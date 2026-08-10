@@ -1,0 +1,103 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unsigned-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iOS app without signing
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Build unsigned app
+        env:
+          DERIVED_DATA: ${{ runner.temp }}/HarvestDerivedData
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project Harvest.xcodeproj \
+            -scheme Harvest \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath "$DERIVED_DATA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+          APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Harvest.app"
+          test -d "$APP_PATH"
+
+          mkdir -p output/Payload
+          /usr/bin/ditto "$APP_PATH" output/Payload/Harvest.app
+          (
+            cd output
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload Harvest-unsigned.ipa
+          )
+
+          if /usr/bin/codesign -dvv "$APP_PATH" >/dev/null 2>&1; then
+            echo "The app is unexpectedly signed."
+            exit 1
+          else
+            echo "Verified: Harvest.app has no code signature."
+          fi
+
+          shasum -a 256 output/Harvest-unsigned.ipa | tee output/Harvest-unsigned.ipa.sha256
+          ls -lh output/Harvest-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harvest-unsigned-${{ github.run_number }}
+          path: |
+            output/Harvest-unsigned.ipa
+            output/Harvest-unsigned.ipa.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            output/Harvest-unsigned.ipa
+            output/Harvest-unsigned.ipa.sha256
+
+      - name: Write summary
+        run: |
+          {
+            echo "## Harvest unsigned IPA"
+            echo
+            echo "- Xcode: $(xcodebuild -version | tr '\n' ' ')"
+            echo "- Artifact: \`Harvest-unsigned.ipa\`"
+            echo "- Signing: disabled"
+            echo
+            echo "This IPA must be signed before installation on a stock iOS device."
+          } >> "$GITHUB_STEP_SUMMARY"
