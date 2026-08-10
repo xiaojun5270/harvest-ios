@@ -330,13 +330,19 @@ final class AppState: ObservableObject {
                 method: .post,
                 body: ["username": username, "password": password]
             )
-            guard let dict = jsonDictionary(raw),
-                  let access = dict.string("access"), !access.isEmpty else {
-                throw APIError(statusCode: 0, message: "登录响应缺少访问令牌")
+            if let businessError = jsonBusinessError(raw, fallback: "登录失败") {
+                throw businessError
+            }
+            guard let tokens = jsonAuthTokenDictionary(raw),
+                  let access = tokens.string("access", "access_token", "accessToken", "token") else {
+                throw APIError(
+                    statusCode: 0,
+                    message: jsonMessage(raw) ?? "登录响应缺少访问令牌"
+                )
             }
             baseURL = normalized
             accessToken = access
-            refreshToken = dict.string("refresh") ?? ""
+            refreshToken = tokens.string("refresh", "refresh_token", "refreshToken") ?? ""
             UserDefaults.standard.set(normalized, forKey: "harvest.baseURL")
             KeychainStore.set(accessToken, for: "accessToken")
             KeychainStore.set(refreshToken, for: "refreshToken")
@@ -460,11 +466,19 @@ final class AppState: ObservableObject {
             method: .post,
             body: ["refresh": refreshToken]
         )
-        guard let next = jsonDictionary(raw)?.string("access"), !next.isEmpty else {
+        if let businessError = jsonBusinessError(raw, fallback: "登录已过期") {
+            throw businessError
+        }
+        guard let tokens = jsonAuthTokenDictionary(raw),
+              let next = tokens.string("access", "access_token", "accessToken", "token") else {
             throw APIError(statusCode: 401, message: "登录已过期")
         }
         accessToken = next
         KeychainStore.set(next, for: "accessToken")
+        if let nextRefresh = tokens.string("refresh", "refresh_token", "refreshToken") {
+            refreshToken = nextRefresh
+            KeychainStore.set(nextRefresh, for: "refreshToken")
+        }
     }
 
     private func clearSession() {
@@ -503,6 +517,28 @@ final class AppState: ObservableObject {
 
 func jsonDictionary(_ value: Any) -> [String: Any]? {
     value as? [String: Any]
+}
+
+func jsonBusinessError(_ value: Any, fallback: String) -> APIError? {
+    guard let dict = jsonDictionary(value) else { return nil }
+    let code = dict.int("code")
+    let failed = dict.bool("succeed") == false || (code != nil && code != 0)
+    guard failed else { return nil }
+    return APIError(statusCode: code ?? 0, message: jsonMessage(value) ?? fallback)
+}
+
+func jsonAuthTokenDictionary(_ value: Any, depth: Int = 0) -> [String: Any]? {
+    guard depth < 6, let dict = jsonDictionary(value) else { return nil }
+    if dict.string("access", "access_token", "accessToken", "token") != nil {
+        return dict
+    }
+    for key in ["data", "result", "token", "tokens"] {
+        if let nested = dict[key],
+           let tokens = jsonAuthTokenDictionary(nested, depth: depth + 1) {
+            return tokens
+        }
+    }
+    return nil
 }
 
 func jsonPayloadDictionary(_ value: Any) -> [String: Any]? {
@@ -547,7 +583,7 @@ func jsonStrings(_ value: Any) -> [String] {
 func jsonMessage(_ value: Any) -> String? {
     if let text = value as? String { return text }
     guard let dict = jsonDictionary(value) else { return nil }
-    for key in ["detail", "message", "msg", "error"] {
+    for key in ["message", "msg", "info", "detail", "error", "result", "data"] {
         if let text = dict[key] as? String, !text.isEmpty { return text }
         if let nested = dict[key], let text = jsonMessage(nested) { return text }
     }
