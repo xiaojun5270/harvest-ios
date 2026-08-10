@@ -18,7 +18,7 @@ side by side.
 - Swift Concurrency and URLSession networking
 - Keychain token and credential storage
 - Swift Charts dashboard visualizations
-- WebKit for authenticated site browsing
+- WebKit site browsing with Cookie, LocalStorage, and User-Agent injection
 - SF Symbols plus a new, project-local AppIcon
 
 ## GitHub unsigned IPA
@@ -32,13 +32,20 @@ An unsigned IPA cannot be installed directly on a stock iPhone. Sign the
 artifact with your own Apple ID, development certificate, enterprise
 certificate, or a compatible sideloading service before installation.
 
-## Ported workflows
+## Migration status
+
+The primary workflows below are implemented, but this is not yet an
+endpoint-for-endpoint port of the Flutter client. See
+[`MIGRATION_AUDIT.md`](MIGRATION_AUDIT.md) for the verified gaps and test limits.
+
+## Implemented core workflows
 
 - Login history, Keychain credentials, access-token refresh, and first-run setup
-- TMDB/Douban news and combined media/resource search with SSE
-- Site overview, filtering, add, refresh, sign-in, repeat, detail, and delete
+- TMDB/Douban news, media details, and combined media/resource search with SSE
+- Site overview, filtering, add/edit, authenticated browsing, refresh, sign-in,
+  repeat, detail, and delete
 - Dashboard totals, traffic chart, privacy mode, and server resource status
 - Downloader setup, torrent push, live polling, filtering, and controls
-- Scheduled tasks, execution results, run-once, create, and delete
-- Notice history/read state, users, authorization, logs, cache, notification test,
-  service restart, appearance, account switching, and logout
+- Scheduled task create/edit/enable/run/delete and execution-result management
+- Notice detail/read/delete operations, users, authorization, logs, cache,
+  notification test, service restart, appearance, account switching, and logout

@@ -10,6 +10,7 @@ enum HarvestTheme {
     static let blue = Color(red: 0.20, green: 0.52, blue: 0.87)
     static let ink = Color(red: 0.08, green: 0.10, blue: 0.11)
     static let panel = Color(uiColor: .secondarySystemBackground)
+    static let cardCornerRadius: CGFloat = 24
 }
 
 enum AppAppearance: String, CaseIterable, Identifiable {
@@ -49,6 +50,7 @@ enum APIPath {
     static let serverStatus = "/api/auth/server/status"
     static let serverRestart = "/api/auth/server/restart"
     static let dashboard = "/api/mysite/dashboard"
+    static let websiteList = "/api/mysite/website"
     static let sites = "/api/mysite/mysite"
     static let websiteToAdd = "/api/mysite/website/add"
     static let siteSearch = "/api/mysite/search"
@@ -61,6 +63,10 @@ enum APIPath {
     static let downloaderTorrents = "/api/ws/downloader"
     static let downloaderMain = "/api/option/downloaders/main/"
     static let downloaderControl = "/api/option/downloaders/control/"
+    static let downloaderPreferences = "/api/option/downloaders/preferences/"
+    static let downloaderTorrentDetail = "/api/option/downloaders/torrent/detail/"
+    static let downloaderRepeat = "/api/option/repeat"
+    static let downloaderPaths = "/api/option/paths"
     static let pushTorrent = "/api/option/push_torrent"
     static let schedules = "/api/option/schedule"
     static let taskTypes = "/api/option/tasks"
@@ -72,14 +78,22 @@ enum APIPath {
     static let options = "/api/option/options"
     static let notifyTest = "/api/option/test"
     static let tmdbSearch = "/api/tmdb/search"
+    static let tmdbMovie = "/api/tmdb/movie/"
+    static let tmdbTV = "/api/tmdb/tv/"
+    static let tmdbPerson = "/api/tmdb/person/"
     static let tmdbPopularMovies = "/api/tmdb/popular/movies"
     static let tmdbPopularTV = "/api/tmdb/popular/tvs"
     static let doubanSearch = "/api/option/douban/search"
     static let doubanHot = "/api/option/douban/hot"
+    static let doubanSubject = "/api/option/douban/subject/"
     static let resourceSearch = "/api/mysite/torrents"
     static let adminUsers = "/api/auth/admin/users"
+    static let adminSendToken = "/api/auth/admin/send"
+    static let adminResetToken = "/api/auth/admin/reset/token"
+    static let adminResetInvite = "/api/auth/admin/reset/invite/"
+    static let adminCacheClear = "/api/auth/admin/cache/clear"
     static let users = "/api/auth/user"
-    static let logs = "/api/logging"
+    static let logs = "/api/auth/logs"
     static let cacheClear = "/api/mysite/cache/clear"
     static let setupStatus = "/api/setup/status"
 }
@@ -142,6 +156,9 @@ final class APIClient {
         guard (200..<300).contains(http.statusCode) else {
             throw APIError(statusCode: http.statusCode, message: jsonMessage(json) ?? "请求失败（\(http.statusCode)）")
         }
+        if let businessError = jsonBusinessError(json, fallback: "请求失败") {
+            throw businessError
+        }
         return json
     }
 
@@ -149,30 +166,43 @@ final class APIClient {
         baseURL: String,
         path: String,
         token: String,
-        body: [String: Any]
+        method: HTTPMethod = .post,
+        query: [String: Any] = [:],
+        body: [String: Any]? = nil
     ) -> AsyncThrowingStream<[String: Any], Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
                     while normalized.hasSuffix("/") { normalized.removeLast() }
-                    guard let url = URL(string: normalized + path) else {
-                        throw APIError(statusCode: 0, message: "搜索地址无效")
+                    guard var components = URLComponents(string: normalized + path) else {
+                        throw APIError(statusCode: 0, message: "流式请求地址无效")
+                    }
+                    if !query.isEmpty {
+                        components.queryItems = query.map {
+                            URLQueryItem(name: $0.key, value: String(describing: $0.value))
+                        }
+                    }
+                    guard let url = components.url else {
+                        throw APIError(statusCode: 0, message: "流式请求地址无效")
                     }
                     var request = URLRequest(url: url)
-                    request.httpMethod = HTTPMethod.post.rawValue
+                    request.httpMethod = method.rawValue
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+                    request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
                     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-                    request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    if let body {
+                        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    }
 
                     let (bytes, response) = try await session.bytes(for: request)
                     guard let http = response as? HTTPURLResponse else {
-                        throw APIError(statusCode: 0, message: "搜索服务未返回有效响应")
+                        throw APIError(statusCode: 0, message: "流式服务未返回有效响应")
                     }
                     guard (200..<300).contains(http.statusCode) else {
-                        throw APIError(statusCode: http.statusCode, message: "资源搜索连接失败（\(http.statusCode)）")
+                        throw APIError(statusCode: http.statusCode, message: "流式连接失败（\(http.statusCode)）")
                     }
                     for try await line in bytes.lines {
                         var payload = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -187,6 +217,7 @@ final class APIClient {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 }
@@ -580,6 +611,15 @@ func jsonStrings(_ value: Any) -> [String] {
     return []
 }
 
+func jsonPathStrings(_ value: Any) -> [String] {
+    let direct = jsonStrings(value)
+    if !direct.isEmpty { return Array(Set(direct)).sorted() }
+    let paths = jsonRows(value).compactMap {
+        $0.string("path", "save_path", "savePath", "download_dir", "downloadDir", "value", "name")
+    }
+    return Array(Set(paths)).sorted()
+}
+
 func jsonMessage(_ value: Any) -> String? {
     if let text = value as? String { return text }
     guard let dict = jsonDictionary(value) else { return nil }
@@ -588,6 +628,21 @@ func jsonMessage(_ value: Any) -> String? {
         if let nested = dict[key], let text = jsonMessage(nested) { return text }
     }
     return nil
+}
+
+func urlPathSegment(_ value: String) -> String {
+    var allowed = CharacterSet.urlPathAllowed
+    allowed.remove(charactersIn: "/?#%")
+    return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+}
+
+func prettyJSON(_ value: Any) -> String {
+    guard JSONSerialization.isValidJSONObject(value),
+          let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]),
+          let text = String(data: data, encoding: .utf8) else {
+        return String(describing: value)
+    }
+    return text
 }
 
 extension Dictionary where Key == String, Value == Any {
@@ -636,6 +691,22 @@ extension Dictionary where Key == String, Value == Any {
 
     func rows(_ keys: String...) -> [[String: Any]] {
         for key in keys { if let value = self[key] { let rows = jsonRows(value); if !rows.isEmpty { return rows } } }
+        return []
+    }
+
+    func strings(_ keys: String...) -> [String] {
+        for key in keys {
+            guard let value = self[key] else { continue }
+            if let values = value as? [String] { return values }
+            if let values = value as? [Any] {
+                let result = values.compactMap { item -> String? in
+                    if let text = item as? String { return text }
+                    if let number = item as? NSNumber { return number.stringValue }
+                    return nil
+                }
+                if !result.isEmpty { return result }
+            }
+        }
         return []
     }
 }

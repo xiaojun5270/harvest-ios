@@ -261,19 +261,14 @@ struct MainShellView: View {
     @State private var showingSettings = false
     @State private var showingNotices = false
 
-    private let tabs = [
-        ShellTabItem(id: 0, title: "资讯", icon: "newspaper"),
-        ShellTabItem(id: 1, title: "站点", icon: "globe.americas"),
-        ShellTabItem(id: 2, title: "仪表盘", icon: "rectangle.3.group"),
-        ShellTabItem(id: 3, title: "下载", icon: "arrow.down.circle"),
-        ShellTabItem(id: 4, title: "任务", icon: "checklist"),
-        ShellTabItem(id: 5, title: "搜索", icon: "magnifyingglass")
+    private let tabTitles = [
+        0: "资讯",
+        1: "站点",
+        2: "仪表盘",
+        3: "下载",
+        4: "任务",
+        5: "搜索"
     ]
-
-    private var visibleTabs: [ShellTabItem] {
-        guard appState.profile?.isSuperuser != true else { return tabs }
-        return tabs.filter { [0, 3, 5].contains($0.id) }
-    }
 
     var body: some View {
         NavigationStack {
@@ -289,18 +284,11 @@ struct MainShellView: View {
                 }
                 SearchView().tabItem { Label("搜索", systemImage: "magnifyingglass") }.tag(5)
             }
-            .toolbar(.hidden, for: .tabBar)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                HarvestLiquidGlassTabBar(items: visibleTabs, selection: $appState.selectedTab)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 6)
-                    .padding(.bottom, 8)
-            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 8) {
                         BrandMark(size: 28)
-                        Text(tabs.first(where: { $0.id == appState.selectedTab })?.title ?? "Harvest")
+                        Text(tabTitles[appState.selectedTab] ?? "Harvest")
                             .font(.headline)
                     }
                 }
@@ -314,75 +302,6 @@ struct MainShellView: View {
         }
         .sheet(isPresented: $showingSettings) { SettingsView().environmentObject(appState) }
         .sheet(isPresented: $showingNotices) { NoticeView().environmentObject(appState).presentationDetents([.medium, .large]) }
-    }
-}
-
-private struct ShellTabItem: Identifiable {
-    let id: Int
-    let title: String
-    let icon: String
-}
-
-private struct HarvestLiquidGlassTabBar: View {
-    let items: [ShellTabItem]
-    @Binding var selection: Int
-
-    var body: some View {
-        HStack(spacing: 2) {
-            ForEach(items) { item in
-                Button {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
-                        selection = item.id
-                    }
-                } label: {
-                    VStack(spacing: 3) {
-                        Image(systemName: item.icon)
-                            .font(.system(size: 18, weight: selection == item.id ? .semibold : .regular))
-                            .symbolVariant(selection == item.id ? .fill : .none)
-                        Text(item.title)
-                            .font(.system(size: 10, weight: selection == item.id ? .semibold : .medium))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
-                    }
-                    .foregroundStyle(selection == item.id ? HarvestTheme.green : Color.secondary)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 48)
-                    .background {
-                        if selection == item.id {
-                            Capsule()
-                                .fill(HarvestTheme.green.opacity(0.14))
-                                .padding(.horizontal, 3)
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(item.title)
-                .accessibilityAddTraits(selection == item.id ? .isSelected : [])
-            }
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
-        .frame(height: 58)
-        .modifier(LiquidGlassBarSurface())
-    }
-}
-
-private struct LiquidGlassBarSurface: ViewModifier {
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) {
-            content
-                .glassEffect()
-        } else {
-            content
-                .background(.ultraThinMaterial, in: Capsule())
-                .overlay {
-                    Capsule()
-                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
-                }
-                .shadow(color: Color.black.opacity(0.12), radius: 12, y: 4)
-        }
     }
 }
 
@@ -473,8 +392,14 @@ struct MetricCard: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.06)))
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(0.06))
+        )
     }
 }
 
@@ -511,7 +436,13 @@ struct LoadingState: View {
 extension View {
     func cardSurface() -> some View {
         self.padding(16)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.06)))
+            .background(
+                Color(uiColor: .secondarySystemGroupedBackground),
+                in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06))
+            )
     }
 }
