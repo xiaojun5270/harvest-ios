@@ -215,11 +215,16 @@ func remoteImageHeaders(for url: URL?, additional: [String: String] = [:]) -> [S
 }
 
 func remoteImageCacheKey(url: URL, headers: [String: String]) -> String {
-    let headerPart = headers
-        .map { ($0.key.lowercased(), $0.value) }
-        .sorted { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0 }
-        .map { "\($0.0)=\($0.1)" }
-        .joined(separator: "&")
+    let normalizedHeaders: [(name: String, value: String)] = headers.map { entry in
+        (name: entry.key.lowercased(), value: entry.value)
+    }
+    let sortedHeaders = normalizedHeaders.sorted { left, right in
+        if left.name == right.name { return left.value < right.value }
+        return left.name < right.name
+    }
+    let headerPart = sortedHeaders.map { entry in
+        entry.name + "=" + entry.value
+    }.joined(separator: "&")
     return "\(url.absoluteString)|\(headerPart)"
 }
 

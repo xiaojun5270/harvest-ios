@@ -836,7 +836,8 @@ private func mediaRows(_ value: Any, depth: Int = 0) -> [[String: Any]] {
     ) != nil {
         return [dictionary]
     }
-    if let rows = jsonRows(value), !rows.isEmpty { return rows }
+    let rows = jsonRows(value)
+    if !rows.isEmpty { return rows }
     return []
 }
 
