@@ -5,20 +5,20 @@ import UIKit
 actor RemoteImageDataCache {
     static let shared = RemoteImageDataCache()
 
-    private let memoryCache: NSCache<NSURL, NSData>
+    private let memoryCache: NSCache<NSString, NSData>
     private let diskCache: URLCache
     private let session: URLSession
     private let privateSession: URLSession
-    private var inFlight: [URL: Task<Data, Error>] = [:]
+    private var inFlight: [String: Task<Data, Error>] = [:]
 
     private init() {
-        let memory = NSCache<NSURL, NSData>()
+        let memory = NSCache<NSString, NSData>()
         memory.totalCostLimit = 48 * 1_024 * 1_024
         memory.countLimit = 240
         let cache = URLCache(
             memoryCapacity: 32 * 1_024 * 1_024,
             diskCapacity: 192 * 1_024 * 1_024,
-            diskPath: "harvest-public-images"
+            diskPath: "harvest-public-images-v2"
         )
         let configuration = URLSessionConfiguration.default
         configuration.urlCache = cache
@@ -44,27 +44,46 @@ actor RemoteImageDataCache {
         privateSession = URLSession(configuration: privateConfiguration)
     }
 
-    func data(for url: URL) async throws -> Data {
-        if let cached = memoryCache.object(forKey: url as NSURL) {
+    func data(for url: URL, headers: [String: String] = [:]) async throws -> Data {
+        guard let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else {
+            throw APIError(statusCode: 0, message: "图片地址无效")
+        }
+        let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
+        let key = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+        let cacheKey = key as NSString
+        if let cached = memoryCache.object(forKey: cacheKey) {
             return cached as Data
         }
 
-        let persistToDisk = isPublicCacheURL(url)
+        let persistToDisk = isPublicCacheURL(normalizedURL) && !hasSensitiveImageHeaders(effectiveHeaders)
         let cachePolicy: URLRequest.CachePolicy = persistToDisk ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData
-        var request = URLRequest(url: url, cachePolicy: cachePolicy, timeoutInterval: 20)
+        var request = URLRequest(url: normalizedURL, cachePolicy: cachePolicy, timeoutInterval: 20)
         request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        request.setValue("Harvest-iOS/1.0", forHTTPHeaderField: "User-Agent")
-        if persistToDisk, let cached = diskCache.cachedResponse(for: request), !cached.data.isEmpty {
-            memoryCache.setObject(cached.data as NSData, forKey: url as NSURL, cost: cached.data.count)
-            return cached.data
+        for (name, value) in effectiveHeaders {
+            request.setValue(value, forHTTPHeaderField: name)
         }
-        if let task = inFlight[url] { return try await task.value }
+        if persistToDisk, let cached = diskCache.cachedResponse(for: request) {
+            let isSuccessful = (cached.response as? HTTPURLResponse).map {
+                (200..<300).contains($0.statusCode)
+            } ?? true
+            let isNotHTML = !((cached.response.mimeType ?? "").lowercased().contains("html"))
+            if isSuccessful, isNotHTML, !cached.data.isEmpty {
+                memoryCache.setObject(cached.data as NSData, forKey: cacheKey, cost: cached.data.count)
+                return cached.data
+            }
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+        }
+        if let task = inFlight[key] { return try await task.value }
 
         let task = Task<Data, Error> {
             let activeSession = persistToDisk ? session : privateSession
             let (data, response) = try await activeSession.data(for: request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 throw APIError(statusCode: http.statusCode, message: "图片加载失败（\(http.statusCode)）")
+            }
+            if let mimeType = (response as? HTTPURLResponse)?.mimeType?.lowercased(),
+               mimeType.contains("html") {
+                throw APIError(statusCode: 0, message: "图片服务返回了网页内容")
             }
             guard !data.isEmpty, data.count <= 20 * 1_024 * 1_024 else {
                 throw APIError(statusCode: 0, message: "图片数据无效")
@@ -73,16 +92,16 @@ actor RemoteImageDataCache {
                 let cached = CachedURLResponse(response: response, data: data, storagePolicy: .allowed)
                 diskCache.storeCachedResponse(cached, for: request)
             }
-            memoryCache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
+            memoryCache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
             return data
         }
-        inFlight[url] = task
+        inFlight[key] = task
         do {
             let data = try await task.value
-            inFlight[url] = nil
+            inFlight[key] = nil
             return data
         } catch {
-            inFlight[url] = nil
+            inFlight[key] = nil
             throw error
         }
     }
@@ -104,39 +123,124 @@ actor RemoteImageDataCache {
                 || ["passkey", "authkey", "apikey", "signature", "credential"].contains(key)
         }
     }
+
+    private func hasSensitiveImageHeaders(_ headers: [String: String]) -> Bool {
+        headers.keys.contains { key in
+            let normalized = key.lowercased()
+            return normalized == "cookie" || normalized == "authorization" || normalized.contains("token")
+        }
+    }
 }
 
 private final class RemoteDecodedImageCache: @unchecked Sendable {
     static let shared = RemoteDecodedImageCache()
-    private let cache = NSCache<NSURL, UIImage>()
+    private let cache = NSCache<NSString, UIImage>()
 
     private init() {
         cache.totalCostLimit = 72 * 1_024 * 1_024
         cache.countLimit = 180
     }
 
-    func image(for url: URL) -> UIImage? { cache.object(forKey: url as NSURL) }
+    func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
 
-    func insert(_ image: UIImage, for url: URL) {
+    func insert(_ image: UIImage, for key: String) {
         let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
-        cache.setObject(image, forKey: url as NSURL, cost: cost)
+        cache.setObject(image, forKey: key as NSString, cost: cost)
     }
 
     func removeAll() { cache.removeAllObjects() }
 }
 
+let doubanImageReferer = "https://movie.douban.com/"
+let doubanImageUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+
+private func isDoubanImageHost(_ host: String) -> Bool {
+    host == "doubanio.com"
+        || host.hasSuffix(".doubanio.com")
+        || host == "douban.com"
+        || host.hasSuffix(".douban.com")
+}
+
+func normalizedRemoteImageURL(_ value: String) -> String {
+    var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalized.isEmpty else { return "" }
+    if normalized.hasPrefix("//") {
+        normalized = "https:\(normalized)"
+    } else if normalized.lowercased().hasPrefix("http://") {
+        let host = URL(string: normalized)?.host?.lowercased() ?? ""
+        if isDoubanImageHost(host) {
+            normalized = "https://" + String(normalized.dropFirst("http://".count))
+        }
+    } else if !normalized.contains("://") {
+        let host = URL(string: "https://\(normalized)")?.host?.lowercased() ?? ""
+        if isDoubanImageHost(host) {
+            normalized = "https://" + normalized
+        }
+    }
+    return normalized
+}
+
+func remoteImageHeaders(for url: URL?, additional: [String: String] = [:]) -> [String: String] {
+    var headers = additional
+    func matchingHeaderKey(_ name: String) -> String? {
+        headers.keys.first { $0.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    let host = url?.host?.lowercased() ?? ""
+    let doubanRequest = isDoubanImageHost(host)
+    let carriesDoubanContext = matchingHeaderKey("Referer")
+        .flatMap { headers[$0] }
+        .map { $0 == doubanImageReferer }
+        ?? false
+    if !doubanRequest, carriesDoubanContext {
+        for name in ["Referer", "Cookie"] {
+            if let key = matchingHeaderKey(name) { headers.removeValue(forKey: key) }
+        }
+        if let key = matchingHeaderKey("User-Agent"), headers[key] == doubanImageUserAgent {
+            headers.removeValue(forKey: key)
+        }
+    }
+    if doubanRequest {
+        if matchingHeaderKey("Referer") == nil {
+            headers["Referer"] = doubanImageReferer
+        }
+        if matchingHeaderKey("User-Agent") == nil {
+            headers["User-Agent"] = doubanImageUserAgent
+        }
+    }
+    if matchingHeaderKey("User-Agent") == nil {
+        headers["User-Agent"] = "Harvest-iOS/1.0"
+    }
+    return headers
+}
+
+func remoteImageCacheKey(url: URL, headers: [String: String]) -> String {
+    let headerPart = headers
+        .map { ($0.key.lowercased(), $0.value) }
+        .sorted { $0.0 == $1.0 ? $0.1 < $1.1 : $0.0 < $1.0 }
+        .map { "\($0.0)=\($0.1)" }
+        .joined(separator: "&")
+    return "\(url.absoluteString)|\(headerPart)"
+}
+
 struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     let url: URL?
+    let headers: [String: String]
+    private let onFailure: (() -> Void)?
     private let content: (Image) -> Content
     private let placeholder: () -> Placeholder
     @State private var loadedImage: UIImage?
 
     init(
         url: URL?,
+        headers: [String: String] = [:],
+        onFailure: (() -> Void)? = nil,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) {
         self.url = url
+        self.headers = headers
+        self.onFailure = onFailure
         self.content = content
         self.placeholder = placeholder
     }
@@ -149,19 +253,90 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: url) {
+        .task(id: requestKey) {
             loadedImage = nil
-            guard let url else { return }
-            if let cached = RemoteDecodedImageCache.shared.image(for: url) {
+            guard let url,
+                  let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else { return }
+            let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
+            let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+            if let cached = RemoteDecodedImageCache.shared.image(for: cacheKey) {
                 loadedImage = cached
                 return
             }
-            guard let data = try? await RemoteImageDataCache.shared.data(for: url),
-                  !Task.isCancelled,
-                  let image = UIImage(data: data) else { return }
-            RemoteDecodedImageCache.shared.insert(image, for: url)
-            loadedImage = image
+            do {
+                let data = try await RemoteImageDataCache.shared.data(for: normalizedURL, headers: effectiveHeaders)
+                guard !Task.isCancelled, let image = UIImage(data: data) else {
+                    if !Task.isCancelled { await MainActor.run { onFailure?() } }
+                    return
+                }
+                RemoteDecodedImageCache.shared.insert(image, for: cacheKey)
+                loadedImage = image
+            } catch {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { onFailure?() }
+            }
         }
+    }
+
+    private var requestKey: String {
+        guard let url,
+              let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else { return "" }
+        return remoteImageCacheKey(url: normalizedURL, headers: remoteImageHeaders(for: normalizedURL, additional: headers))
+    }
+}
+
+struct RemoteImageCandidate: Identifiable {
+    let url: URL
+    let headers: [String: String]
+
+    init(url: URL, headers: [String: String] = [:]) {
+        self.url = url
+        self.headers = headers
+    }
+
+    var id: String {
+        remoteImageCacheKey(url: url, headers: remoteImageHeaders(for: url, additional: headers))
+    }
+}
+
+struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
+    let candidates: [RemoteImageCandidate]
+    private let content: (Image) -> Content
+    private let placeholder: () -> Placeholder
+    @State private var candidateIndex = 0
+
+    init(
+        candidates: [RemoteImageCandidate],
+        @ViewBuilder content: @escaping (Image) -> Content,
+        @ViewBuilder placeholder: @escaping () -> Placeholder
+    ) {
+        self.candidates = candidates
+        self.content = content
+        self.placeholder = placeholder
+    }
+
+    var body: some View {
+        Group {
+            if candidateIndex < candidates.count {
+                let candidate = candidates[candidateIndex]
+                CachedRemoteImage(
+                    url: candidate.url,
+                    headers: candidate.headers,
+                    onFailure: advanceCandidate,
+                    content: content,
+                    placeholder: placeholder
+                )
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: candidateKey) { candidateIndex = 0 }
+    }
+
+    private var candidateKey: String { candidates.map(\.id).joined(separator: "|") }
+
+    private func advanceCandidate() {
+        candidateIndex = min(candidateIndex + 1, candidates.count)
     }
 }
 
@@ -627,6 +802,7 @@ struct MainShellView: View {
                 SearchView().tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }.tag(5)
             }
             .harvestNavigationChrome()
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     BrandMark(size: 28)
@@ -861,16 +1037,16 @@ struct SymbolBadge: View {
     var body: some View {
         Image(systemName: icon)
             .font(.system(size: size * 0.42, weight: .semibold))
-            .symbolRenderingMode(.hierarchical)
-            .foregroundStyle(color)
+            .symbolRenderingMode(.monochrome)
+            .foregroundStyle(.white)
             .frame(width: size, height: size)
             .background(
-                color.opacity(0.12),
+                color,
                 in: RoundedRectangle(cornerRadius: min(12, size * 0.32), style: .continuous)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: min(12, size * 0.32), style: .continuous)
-                    .stroke(color.opacity(0.12))
+                    .stroke(Color.white.opacity(0.18))
             )
     }
 }

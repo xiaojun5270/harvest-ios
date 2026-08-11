@@ -908,7 +908,7 @@ struct DashboardView: View {
     @AppStorage("dashboard.showMonthlyUpload") private var showMonthlyUpload = true
     @AppStorage("dashboard.showMonthlyDownload") private var showMonthlyDownload = true
     @AppStorage("dashboard.showMonthlyPublish") private var showMonthlyPublish = true
-    @AppStorage("dashboard.moduleOrder") private var moduleOrderRaw = "userInfo,serverResources,designation,overview,quickActions,trend,siteStatus,siteUploadDistribution,usernameDistribution,emailDistribution,todayIncrement,seedDistribution,siteDownloadDistribution,monthlyUpload,monthlyDownload,monthlyPublish"
+    @AppStorage("dashboard.moduleOrder") private var moduleOrderRaw = "overview,userInfo,quickActions,siteStatus,trend,serverResources,designation,todayIncrement,siteUploadDistribution,siteDownloadDistribution,seedDistribution,usernameDistribution,emailDistribution,monthlyUpload,monthlyDownload,monthlyPublish"
     @State private var showSettings = false
     @State private var showCacheClear = false
     @State private var showShare = false
@@ -922,22 +922,18 @@ struct DashboardView: View {
             if model.isLoading {
                 LoadingState()
             } else {
-                LazyVStack(spacing: 18) {
+                LazyVStack(spacing: 14) {
                     if model.usingCachedData {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                     }
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(greeting).font(.title2.weight(.bold))
-                            Text(model.lastUpdated?.formatted(date: .omitted, time: .shortened) ?? "刚刚同步")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        StatusPill(
-                            label: model.serverConnected ? "资源监控在线" : model.serverError == nil ? "数据已同步" : "资源监控异常",
-                            color: model.serverConnected ? HarvestTheme.green : model.serverError == nil ? HarvestTheme.blue : HarvestTheme.coral
-                        )
-                    }
+                    DashboardHeroView(
+                        greeting: greeting,
+                        updatedAt: model.lastUpdated,
+                        serverConnected: model.serverConnected,
+                        serverError: model.serverError,
+                        snapshot: model.snapshot,
+                        privacy: appState.privacyMode
+                    )
 
                     ForEach(moduleOrder) { module in
                         dashboardModule(module)
@@ -1027,16 +1023,11 @@ struct DashboardView: View {
             }
         case .overview:
             if showOverview {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                    MetricCard(label: "总上传", value: hidden(formatBytes(model.snapshot.uploaded)), detail: formatSpeed(model.snapshot.uploadSpeed), icon: "arrow.up", color: HarvestTheme.green)
-                    MetricCard(label: "总下载", value: hidden(formatBytes(model.snapshot.downloaded)), detail: formatSpeed(model.snapshot.downloadSpeed), icon: "arrow.down", color: HarvestTheme.blue)
-                    MetricCard(label: "分享率", value: hidden(String(format: "%.2f", model.snapshot.ratio)), detail: "\(model.snapshot.seeding) 个做种任务", icon: "arrow.triangle.2.circlepath", color: HarvestTheme.amber)
-                    MetricCard(label: "站点", value: "\(model.snapshot.siteCount)", detail: "\(model.snapshot.unread) 条未读消息", icon: "globe.americas", color: HarvestTheme.coral)
-                    MetricCard(label: "今日上传", value: hidden(formatBytes(model.snapshot.todayUploaded)), detail: "今日增量", icon: "arrow.up.right", color: HarvestTheme.green)
-                    MetricCard(label: "今日下载", value: hidden(formatBytes(model.snapshot.todayDownloaded)), detail: "今日增量", icon: "arrow.down.right", color: HarvestTheme.blue)
-                    MetricCard(label: "做种体积", value: hidden(formatBytes(model.snapshot.seedVolume)), detail: "\(model.snapshot.leeching) 个下载中", icon: "externaldrive.fill.badge.checkmark", color: HarvestTheme.amber)
-                    MetricCard(label: "已发布", value: "\(model.snapshot.published)", detail: accountAgeText, icon: "paperplane.fill", color: HarvestTheme.coral)
-                }
+                DashboardOverviewView(
+                    snapshot: model.snapshot,
+                    privacy: appState.privacyMode,
+                    accountAgeText: accountAgeText
+                )
             }
         case .quickActions:
             if showQuickActions {
@@ -1289,6 +1280,224 @@ struct DashboardView: View {
     }
 }
 
+private struct DashboardHeroView: View {
+    let greeting: String
+    let updatedAt: Date?
+    let serverConnected: Bool
+    let serverError: String?
+    let snapshot: DashboardSnapshot
+    let privacy: Bool
+
+    private var statusLabel: String {
+        if serverError != nil { return "资源监控异常" }
+        return serverConnected ? "资源监控在线" : "数据已同步"
+    }
+
+    private var statusColor: Color {
+        if serverError != nil { return HarvestTheme.coral }
+        return serverConnected ? HarvestTheme.green : HarvestTheme.blue
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                SymbolBadge(icon: "chart.xyaxis.line", color: statusColor, size: 44)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(greeting)
+                        .font(.title2.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                    Text(updatedAt?.formatted(date: .omitted, time: .shortened) ?? "刚刚同步")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                StatusPill(label: statusLabel, color: statusColor)
+            }
+
+            HStack(spacing: 0) {
+                heroMetric(
+                    label: "站点",
+                    value: "\(snapshot.siteCount)",
+                    detail: "\(snapshot.unread) 条未读",
+                    color: HarvestTheme.coral
+                )
+                Divider().frame(height: 46)
+                heroMetric(
+                    label: "下载速度",
+                    value: privacy ? "••••" : formatSpeed(snapshot.downloadSpeed),
+                    detail: "实时",
+                    color: HarvestTheme.blue
+                )
+                Divider().frame(height: 46)
+                heroMetric(
+                    label: "上传速度",
+                    value: privacy ? "••••" : formatSpeed(snapshot.uploadSpeed),
+                    detail: "实时",
+                    color: HarvestTheme.green
+                )
+            }
+        }
+        .padding(18)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                .stroke(statusColor.opacity(0.18), lineWidth: 1)
+        }
+    }
+
+    private func heroMetric(label: String, value: String, detail: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.title3.weight(.bold).monospacedDigit())
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+    }
+}
+
+private struct DashboardOverviewView: View {
+    let snapshot: DashboardSnapshot
+    let privacy: Bool
+    let accountAgeText: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionHeader(title: "数据概览", subtitle: "累计数据与今日增量")
+
+            HStack(spacing: 0) {
+                overviewPrimaryMetric(
+                    label: "总上传",
+                    value: privateValue(formatBytes(snapshot.uploaded)),
+                    detail: formatSpeed(snapshot.uploadSpeed),
+                    icon: "arrow.up",
+                    color: HarvestTheme.green
+                )
+                Divider().frame(height: 54)
+                overviewPrimaryMetric(
+                    label: "总下载",
+                    value: privateValue(formatBytes(snapshot.downloaded)),
+                    detail: formatSpeed(snapshot.downloadSpeed),
+                    icon: "arrow.down",
+                    color: HarvestTheme.blue
+                )
+            }
+
+            Divider()
+
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
+                DashboardStatLine(
+                    label: "分享率",
+                    value: privateValue(String(format: "%.2f", snapshot.ratio)),
+                    detail: "\(snapshot.seeding) 个做种任务",
+                    icon: "arrow.triangle.2.circlepath",
+                    color: HarvestTheme.amber
+                )
+                DashboardStatLine(
+                    label: "站点",
+                    value: "\(snapshot.siteCount)",
+                    detail: "\(snapshot.unread) 条未读消息",
+                    icon: "globe.americas",
+                    color: HarvestTheme.coral
+                )
+                DashboardStatLine(
+                    label: "今日上传",
+                    value: privateValue(formatBytes(snapshot.todayUploaded)),
+                    detail: "今日增量",
+                    icon: "arrow.up.right",
+                    color: HarvestTheme.green
+                )
+                DashboardStatLine(
+                    label: "今日下载",
+                    value: privateValue(formatBytes(snapshot.todayDownloaded)),
+                    detail: "今日增量",
+                    icon: "arrow.down.right",
+                    color: HarvestTheme.blue
+                )
+                DashboardStatLine(
+                    label: "做种体积",
+                    value: privateValue(formatBytes(snapshot.seedVolume)),
+                    detail: "\(snapshot.leeching) 个下载中",
+                    icon: "externaldrive.fill.badge.checkmark",
+                    color: HarvestTheme.amber
+                )
+                DashboardStatLine(
+                    label: "已发布",
+                    value: "\(snapshot.published)",
+                    detail: accountAgeText,
+                    icon: "paperplane.fill",
+                    color: HarvestTheme.coral
+                )
+            }
+        }
+        .cardSurface()
+    }
+
+    private func overviewPrimaryMetric(label: String, value: String, detail: String, icon: String, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(label, systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+            Text(value)
+                .font(.title2.weight(.bold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
+            Text(detail)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+    }
+
+    private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
+}
+
+private struct DashboardStatLine: View {
+    let label: String
+    let value: String
+    let detail: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 9) {
+            SymbolBadge(icon: icon, color: color, size: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text(value)
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct DashboardUserInfoView: View {
     let profile: UserProfile?
     let authorizationInfo: [String: Any]?
@@ -1336,11 +1545,7 @@ private struct DashboardUserInfoView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "person.crop.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(HarvestTheme.blue)
-                    .frame(width: 44, height: 44)
-                    .background(HarvestTheme.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                SymbolBadge(icon: "person.crop.circle.fill", color: HarvestTheme.blue, size: 44)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text("用户信息").font(.title3.weight(.bold))
@@ -1455,11 +1660,7 @@ private struct DashboardDesignationView: View {
             HStack {
                 SectionHeader(title: "称号进度", subtitle: "\(siteCount) 个站点接入")
                 Spacer()
-                Image(systemName: "medal.fill")
-                    .font(.title2)
-                    .foregroundStyle(HarvestTheme.coral)
-                    .frame(width: 44, height: 44)
-                    .background(HarvestTheme.coral.opacity(0.12), in: Circle())
+                SymbolBadge(icon: "medal.fill", color: HarvestTheme.coral, size: 44)
             }
             HStack(alignment: .firstTextBaseline) {
                 Text(current?.title ?? "无称号")
@@ -1496,15 +1697,15 @@ private struct DashboardQuickActionsView: View {
                         VStack(spacing: 9) {
                             Group {
                                 if running == action {
-                                    ProgressView().tint(action.color)
+                                    ProgressView().tint(.white)
                                 } else {
                                     Image(systemName: action.icon)
                                         .font(.title3.weight(.semibold))
-                                        .foregroundStyle(action.color)
+                                        .foregroundStyle(.white)
                                 }
                             }
                             .frame(width: 42, height: 42)
-                            .background(action.color.opacity(0.12), in: Circle())
+                            .background(action.color, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                             Text(action.title)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.primary)
@@ -2659,7 +2860,33 @@ final class SitesViewModel: ObservableObject {
         config(for: site)?.string("type", "site_type", "siteType") ?? site.siteType
     }
 
-    func logoURL(for site: SiteItem) -> URL? {
+    func logoCandidates(for site: SiteItem, appState: AppState) -> [RemoteImageCandidate] {
+        var candidates: [RemoteImageCandidate] = []
+        var seen = Set<String>()
+
+        let siteName = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while server.hasSuffix("/") { server.removeLast() }
+        if !siteName.isEmpty, let serverURL = URL(string: server + "/") {
+            let headers = appState.accessToken.isEmpty
+                ? [:]
+                : ["Authorization": "Bearer \(appState.accessToken)"]
+            for fileExtension in ["png", "gif", "jpg", "jpeg", "webp", "ico"] {
+                let relative = "local/icons/\(urlPathSegment(siteName)).\(fileExtension)"
+                guard let url = URL(string: relative, relativeTo: serverURL)?.absoluteURL else { continue }
+                if seen.insert(url.absoluteString).inserted {
+                    candidates.append(RemoteImageCandidate(url: url, headers: headers))
+                }
+            }
+        }
+
+        if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
+            candidates.append(RemoteImageCandidate(url: url))
+        }
+        return candidates
+    }
+
+    private func logoURL(for site: SiteItem) -> URL? {
         let siteConfig = config(for: site)
         let candidates = [
             site.iconURL,
@@ -2755,7 +2982,11 @@ struct SitesView: View {
                             Button {
                                 selectedSite = site
                             } label: {
-                                SiteRow(site: site, privacy: appState.privacyMode, iconURL: model.logoURL(for: site))
+                                SiteRow(
+                                    site: site,
+                                    privacy: appState.privacyMode,
+                                    iconCandidates: model.logoCandidates(for: site, appState: appState)
+                                )
                             }
                                 .buttonStyle(.plain)
                                 .contextMenu { SiteActions(site: site, model: model) }
@@ -2774,7 +3005,7 @@ struct SitesView: View {
                     }
                     .listStyle(.plain)
                     .scrollContentBackground(.hidden)
-                    .background(Color(uiColor: .systemBackground))
+                    .background(Color(uiColor: .systemGroupedBackground))
                     .refreshable { await model.load(appState) }
                 }
             }
@@ -3988,128 +4219,155 @@ struct SiteRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let site: SiteItem
     let privacy: Bool
-    let iconURL: URL?
+    let iconCandidates: [RemoteImageCandidate]
 
-    init(site: SiteItem, privacy: Bool, iconURL: URL? = nil) {
+    init(site: SiteItem, privacy: Bool, iconCandidates: [RemoteImageCandidate] = []) {
         self.site = site
         self.privacy = privacy
-        self.iconURL = iconURL
+        self.iconCandidates = iconCandidates
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if dynamicTypeSize.isAccessibilitySize {
-                accessibilityLayout
-            } else {
-                standardLayout
-            }
+        VStack(alignment: .leading, spacing: 13) {
+            header
             Divider()
-                .padding(.leading, dynamicTypeSize.isAccessibilitySize ? 16 : 88)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    trafficMetric(
+                        label: "上传",
+                        value: privateValue(formatBytes(site.uploaded)),
+                        delta: dailyDeltaText(site.uploadDelta),
+                        icon: "arrow.up",
+                        color: HarvestTheme.green
+                    )
+                    Divider().frame(height: 58)
+                    trafficMetric(
+                        label: "下载",
+                        value: privateValue(formatBytes(site.downloaded)),
+                        delta: dailyDeltaText(site.downloadDelta),
+                        icon: "arrow.down",
+                        color: HarvestTheme.blue
+                    )
+                }
+                VStack(spacing: 10) {
+                    trafficMetric(
+                        label: "上传",
+                        value: privateValue(formatBytes(site.uploaded)),
+                        delta: dailyDeltaText(site.uploadDelta),
+                        icon: "arrow.up",
+                        color: HarvestTheme.green
+                    )
+                    trafficMetric(
+                        label: "下载",
+                        value: privateValue(formatBytes(site.downloaded)),
+                        delta: dailyDeltaText(site.downloadDelta),
+                        icon: "arrow.down",
+                        color: HarvestTheme.blue
+                    )
+                }
+            }
+
+            LazyVGrid(columns: metricColumns, spacing: 10) {
+                SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green)
+                SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue)
+                SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber)
+                SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral)
+                SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
+                SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber)
+                SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue)
+                SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: privateValue(formatBytes(site.seedVolume)), color: HarvestTheme.green)
+            }
+
+            Divider()
+            metadata
         }
-        .contentShape(Rectangle())
+        .padding(14)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                .stroke(site.enabled ? HarvestTheme.green.opacity(0.22) : HarvestTheme.coral.opacity(0.18))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilitySummary)
     }
 
-    private var standardLayout: some View {
-        HStack(alignment: .center, spacing: 14) {
-            siteLogo(size: 58)
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    HStack(spacing: 5) {
-                        Text(site.name)
-                            .font(.headline)
-                            .lineLimit(1)
-                        signStatusIcon
-                    }
-                    .layoutPriority(1)
-                    Spacer(minLength: 8)
-                    Text(ratioText)
-                        .font(.subheadline.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(ratioColor)
-                        .lineLimit(1)
-                        .accessibilityLabel("分享率 \(ratioText)")
-                }
-
-                HStack(spacing: 6) {
-                    Text(identityText)
-                        .lineLimit(1)
-                    if !site.level.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("·")
-                        Text(site.level)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 8)
-                    Label("\(site.seeding) 做种", systemImage: "leaf.fill")
-                        .lineLimit(1)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 10) {
-                        trafficMetrics
-                        Spacer(minLength: 0)
-                        unreadIndicators
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        trafficMetrics
-                        unreadIndicators
-                    }
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+    private var metricColumns: [GridItem] {
+        let count = dynamicTypeSize.isAccessibilitySize ? 2 : 4
+        return Array(repeating: GridItem(.flexible(), spacing: 8), count: count)
     }
 
-    private var accessibilityLayout: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                siteLogo(size: 52)
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 6) {
-                        Text(site.name).font(.headline)
-                        signStatusIcon
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            siteLogo(size: 56)
+            VStack(alignment: .leading, spacing: 7) {
+                Text(site.name)
+                    .font(.headline)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(siteIdentityText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                CompactFlowLayout(spacing: 6) {
+                    siteBadge(
+                        site.enabled ? "可用" : "停用",
+                        icon: site.enabled ? "checkmark" : "pause.fill",
+                        color: site.enabled ? HarvestTheme.green : HarvestTheme.coral
+                    )
+                    if site.signed {
+                        siteBadge("今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green)
+                    } else if site.signIn {
+                        siteBadge("今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber)
                     }
-                    Text(identityText).font(.caption).foregroundStyle(.secondary)
-                    if !site.level.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text(site.level).font(.caption).foregroundStyle(.secondary)
+                    let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !level.isEmpty {
+                        siteBadge(level, icon: "medal.fill", color: HarvestTheme.blue)
                     }
                 }
             }
-            trafficMetrics
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 16) {
-                    statusMetrics
-                    Spacer(minLength: 0)
-                    unreadIndicators
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    statusMetrics
-                    unreadIndicators
-                }
-            }
-            .font(.caption.weight(.semibold))
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+    }
+
+    private var metadata: some View {
+        CompactFlowLayout(spacing: 7) {
+            SiteMetadataItem(icon: "ticket.fill", label: "邀请 \(site.invitations)", color: HarvestTheme.coral)
+            SiteMetadataItem(icon: "calendar", label: "做种 \(site.seedDays) 天", color: HarvestTheme.green)
+            SiteMetadataItem(icon: "exclamationmark.triangle.fill", label: "H&R \(hrText)", color: HarvestTheme.amber)
+            SiteMetadataItem(icon: "envelope.fill", label: "邮件 \(site.mail)", color: HarvestTheme.blue)
+            SiteMetadataItem(icon: "bell.fill", label: "通知 \(site.notice)", color: HarvestTheme.coral)
+            SiteMetadataItem(icon: "person.badge.clock", label: "注册 \(joinedText)", color: HarvestTheme.blue)
+            SiteMetadataItem(icon: "clock.fill", label: "活跃 \(shortDate(site.latestActive))", color: HarvestTheme.green)
+            SiteMetadataItem(icon: "arrow.clockwise", label: "同步 \(shortDate(site.updatedAt))", color: HarvestTheme.amber)
+            ForEach(site.tags, id: \.self) { tag in
+                SiteMetadataItem(icon: "tag.fill", label: tag, color: HarvestTheme.blue)
+            }
+        }
     }
 
     private func siteLogo(size: CGFloat) -> some View {
         let radius = min(14, size * 0.24)
         return ZStack {
             RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .fill(site.enabled ? HarvestTheme.green.opacity(0.10) : Color.secondary.opacity(0.10))
-            CachedRemoteImage(url: iconURL) { image in
+                .fill(site.enabled ? HarvestTheme.blue : Color.secondary)
+            CachedRemoteImageCandidates(candidates: iconCandidates) { image in
                 image
                     .resizable()
                     .scaledToFit()
-                    .padding(6)
+                    .padding(size * 0.12)
             } placeholder: {
                 Image(systemName: site.enabled ? "globe.asia.australia.fill" : "globe.asia.australia")
-                    .font(.system(size: size * 0.34, weight: .medium))
-                    .foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
+                    .font(.system(size: size * 0.38, weight: .semibold))
+                    .foregroundStyle(.white)
             }
         }
         .frame(width: size, height: size)
@@ -4128,78 +4386,74 @@ struct SiteRow: View {
         .accessibilityHidden(true)
     }
 
-    @ViewBuilder private var signStatusIcon: some View {
-        if site.signed || site.signIn {
-            Image(systemName: site.signed ? "checkmark.seal.fill" : "checkmark.seal")
-                .font(.caption)
-                .foregroundStyle(site.signed ? HarvestTheme.green : HarvestTheme.amber)
-                .accessibilityLabel(site.signed ? "今日已签到" : "今日待签到")
-        }
-    }
-
-    @ViewBuilder private var unreadIndicators: some View {
-        HStack(spacing: 7) {
-            if site.mail > 0 { Label("\(site.mail)", systemImage: "envelope.fill") }
-            if site.notice > 0 { Label("\(site.notice)", systemImage: "bell.fill") }
-            if site.mail == 0, site.notice == 0, site.unread > 0 {
-                Label("\(site.unread)", systemImage: "bell.badge.fill")
+    private func trafficMetric(label: String, value: String, delta: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 10) {
+            SymbolBadge(icon: icon, color: color, size: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.title3.weight(.bold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.62)
+                Text(delta)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
             }
-        }
-        .font(.caption.weight(.semibold))
-        .foregroundStyle(HarvestTheme.coral)
-        .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private var trafficMetrics: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 14) {
-                uploadMetric
-                downloadMetric
-            }
-            VStack(alignment: .leading, spacing: 7) {
-                uploadMetric
-                downloadMetric
-            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
-    private var uploadMetric: some View {
-        SiteTransferMetric(
-            label: "上传",
-            value: privateValue(formatBytes(site.uploaded)),
-            icon: "arrow.up",
-            color: HarvestTheme.green
-        )
+    private func siteBadge(_ label: String, icon: String, color: Color) -> some View {
+        Label(label, systemImage: icon)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(color, in: Capsule())
     }
 
-    private var downloadMetric: some View {
-        SiteTransferMetric(
-            label: "下载",
-            value: privateValue(formatBytes(site.downloaded)),
-            icon: "arrow.down",
-            color: HarvestTheme.blue
-        )
+    private func dailyDeltaText(_ value: Double) -> String {
+        guard !privacy else { return "今日 ••••" }
+        guard site.hasTodayData else { return "今日暂无增量" }
+        let prefix = value > 0 ? "+" : value < 0 ? "-" : ""
+        return "今日 \(prefix)\(formatBytes(abs(value)))"
     }
 
-    private var statusMetrics: some View {
-        HStack(spacing: 16) {
-            Label(ratioText, systemImage: "arrow.triangle.2.circlepath")
-                .foregroundStyle(ratioColor)
-            Label("\(site.seeding) 做种", systemImage: "leaf.fill")
-                .foregroundStyle(.secondary)
+    private var siteIdentityText: String {
+        let host = URL(string: site.url)?.host?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !host.isEmpty, !site.siteKey.isEmpty, host.caseInsensitiveCompare(site.siteKey) != .orderedSame {
+            return "\(site.siteKey) · \(host)"
         }
+        if !host.isEmpty { return host }
+        return site.siteKey.isEmpty ? "未配置站点地址" : site.siteKey
     }
 
-    private var identityText: String {
-        let username = site.username.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !username.isEmpty { return username }
-        if let host = URL(string: site.url)?.host, !host.isEmpty { return host }
-        return site.siteKey.isEmpty ? "未设置账号" : site.siteKey
+    private var joinedText: String {
+        guard let joined = parseDate(site.joinedAt) else { return shortDate(site.joinedAt) }
+        let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
+        return "\(days) 天"
     }
 
     private var ratioText: String { privateValue(String(format: "%.2f", site.ratio)) }
-    private var ratioColor: Color { !privacy && site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : .primary }
+    private var ratioColor: Color { !privacy && site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.green }
+    private var hrText: String {
+        let value = site.hr.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? "0" : value
+    }
+
+    private func shortDate(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "-" }
+        if let date = parseDate(trimmed) {
+            return date.formatted(date: .abbreviated, time: .omitted)
+        }
+        return String(trimmed.prefix(10))
+    }
+
     private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
 
     private var accessibilitySummary: String {
@@ -4213,23 +4467,51 @@ struct SiteRow: View {
     }
 }
 
-private struct SiteTransferMetric: View {
+private struct SiteCardMetric: View {
+    let icon: String
     let label: String
     let value: String
-    let icon: String
     let color: Color
 
     var body: some View {
-        HStack(spacing: 4) {
+        VStack(spacing: 4) {
             Image(systemName: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 26, height: 26)
+                .background(color, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             Text(value)
+                .font(.caption.weight(.bold))
                 .monospacedDigit()
-                .minimumScaleFactor(0.76)
+                .lineLimit(1)
+                .minimumScaleFactor(0.58)
         }
-        .font(.caption.weight(.medium))
-        .foregroundStyle(color)
-        .lineLimit(1)
+        .frame(maxWidth: .infinity, minHeight: 58)
         .accessibilityLabel("\(label) \(value)")
+    }
+}
+
+private struct SiteMetadataItem: View {
+    let icon: String
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 19, height: 19)
+                .background(color, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+            Text(label)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 }
 
@@ -5236,7 +5518,10 @@ struct SiteDetailView: View {
             List {
                 Section {
                     HStack(spacing: 14) {
-                        SiteDetailIcon(site: current, iconURL: model.logoURL(for: current))
+                        SiteDetailIcon(
+                            site: current,
+                            iconCandidates: model.logoCandidates(for: current, appState: appState)
+                        )
                         VStack(alignment: .leading, spacing: 4) {
                             Text(current.name).font(.headline)
                             Text(current.siteType.isEmpty ? current.siteKey : current.siteType)
@@ -6821,21 +7106,21 @@ private struct BrowserBonusSheet: View {
 
 private struct SiteDetailIcon: View {
     let site: SiteItem
-    let iconURL: URL?
+    let iconCandidates: [RemoteImageCandidate]
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
-            if let iconURL {
-                CachedRemoteImage(url: iconURL) { image in image.resizable().scaledToFit() } placeholder: {
-                    Image(systemName: "globe.americas.fill").foregroundStyle(HarvestTheme.green)
-                }
-                .padding(10)
-            } else {
-                Image(systemName: "globe.americas.fill").foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
+                .fill(site.enabled ? HarvestTheme.blue : Color.secondary)
+            CachedRemoteImageCandidates(candidates: iconCandidates) { image in
+                image.resizable().scaledToFit().padding(8)
+            } placeholder: {
+                Image(systemName: "globe.americas.fill")
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
             }
         }
         .frame(width: 64, height: 64)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
 
@@ -8182,27 +8467,26 @@ struct DownloadsView: View {
                         }
                         .frame(minHeight: 260)
                     } else {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 10) {
-                                ForEach(model.downloaders) { downloader in
-                                    DownloaderCard(
-                                        item: downloader,
-                                        onAddTorrent: {
-                                            addTorrentDownloaderID = downloader.id
-                                            showAddTorrent = true
-                                        },
-                                        onEdit: { editingDownloader = downloader },
-                                        onSettings: { settingsDownloader = downloader },
-                                        onTools: { toolsDownloader = downloader },
-                                        onToggle: { Task { await model.toggle(appState, downloader: downloader) } },
-                                        onToggleBrush: { Task { await model.toggleBrush(appState, downloader: downloader) } },
-                                        onRepeat: { repeatingDownloader = downloader },
-                                        onDelete: { deletingDownloader = downloader }
-                                    )
-                                }
+                        LazyVStack(spacing: 12) {
+                            ForEach(model.downloaders) { downloader in
+                                DownloaderCard(
+                                    item: downloader,
+                                    onAddTorrent: {
+                                        addTorrentDownloaderID = downloader.id
+                                        showAddTorrent = true
+                                    },
+                                    onEdit: { editingDownloader = downloader },
+                                    onSettings: { settingsDownloader = downloader },
+                                    onTools: { toolsDownloader = downloader },
+                                    onToggle: { Task { await model.toggle(appState, downloader: downloader) } },
+                                    onToggleBrush: { Task { await model.toggleBrush(appState, downloader: downloader) } },
+                                    onRepeat: { repeatingDownloader = downloader },
+                                    onDelete: { deletingDownloader = downloader }
+                                )
+                                .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .padding(.horizontal, 16)
                         }
+                        .padding(.horizontal, 16)
                     }
                 }.padding(.vertical, 12)
             }
@@ -8552,7 +8836,8 @@ struct DownloaderCard: View {
                 .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
             }
         }
-        .padding(14).frame(width: 330, alignment: .leading)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)

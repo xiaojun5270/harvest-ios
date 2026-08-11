@@ -747,6 +747,138 @@ struct TaskResultDetailSheet: View {
     }
 }
 
+private func isDoubanSource(_ source: String) -> Bool {
+    let normalized = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalized.contains("豆瓣") || normalized.contains("douban")
+}
+
+private func mediaStringValue(_ value: Any?, depth: Int = 0) -> String? {
+    guard depth < 4 else { return nil }
+    if let value = value as? String {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+    if let value = value as? NSNumber {
+        return value.stringValue
+    }
+    if let dictionary = value as? [String: Any] {
+        for key in ["url", "src", "href", "large", "normal", "medium", "small", "value"] {
+            if let result = mediaStringValue(dictionary[key], depth: depth + 1) { return result }
+        }
+    }
+    if let values = value as? [Any] {
+        for item in values {
+            if let result = mediaStringValue(item, depth: depth + 1) { return result }
+        }
+    }
+    return nil
+}
+
+private func mediaImageValue(_ content: [String: Any]) -> String {
+    let keys = [
+        "poster_path", "profile_path", "poster_url", "posterUrl", "poster",
+        "cover_url", "coverUrl", "cover", "pic", "image_url", "imageUrl",
+        "image", "images", "img", "thumbnail", "thumb", "icon", "grey_icon", "logo",
+        "large", "medium"
+    ]
+    for key in keys {
+        if let value = mediaStringValue(content[key]) { return value }
+    }
+    return ""
+}
+
+private func isNumericMediaID(_ value: String) -> Bool {
+    !value.isEmpty && value.unicodeScalars.allSatisfy { CharacterSet.decimalDigits.contains($0) }
+}
+
+private func doubanSubjectID(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if isNumericMediaID(trimmed) { return trimmed }
+
+    let tokens = trimmed.split { character in
+        !(character.isLetter || character.isNumber)
+    }.map(String.init)
+    if let subjectIndex = tokens.firstIndex(where: { $0.caseInsensitiveCompare("subject") == .orderedSame }),
+       tokens.index(after: subjectIndex) < tokens.endIndex {
+        let candidate = tokens[tokens.index(after: subjectIndex)]
+        if isNumericMediaID(candidate) { return candidate }
+    }
+    if let idIndex = tokens.firstIndex(where: {
+        ["id", "subjectid", "subject_id", "doubanid", "douban_id"].contains($0.lowercased())
+    }), tokens.index(after: idIndex) < tokens.endIndex {
+        let candidate = tokens[tokens.index(after: idIndex)]
+        if isNumericMediaID(candidate) { return candidate }
+    }
+    return tokens.reversed().first(where: { isNumericMediaID($0) && $0.count >= 3 })
+}
+
+private func mediaRows(_ value: Any, depth: Int = 0) -> [[String: Any]] {
+    guard depth < 6 else { return [] }
+    if let rows = value as? [[String: Any]], !rows.isEmpty { return rows }
+    if let values = value as? [Any] {
+        let rows = values.compactMap { $0 as? [String: Any] }
+        if !rows.isEmpty { return rows }
+    }
+    guard let dictionary = value as? [String: Any] else { return [] }
+    for key in [
+        "data", "results", "items", "list", "rows", "records", "subjects",
+        "movies", "tv", "tv_shows", "targets", "hot", "entries"
+    ] {
+        if let nested = dictionary[key] {
+            let rows = mediaRows(nested, depth: depth + 1)
+            if !rows.isEmpty { return rows }
+        }
+    }
+    if dictionary.dict("target") != nil || dictionary.string(
+        "title", "name", "id", "target_id", "subject_id", "douban_url", "doubanUrl", "url",
+        "poster", "cover", "cover_url", "poster_url"
+    ) != nil {
+        return [dictionary]
+    }
+    if let rows = jsonRows(value), !rows.isEmpty { return rows }
+    return []
+}
+
+private func mediaPayloadDictionary(_ value: Any, depth: Int = 0) -> [String: Any]? {
+    guard depth < 6, let dictionary = value as? [String: Any] else { return nil }
+    let hasMediaFields = dictionary.string("title", "name", "id", "subject_id") != nil || !mediaImageValue(dictionary).isEmpty
+    if hasMediaFields {
+        return dictionary
+    }
+    for key in ["data", "result", "subject", "target", "movie"] {
+        if let nested = dictionary[key],
+           let payload = mediaPayloadDictionary(nested, depth: depth + 1) {
+            return payload
+        }
+    }
+    return dictionary
+}
+
+private func mediaCookie(_ raw: [String: Any]) -> String? {
+    let content = raw.dict("target") ?? raw
+    return mediaStringValue(content["cookie"])
+        ?? mediaStringValue(content["cookies"])
+        ?? mediaStringValue(content["douban_cookie"])
+        ?? mediaStringValue(raw["cookie"])
+        ?? mediaStringValue(raw["cookies"])
+        ?? mediaStringValue(raw["douban_cookie"])
+}
+
+private func mediaImageHeaders(source: String, raw: [String: Any] = [:]) -> [String: String] {
+    var headers: [String: String] = [:]
+    if isDoubanSource(source) {
+        headers["Referer"] = doubanImageReferer
+        headers["User-Agent"] = doubanImageUserAgent
+        if let cookie = mediaCookie(raw), !cookie.isEmpty {
+            headers["Cookie"] = cookie
+                .replacingOccurrences(of: "\r", with: "")
+                .replacingOccurrences(of: "\n", with: "")
+        }
+    }
+    return headers
+}
+
 struct MediaItem: Identifiable {
     let id: String
     var remoteID: String
@@ -762,19 +894,39 @@ struct MediaItem: Identifiable {
 
     init(_ json: [String: Any], source: String, mediaType: String = "") {
         let content = json.dict("target") ?? json
-        remoteID = content.string("id", "subject_id", "tmdb_id", "douban_url", "url")
-            ?? json.string("target_id", "targetId")
-            ?? UUID().uuidString
+        let rawRemoteID = content.string(
+            "id", "subject_id", "subjectId", "douban_id", "doubanId", "tmdb_id",
+            "douban_url", "doubanUrl", "subject_url", "subjectUrl", "url", "uri"
+        ) ?? json.string(
+            "target_id", "targetId", "subject_id", "subjectId",
+            "douban_url", "doubanUrl", "subject_url", "subjectUrl", "url", "uri", "hash"
+        )
+        let normalizedRemoteID = isDoubanSource(source)
+            ? rawRemoteID.flatMap(doubanSubjectID)
+            : rawRemoteID
+        remoteID = normalizedRemoteID ?? rawRemoteID ?? UUID().uuidString
         let resolvedType = mediaType.isEmpty ? (json.string("media_type", "target_type", "targetType") ?? content.string("media_type") ?? "") : mediaType
         id = "\(source):\(resolvedType):\(remoteID)"
-        title = content.string("title", "name", "original_title") ?? "未命名"
-        subtitle = content.string("original_title", "original_name", "card_subtitle") ?? ""
-        overview = content.string("overview", "abstract", "summary", "intro", "quote", "episodes_info") ?? ""
-        poster = mediaPosterURL(content.string("poster_path", "profile_path", "poster", "cover_url", "cover") ?? "", source: source)
-        score = content.double("vote_average", "score", "rate", "rating_num")
+        title = content.string("title", "name", "original_title")
+            ?? json.string("title", "name", "original_title")
+            ?? "未命名"
+        subtitle = content.string("original_title", "original_name", "card_subtitle")
+            ?? mediaStringValue(content["subtitle"])
+            ?? json.string("original_title", "original_name", "card_subtitle")
+            ?? mediaStringValue(json["subtitle"])
+            ?? ""
+        overview = content.string("overview", "abstract", "summary", "intro", "quote", "episodes_info")
+            ?? json.string("overview", "abstract", "summary", "intro", "quote", "episodes_info")
+            ?? ""
+        let imageValue = mediaImageValue(content)
+        poster = mediaPosterURL(imageValue.isEmpty ? mediaImageValue(json) : imageValue, source: source)
+        score = content.double("vote_average", "score", "rate", "rating_num", "rating")
+            ?? json.double("vote_average", "score", "rate", "rating_num", "rating")
             ?? content.dict("rating")?.double("value", "star_count")
+            ?? json.dict("rating")?.double("value", "star_count")
             ?? 0
-        year = content.string("release_date", "first_air_date", "year")?.prefix(4).description ?? ""
+        year = (content.string("release_date", "first_air_date", "year")
+            ?? json.string("release_date", "first_air_date", "year"))?.prefix(4).description ?? ""
         self.source = source
         self.mediaType = resolvedType
         raw = json
@@ -782,11 +934,15 @@ struct MediaItem: Identifiable {
 }
 
 private func mediaPosterURL(_ value: String, source: String) -> String {
-    guard !value.isEmpty else { return "" }
-    if source == "TMDB", value.hasPrefix("/") {
-        return "https://image.tmdb.org/t/p/w500\(value)"
+    var normalized = normalizedRemoteImageURL(value)
+    guard !normalized.isEmpty else { return "" }
+    if source == "TMDB", normalized.hasPrefix("/") {
+        normalized = "https://image.tmdb.org/t/p/w500\(normalized)"
     }
-    return value
+    if isDoubanSource(source), normalized.hasPrefix("/") {
+        normalized = "https://movie.douban.com\(normalized)"
+    }
+    return normalized
 }
 
 enum ResourceSearchSortField: String, CaseIterable, Identifiable {
@@ -910,7 +1066,7 @@ final class SearchViewModel: ObservableObject {
                     appState,
                     path: APIPath.doubanSearch,
                     source: "豆瓣",
-                    query: ["q": term, "query": term]
+                    query: ["q": term]
                 )
                 let (tmdb, douban) = await (tmdbResult, doubanResult)
                 guard searchGeneration == generation else { return }
@@ -920,6 +1076,10 @@ final class SearchViewModel: ObservableObject {
                     appState.presentedError = [tmdb.errorMessage, douban.errorMessage]
                         .compactMap { $0 }
                         .joined(separator: "\n")
+                } else if douban.errorMessage != nil {
+                    statusMessage += " · 豆瓣搜索暂不可用"
+                } else if tmdb.errorMessage != nil {
+                    statusMessage += " · TMDB 搜索暂不可用"
                 }
             } else {
                 for try await event in APIClient.shared.streamSSE(
@@ -976,8 +1136,15 @@ final class SearchViewModel: ObservableObject {
     ) async -> (items: [MediaItem], errorMessage: String?) {
         do {
             let raw = try await appState.api(path, query: query)
-            return (jsonRows(raw).map { MediaItem($0, source: source) }, nil)
+            let rows = mediaRows(raw)
+            if rows.isEmpty {
+                await AppLogStore.shared.append(.warning, "\(source) 返回空或未知的数据结构")
+            } else {
+                await AppLogStore.shared.append(.info, "\(source) 解析到 \(rows.count) 条影视数据")
+            }
+            return (rows.map { MediaItem($0, source: source) }, nil)
         } catch {
+            await AppLogStore.shared.append(.error, "\(source) 影视接口失败：\(error.localizedDescription)")
             return ([], "\(source)：\(error.localizedDescription)")
         }
     }
@@ -1593,7 +1760,10 @@ struct MediaRow: View {
     let item: MediaItem
     var body: some View {
         HStack(spacing: 12) {
-            CachedRemoteImage(url: URL(string: item.poster)) { image in
+            CachedRemoteImage(
+                url: URL(string: item.poster),
+                headers: mediaImageHeaders(source: item.source, raw: item.raw)
+            ) { image in
                 image.resizable().scaledToFill()
             } placeholder: {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -1675,7 +1845,10 @@ struct MediaDetailSheet: View {
             List {
                 Section {
                     HStack(alignment: .top, spacing: 14) {
-                        CachedRemoteImage(url: URL(string: poster)) { image in
+                        CachedRemoteImage(
+                            url: URL(string: poster),
+                            headers: imageHeaders
+                        ) { image in
                             image.resizable().scaledToFill()
                         } placeholder: {
                             Color.secondary.opacity(0.12)
@@ -1766,7 +1939,11 @@ struct MediaDetailSheet: View {
                     Section("预告片") {
                         ForEach(Array(trailers.enumerated()), id: \.offset) { _, trailer in
                             mediaLink(destination: trailer.string("video_url", "url")) {
-                                MediaTrailerCard(trailer: trailer)
+                                MediaTrailerCard(
+                                    trailer: trailer,
+                                    source: item.source,
+                                    headers: imageHeaders
+                                )
                             }
                         }
                     }
@@ -1808,10 +1985,20 @@ struct MediaDetailSheet: View {
     }
 
     private var resolved: [String: Any] { detail ?? item.raw.dict("target") ?? item.raw }
+    private var imageHeaders: [String: String] {
+        var headers = mediaImageHeaders(source: item.source, raw: item.raw)
+        for (key, value) in mediaImageHeaders(source: item.source, raw: resolved) {
+            headers[key] = value
+        }
+        return headers
+    }
     private var title: String { resolved.string("title", "name") ?? item.title }
     private var subtitle: String { resolved.string("original_title", "original_name", "card_subtitle") ?? item.subtitle }
     private var overview: String { resolved.string("overview", "summary", "abstract", "intro", "biography") ?? item.overview }
-    private var poster: String { mediaPosterURL(resolved.string("poster_path", "profile_path", "cover_url", "cover") ?? item.poster, source: item.source) }
+    private var poster: String {
+        let value = mediaImageValue(resolved)
+        return mediaPosterURL(value.isEmpty ? item.poster : value, source: item.source)
+    }
     private var score: Double { resolved.double("vote_average", "score") ?? resolved.dict("rating")?.double("value") ?? item.score }
     private var ratingCount: Int { resolved.int("vote_count") ?? resolved.dict("rating")?.int("count") ?? 0 }
     private var ratingUnavailableReason: String { resolved.string("null_rating_reason") ?? "" }
@@ -1902,7 +2089,7 @@ struct MediaDetailSheet: View {
     private func load() async {
         defer { isLoading = false }
         let path: String
-        if item.source == "豆瓣" {
+        if isDoubanSource(item.source) {
             path = APIPath.doubanSubject + urlPathSegment(item.remoteID)
         } else {
             switch item.mediaType.lowercased() {
@@ -1911,7 +2098,7 @@ struct MediaDetailSheet: View {
             default: path = APIPath.tmdbMovie + urlPathSegment(item.remoteID)
             }
         }
-        do { detail = jsonPayloadDictionary(try await appState.api(path)) }
+        do { detail = mediaPayloadDictionary(try await appState.api(path)) }
         catch { appState.presentedError = error.localizedDescription }
     }
 }
@@ -1921,7 +2108,9 @@ private struct MediaVendorRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            CachedRemoteImage(url: URL(string: vendor.string("icon", "grey_icon") ?? "")) { image in
+            CachedRemoteImage(
+                url: URL(string: normalizedRemoteImageURL(mediaImageValue(vendor)))
+            ) { image in
                 image.resizable().scaledToFit()
             } placeholder: {
                 Image(systemName: "play.tv").foregroundStyle(.secondary)
@@ -1944,10 +2133,15 @@ private struct MediaVendorRow: View {
 
 private struct MediaTrailerCard: View {
     let trailer: [String: Any]
+    let source: String
+    let headers: [String: String]
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            CachedRemoteImage(url: URL(string: trailer.string("cover_url", "cover") ?? "")) { image in
+            CachedRemoteImage(
+                url: URL(string: mediaPosterURL(mediaImageValue(trailer), source: source)),
+                headers: headers
+            ) { image in
                 image.resizable().scaledToFill()
             } placeholder: {
                 Color.secondary.opacity(0.12)
@@ -2303,18 +2497,6 @@ struct NewsView: View {
     }
 
     private func load() async {
-        if appState.mediaDoubanEnabled && doubanTags.count == 1 {
-            do {
-                let raw = try await appState.api(APIPath.doubanTags, query: ["category": "movie"])
-                let values = jsonStrings(raw)
-                if !values.isEmpty {
-                    doubanTags = Array(Set(["热门"] + values)).sorted()
-                }
-            } catch {
-                // Catalog loading below remains available when the tag endpoint is disabled.
-            }
-        }
-
         let tag = selectedDoubanTag
         var definitions: [MediaCatalogDefinition] = []
         if appState.mediaTMDBEnabled {
@@ -2359,28 +2541,64 @@ struct NewsView: View {
         isLoading = collections.isEmpty && !definitions.isEmpty
         defer { isLoading = false }
         let previous = Dictionary(uniqueKeysWithValues: collections.map { ($0.cacheKey, $0) })
-        var loaded: [MediaCollection] = []
+        let fetchOrder = definitions.enumerated()
+            .sorted { left, right in
+                let leftDouban = isDoubanSource(left.element.source)
+                let rightDouban = isDoubanSource(right.element.source)
+                if leftDouban != rightDouban { return leftDouban }
+                return left.offset < right.offset
+            }
+            .map { $0.element }
+        var loadedByKey: [String: MediaCollection] = [:]
         var usedCachedFallback = false
-        for definition in definitions {
+        var loadedDoubanCatalog = false
+        for definition in fetchOrder {
             if let result = await fetchCollection(definition) {
                 await appState.writeSessionCache(result.raw, name: definition.cacheKey)
-                if !result.collection.items.isEmpty { loaded.append(result.collection) }
+                if !result.collection.items.isEmpty {
+                    loadedByKey[definition.cacheKey] = result.collection
+                    if isDoubanSource(definition.source) { loadedDoubanCatalog = true }
+                }
             } else if let fallback = previous[definition.cacheKey] {
-                loaded.append(fallback)
+                loadedByKey[definition.cacheKey] = fallback
                 usedCachedFallback = true
+                if isDoubanSource(definition.source), !fallback.items.isEmpty {
+                    loadedDoubanCatalog = true
+                }
             }
+            collections = definitions.compactMap { loadedByKey[$0.cacheKey] ?? previous[$0.cacheKey] }
+            if !collections.isEmpty { isLoading = false }
         }
+        let loaded = definitions.compactMap { loadedByKey[$0.cacheKey] }
         collections = loaded
         usingCachedData = usedCachedFallback
         if !usedCachedFallback { cachedAt = nil }
-        if loaded.isEmpty && !definitions.isEmpty { appState.presentedError = "影视资讯暂时不可用，请检查 TMDB/豆瓣配置" }
+        if appState.mediaDoubanEnabled && !loadedDoubanCatalog {
+            appState.presentedError = "豆瓣影视暂时无法获取，请检查后端豆瓣 Cookie 与外网连接"
+        } else if loaded.isEmpty && !definitions.isEmpty {
+            appState.presentedError = "影视资讯暂时不可用，请检查 TMDB/豆瓣配置"
+        }
+        isLoading = false
+
+        // 标签接口不是目录数据的前置依赖，放到首屏目录之后读取，避免它阻塞影视内容。
+        if appState.mediaDoubanEnabled && doubanTags.count == 1 {
+            do {
+                let raw = try await appState.api(APIPath.doubanTags, query: ["category": "movie"])
+                let values = jsonStrings(raw)
+                if !values.isEmpty {
+                    doubanTags = Array(Set(["热门"] + values)).sorted()
+                }
+            } catch {
+                await AppLogStore.shared.append(.warning, "豆瓣标签接口不可用：\(error.localizedDescription)")
+            }
+        }
     }
 
     private func cachedCollection(
         _ definition: MediaCatalogDefinition
     ) async -> (collection: MediaCollection, cachedAt: Date)? {
         guard let cached = await appState.readSessionCache(definition.cacheKey) else { return nil }
-        let items = jsonRows(cached.value).map {
+        let items = mediaRows(cached.value).map {
             MediaItem($0, source: definition.source, mediaType: definition.mediaType)
         }
         return (
@@ -2394,7 +2612,13 @@ struct NewsView: View {
     ) async -> (collection: MediaCollection, raw: Any)? {
         do {
             let raw = try await appState.api(definition.path, query: definition.query)
-            let items = jsonRows(raw).map {
+            let rows = mediaRows(raw)
+            if rows.isEmpty {
+                await AppLogStore.shared.append(.warning, "\(definition.source) \(definition.title) 返回空数据")
+                return nil
+            }
+            await AppLogStore.shared.append(.info, "\(definition.source) \(definition.title) 解析到 \(rows.count) 条数据")
+            let items = rows.map {
                 MediaItem($0, source: definition.source, mediaType: definition.mediaType)
             }
             return (
@@ -2402,6 +2626,7 @@ struct NewsView: View {
                 raw
             )
         } catch {
+            await AppLogStore.shared.append(.error, "\(definition.source) \(definition.title) 加载失败：\(error.localizedDescription)")
             return nil
         }
     }
@@ -2423,7 +2648,10 @@ struct MediaCarousel: View {
                         ForEach(items.prefix(12)) { item in
                             Button { onSelect(item) } label: {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    CachedRemoteImage(url: URL(string: item.poster)) { image in
+                                    CachedRemoteImage(
+                                        url: URL(string: item.poster),
+                                        headers: mediaImageHeaders(source: item.source, raw: item.raw)
+                                    ) { image in
                                         image.resizable().scaledToFill()
                                     } placeholder: {
                                         Color.secondary.opacity(0.12)
