@@ -3721,6 +3721,7 @@ final class BrowserSessionModel: ObservableObject {
     @Published private(set) var canGoForward = false
     @Published private(set) var currentURL: URL?
     @Published private(set) var isLoading = false
+    @Published private(set) var loadError: String?
     @Published var pendingTorrent: BrowserTorrentRequest?
     weak var webView: WKWebView?
 
@@ -3737,16 +3738,53 @@ final class BrowserSessionModel: ObservableObject {
         isLoading = view.isLoading
     }
 
-    func goBack() { webView?.goBack() }
-    func goForward() { webView?.goForward() }
-    func reload() { webView?.reload() }
+    func goBack() {
+        loadError = nil
+        webView?.goBack()
+    }
+
+    func goForward() {
+        loadError = nil
+        webView?.goForward()
+    }
+
+    func reload() {
+        loadError = nil
+        webView?.reload()
+    }
 
     func setUserAgent(_ value: String?) {
+        loadError = nil
         webView?.customUserAgent = value?.trimmingCharacters(in: .whitespacesAndNewlines)
         webView?.reload()
     }
 
-    func load(_ url: URL) { webView?.load(URLRequest(url: url)) }
+    func load(_ url: URL) {
+        loadError = nil
+        webView?.load(URLRequest(url: url))
+    }
+
+    func navigationStarted(_ webView: WKWebView) {
+        loadError = nil
+        refreshState(webView)
+    }
+
+    func navigationFinished(_ webView: WKWebView) {
+        loadError = nil
+        refreshState(webView)
+    }
+
+    func navigationFailed(_ webView: WKWebView, error: Error) {
+        let nsError = error as NSError
+        let cancelledRequest = nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+        let interruptedByPolicy = nsError.domain == "WebKitErrorDomain" && nsError.code == 102
+        if cancelledRequest || interruptedByPolicy {
+            refreshState(webView)
+            return
+        }
+        loadError = error.localizedDescription
+        refreshState(webView)
+    }
 
     func interceptTorrent(_ request: BrowserTorrentRequest) {
         pendingTorrent = request
@@ -3931,7 +3969,7 @@ struct NativeBrowserView: UIViewRepresentable {
         init(session: BrowserSessionModel?) { self.session = session }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation?) {
-            session?.refreshState(webView)
+            session?.navigationStarted(webView)
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation?) {
@@ -3939,15 +3977,15 @@ struct NativeBrowserView: UIViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
-            session?.refreshState(webView)
+            session?.navigationFinished(webView)
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation?, withError error: Error) {
-            session?.refreshState(webView)
+            session?.navigationFailed(webView, error: error)
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation?, withError error: Error) {
-            session?.refreshState(webView)
+            session?.navigationFailed(webView, error: error)
         }
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -4001,6 +4039,94 @@ struct NativeBrowserView: UIViewRepresentable {
                 webView.load(navigationAction.request)
             }
             return nil
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            runJavaScriptAlertPanelWithMessage message: String,
+            initiatedByFrame frame: WKFrameInfo,
+            completionHandler: @escaping () -> Void
+        ) {
+            guard let presenter = presentationController(for: webView) else {
+                completionHandler()
+                return
+            }
+            let alert = UIAlertController(
+                title: webDialogTitle(for: frame, fallback: webView),
+                message: message,
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "好", style: .default) { _ in completionHandler() })
+            presenter.present(alert, animated: true)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            runJavaScriptConfirmPanelWithMessage message: String,
+            initiatedByFrame frame: WKFrameInfo,
+            completionHandler: @escaping (Bool) -> Void
+        ) {
+            guard let presenter = presentationController(for: webView) else {
+                completionHandler(false)
+                return
+            }
+            let alert = UIAlertController(
+                title: webDialogTitle(for: frame, fallback: webView),
+                message: message,
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(false) })
+            alert.addAction(UIAlertAction(title: "确定", style: .default) { _ in completionHandler(true) })
+            presenter.present(alert, animated: true)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            runJavaScriptTextInputPanelWithPrompt prompt: String,
+            defaultText: String?,
+            initiatedByFrame frame: WKFrameInfo,
+            completionHandler: @escaping (String?) -> Void
+        ) {
+            guard let presenter = presentationController(for: webView) else {
+                completionHandler(nil)
+                return
+            }
+            let alert = UIAlertController(
+                title: webDialogTitle(for: frame, fallback: webView),
+                message: prompt,
+                preferredStyle: .alert
+            )
+            alert.addTextField { field in field.text = defaultText }
+            alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(nil) })
+            alert.addAction(UIAlertAction(title: "确定", style: .default) { _ in
+                completionHandler(alert.textFields?.first?.text)
+            })
+            presenter.present(alert, animated: true)
+        }
+
+        private func webDialogTitle(for frame: WKFrameInfo, fallback webView: WKWebView) -> String {
+            frame.request.url?.host ?? webView.url?.host ?? "网页提示"
+        }
+
+        private func presentationController(for webView: WKWebView) -> UIViewController? {
+            var controller = webView.window?.rootViewController
+            var advanced = true
+            while advanced {
+                advanced = false
+                if let presented = controller?.presentedViewController {
+                    controller = presented
+                    advanced = true
+                } else if let navigation = controller as? UINavigationController,
+                          let visible = navigation.visibleViewController {
+                    controller = visible
+                    advanced = true
+                } else if let tabs = controller as? UITabBarController,
+                          let selected = tabs.selectedViewController {
+                    controller = selected
+                    advanced = true
+                }
+            }
+            return controller
         }
     }
 

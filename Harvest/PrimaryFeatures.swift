@@ -2455,13 +2455,17 @@ final class SitesViewModel: ObservableObject {
 
     private func computeFilteredSites() -> [SiteItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let compactQuery = compactSiteSearchText(normalizedQuery)
         let values = sites.filter { site in
             if !normalizedQuery.isEmpty {
                 let config = config(for: site)
                 let searchableValues = [site.name, site.siteKey, site.url, site.username, site.email]
                     + [config?.string("name", "site"), config?.string("nickname")].compactMap { $0 }
                     + (config.map { configStrings($0["url"]) } ?? [])
-                let matches = searchableValues.contains { $0.localizedCaseInsensitiveContains(normalizedQuery) }
+                let matches = searchableValues.contains { value in
+                    value.localizedCaseInsensitiveContains(normalizedQuery)
+                        || (!compactQuery.isEmpty && compactSiteSearchText(value).contains(compactQuery))
+                }
                 if !matches { return false }
             }
             if availability == .alive && !site.enabled { return false }
@@ -2495,8 +2499,10 @@ final class SitesViewModel: ObservableObject {
             }
             if !selectedTags.isEmpty && selectedTags.isDisjoint(with: site.tags) { return false }
             if !selectedTypes.isEmpty && !selectedTypes.contains(resolvedSiteType(for: site)) { return false }
-            if !selectedUsername.isEmpty && site.username.lowercased() != selectedUsername.lowercased() { return false }
-            if !selectedEmail.isEmpty && site.email.lowercased() != selectedEmail.lowercased() { return false }
+            if !selectedUsername.isEmpty
+                && normalizedSiteIdentity(site.username) != normalizedSiteIdentity(selectedUsername) { return false }
+            if !selectedEmail.isEmpty
+                && normalizedSiteIdentity(site.email) != normalizedSiteIdentity(selectedEmail) { return false }
             return true
         }
         return values.sorted { left, right in
@@ -2566,7 +2572,7 @@ final class SitesViewModel: ObservableObject {
         ascending = field.defaultAscending
     }
 
-    func load(_ appState: AppState) async {
+    func load(_ appState: AppState, cached: Bool = true) async {
         let cacheKey = "site.info.list"
         if !didRestoreCache {
             didRestoreCache = true
@@ -2579,7 +2585,7 @@ final class SitesViewModel: ObservableObject {
         isLoading = sites.isEmpty && !usingCachedData
         defer { isLoading = false }
         do {
-            let raw = try await appState.api(APIPath.sites)
+            let raw = try await appState.api(APIPath.sites, query: ["cached": cached])
             sites = jsonRows(raw).map(SiteItem.init)
             cachedAt = nil
             usingCachedData = false
@@ -2600,19 +2606,33 @@ final class SitesViewModel: ObservableObject {
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
-        if await appState.perform(path + "\(site.id)", method: .get) { await load(appState) }
+        if await appState.perform(path + "\(site.id)", method: .get) {
+            await load(appState, cached: false)
+        }
     }
 
     func delete(_ appState: AppState, site: SiteItem) async {
         if await appState.perform("\(APIPath.sites)/\(site.id)", method: .delete) {
             sites.removeAll { $0.id == site.id }
             await appState.removeSessionCache("site.info.list")
+            await load(appState, cached: false)
         }
     }
 
     private func numberCompare(_ left: Double, _ right: Double) -> ComparisonResult {
         if left == right { return .orderedSame }
         return left < right ? .orderedAscending : .orderedDescending
+    }
+
+    private func compactSiteSearchText(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+    }
+
+    private func normalizedSiteIdentity(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
@@ -2634,6 +2654,34 @@ final class SitesViewModel: ObservableObject {
 
     private func resolvedSiteType(for site: SiteItem) -> String {
         config(for: site)?.string("type", "site_type", "siteType") ?? site.siteType
+    }
+
+    func logoURL(for site: SiteItem) -> URL? {
+        let siteConfig = config(for: site)
+        let candidates = [
+            site.iconURL,
+            siteConfig?.string("logo", "icon", "favicon") ?? ""
+        ]
+        let baseValues = [site.url] + (siteConfig.map { configStrings($0["url"]) } ?? [])
+
+        for rawValue in candidates {
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { continue }
+            if value.hasPrefix("//") {
+                let scheme = baseValues.compactMap { URL(string: $0)?.scheme }.first ?? "https"
+                if let url = URL(string: "\(scheme):\(value)") { return url }
+            }
+            if let absolute = URL(string: value), ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
+                return absolute
+            }
+            for baseValue in baseValues {
+                guard let baseURL = URL(string: baseValue),
+                      ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
+                      let resolved = URL(string: value, relativeTo: baseURL)?.absoluteURL else { continue }
+                return resolved
+            }
+        }
+        return nil
     }
 
     private func milestone(for site: SiteItem) -> SiteLevelMilestone? {
@@ -2693,7 +2741,11 @@ struct SitesView: View {
                     }
                     List {
                         ForEach(model.filtered) { site in
-                            Button { selectedSite = site } label: { SiteRow(site: site, privacy: appState.privacyMode) }
+                            Button {
+                                selectedSite = site
+                            } label: {
+                                SiteRow(site: site, privacy: appState.privacyMode, iconURL: model.logoURL(for: site))
+                            }
                                 .buttonStyle(.plain)
                                 .contextMenu { SiteActions(site: site, model: model) }
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -2737,12 +2789,15 @@ struct SitesView: View {
             model.query = ""
             model.resetFilters()
         }
-        .sheet(isPresented: $showAdd) { SiteEditorSheet(onSaved: { await model.load(appState) }).environmentObject(appState) }
+        .sheet(isPresented: $showAdd) { SiteEditorSheet(onSaved: { await model.load(appState, cached: false) }).environmentObject(appState) }
         .sheet(isPresented: $showFilters) { SiteFilterSheet(model: model) }
-        .sheet(isPresented: $showImport) { SiteImportSheet(onComplete: { await model.load(appState) }).environmentObject(appState) }
-        .sheet(isPresented: $showGenerator) { SiteConfigGeneratorSheet().environmentObject(appState) }
+        .sheet(isPresented: $showImport) { SiteImportSheet(onComplete: { await model.load(appState, cached: false) }).environmentObject(appState) }
+        .sheet(isPresented: $showGenerator) {
+            SiteConfigGeneratorSheet(onSaved: { await model.load(appState, cached: false) })
+                .environmentObject(appState)
+        }
         .sheet(isPresented: $showTimeline) { SiteTimelineView(model: model).environmentObject(appState) }
-        .sheet(item: $editingSite) { site in SiteEditorSheet(site: site, onSaved: { await model.load(appState) }).environmentObject(appState) }
+        .sheet(item: $editingSite) { site in SiteEditorSheet(site: site, onSaved: { await model.load(appState, cached: false) }).environmentObject(appState) }
         .sheet(item: $selectedSite) { site in SiteDetailView(site: site, model: model).environmentObject(appState).presentationDetents([.medium, .large]) }
         .confirmationDialog(
             "确定删除站点「\(deletingSite?.name ?? "")」？",
@@ -3041,7 +3096,7 @@ struct SiteTimelineView: View {
 
     @ViewBuilder private func browserDestination(_ entry: SiteTimelineEntry, urlString: String) -> some View {
         SiteBrowserScreen(site: entry.browserSite, urlString: urlString, title: entry.displayName) {
-            await model.load(appState)
+            await model.load(appState, cached: false)
         }
     }
 
@@ -3324,6 +3379,7 @@ struct SiteImportSheet: View {
 struct SiteConfigGeneratorSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
+    let onSaved: () async -> Void
     @State private var configs: [[String: Any]] = []
     @State private var selectedName = ""
     @State private var configName = ""
@@ -3333,6 +3389,10 @@ struct SiteConfigGeneratorSheet: View {
     @State private var isSaving = false
     @State private var exportedFile: GeneratedSiteConfigFile?
     @State private var editorMode = SiteConfigEditorMode.form
+
+    init(onSaved: @escaping () async -> Void = {}) {
+        self.onSaved = onSaved
+    }
 
     var body: some View {
         NavigationStack {
@@ -3426,6 +3486,7 @@ struct SiteConfigGeneratorSheet: View {
                 fields: ["overwrite": String(overwrite)],
                 parts: [MultipartPart(fieldName: "files", fileName: "\(normalizedName).toml", mimeType: "application/toml", data: data)]
             )
+            await onSaved()
         } catch { appState.presentedError = error.localizedDescription }
     }
 
@@ -3910,14 +3971,22 @@ private func safeFileName(_ value: String) -> String {
 struct SiteRow: View {
     let site: SiteItem
     let privacy: Bool
+    let iconURL: URL?
+
+    init(site: SiteItem, privacy: Bool, iconURL: URL? = nil) {
+        self.site = site
+        self.privacy = privacy
+        self.iconURL = iconURL
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
                     .frame(width: 48, height: 48)
-                if let url = URL(string: site.iconURL), !site.iconURL.isEmpty {
-                    CachedRemoteImage(url: url) { image in
+                if let iconURL {
+                    CachedRemoteImage(url: iconURL) { image in
                         image.resizable().scaledToFit()
                     } placeholder: {
                         Image(systemName: site.enabled ? "globe.americas.fill" : "globe.americas")
@@ -4911,7 +4980,7 @@ struct SiteDetailView: View {
             List {
                 Section {
                     HStack(spacing: 14) {
-                        SiteDetailIcon(site: current)
+                        SiteDetailIcon(site: current, iconURL: model.logoURL(for: current))
                         VStack(alignment: .leading, spacing: 4) {
                             Text(current.name).font(.headline)
                             Text(current.siteType.isEmpty ? current.siteKey : current.siteType)
@@ -5029,7 +5098,10 @@ struct SiteDetailView: View {
                                     site: current,
                                     urlString: resolvedPageURL(shortcut.path),
                                     title: shortcut.label,
-                                    onSynced: { await loadDetail() }
+                                    onSynced: {
+                                        await model.load(appState, cached: false)
+                                        await loadDetail()
+                                    }
                                 )
                             } label: {
                                 Label(shortcut.label, systemImage: shortcut.icon)
@@ -5045,7 +5117,10 @@ struct SiteDetailView: View {
                                 site: current,
                                 urlString: current.url,
                                 title: current.name,
-                                onSynced: { await loadDetail() }
+                                onSynced: {
+                                    await model.load(appState, cached: false)
+                                    await loadDetail()
+                                }
                             )
                         } label: {
                             Label("打开站点", systemImage: "safari")
@@ -5151,7 +5226,7 @@ struct SiteDetailView: View {
             return
         }
 
-        await model.load(appState)
+        await model.load(appState, cached: false)
         if let reloaded = model.sites.first(where: { $0.id == current.id }),
            flag.value(in: reloaded) == value {
             latestSite = reloaded
@@ -5619,16 +5694,45 @@ struct SiteBrowserScreen: View {
     }
 
     var body: some View {
-        NativeBrowserView(
-            urlString: urlString,
-            title: title,
-            cookie: site.cookie,
-            localStorage: site.localStorage,
-            userAgent: site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? browserSafariMacUserAgent : site.userAgent,
-            localStorageURLs: browserLocalStorageURLs,
-            installsLocalStorageAuthBridge: installsBrowserAuthBridge,
-            session: session
-        )
+        ZStack(alignment: .top) {
+            NativeBrowserView(
+                urlString: urlString,
+                title: title,
+                cookie: site.cookie,
+                localStorage: site.localStorage,
+                userAgent: site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? browserSafariMacUserAgent : site.userAgent,
+                localStorageURLs: browserLocalStorageURLs,
+                installsLocalStorageAuthBridge: installsBrowserAuthBridge,
+                session: session
+            )
+            if let error = session.loadError, !session.isLoading {
+                ContentUnavailableView {
+                    Label("网页加载失败", systemImage: "wifi.exclamationmark")
+                } description: {
+                    VStack(spacing: 6) {
+                        Text(error)
+                        Text((session.currentURL ?? URL(string: urlString))?.absoluteString ?? urlString)
+                            .font(.caption2.monospaced())
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                    }
+                } actions: {
+                    Button { session.reload() } label: {
+                        Label("重新加载", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(HarvestTheme.green)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.regularMaterial)
+            }
+            if session.isLoading {
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(HarvestTheme.green)
+                    .frame(maxWidth: .infinity)
+            }
+        }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -6461,12 +6565,13 @@ private struct BrowserBonusSheet: View {
 
 private struct SiteDetailIcon: View {
     let site: SiteItem
+    let iconURL: URL?
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
-            if let url = URL(string: site.iconURL), !site.iconURL.isEmpty {
-                CachedRemoteImage(url: url) { image in image.resizable().scaledToFit() } placeholder: {
+            if let iconURL {
+                CachedRemoteImage(url: iconURL) { image in image.resizable().scaledToFit() } placeholder: {
                     Image(systemName: "globe.americas.fill").foregroundStyle(HarvestTheme.green)
                 }
                 .padding(10)

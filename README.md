@@ -23,7 +23,8 @@ side by side.
   image URLs remain memory-only
 - Swift Charts dashboard visualizations
 - WebKit site browsing with Cookie, host-aware LocalStorage/token injection,
-  User-Agent switching, and persistent current-site cleanup
+  User-Agent switching, JavaScript dialogs, file inputs, recoverable loading
+  errors, and persistent current-site cleanup
 - SF Symbols plus a new, project-local AppIcon
 
 ## GitHub unsigned IPA
@@ -57,7 +58,8 @@ Xcode build and an integration pass against a reachable Harvest server. See
 - Site overview, ten editable feature flags, daily/monthly status history,
   separate mail/announcement state, complete filters and sorting, timeline,
   levels, imports, structured/raw TOML generation, bulk operations,
-  authenticated browsing, credential sync, extraction, and pausable bonus tools
+  cache-consistent mutations, authenticated browsing, credential sync,
+  extraction, and pausable bonus tools
 - Configurable dashboard modules, traffic/server charts, privacy mode, current
   page screenshot sharing, a dedicated dashboard long image, and cached
   dashboard/site data with visible timestamps and background refresh

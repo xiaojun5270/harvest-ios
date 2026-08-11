@@ -20,6 +20,20 @@ pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
 
+- Authenticated site browsing now implements native JavaScript alert, confirm,
+  and text-input panels instead of dropping dialogs required by some login,
+  exchange, posting, and account workflows. Browser navigation exposes an
+  in-page loading state plus a recoverable failure view. File inputs retain
+  WebKit's enabled-by-default system picker across all supported iOS versions;
+  the app does not replace the platform's source or multi-selection behavior.
+- Site refresh, sign-in, repeat, create, edit, delete, feature-toggle, import, and
+  generated-config save flows now bypass the backend's stale site-list cache
+  before updating the persistent snapshot. Saving a generated TOML config also
+  refreshes the shared site/config model, and list/detail icons resolve public
+  absolute, protocol-relative, and site-relative logos from website configs.
+- Site search now keeps Flutter's symbol-insensitive fallback, so compact terms
+  such as `mteam` still match names such as `M-Team`. Username and email filters
+  normalize surrounding whitespace on both stored and selected values.
 - WebKit LocalStorage injection now follows the configured site's base,
   `www`, and mobile host aliases. Token-backed M-Team/Rousi sessions install
   the same narrowly scoped fetch/XHR authorization bridge as Flutter, while a
