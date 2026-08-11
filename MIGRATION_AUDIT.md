@@ -20,6 +20,27 @@ pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
 
+- WebKit LocalStorage injection now follows the configured site's base,
+  `www`, and mobile host aliases. Token-backed M-Team/Rousi sessions install
+  the same narrowly scoped fetch/XHR authorization bridge as Flutter, while a
+  per-origin cleared marker prevents the configured credentials from being
+  silently restored after the user clears current-site browser data.
+- Bonus exchange now exposes completed/total progress, remaining balance, the
+  inter-submit countdown, pause/resume, and stop controls throughout a batch.
+  Cancellation exits without reporting a request failure and reloads the page
+  so the displayed balance can be refreshed.
+- Transmission settings now expose and submit only the writable fields used by
+  Flutter instead of echoing version, free-space, and other read-only session
+  status values. Known qBittorrent and Transmission enums use typed pickers
+  while booleans, numbers, text, and structured values retain their native
+  editors.
+- Browser profile extraction is now available when `page_user` supplies only a
+  `{}` UID placeholder, matching Flutter's URL-based UID fallback even when no
+  explicit `my_uid_rule` exists.
+- Single browser/manual pushes now include a parsed `ids` value just like
+  Flutter; the field is no longer deferred until the monkey-push batch branch.
+  This preserves the torrent identity needed by generated-link workflows even
+  when only one detail URL was intercepted or extracted.
 - First-run setup now consumes `database_defaults` from `/api/setup/status`,
   recognizes PostgreSQL aliases, reapplies the correct values when switching
   database type, validates the full TCP port range, and sends the same minimal
@@ -85,6 +106,38 @@ pass, and device testing against a reachable Harvest server.
   aliases share the same waiting/running/success/failure labels.
 - Missing managed-user activation flags now default to disabled, and server log
   warning filters send `WARN` while still matching native `WARNING` app records.
+
+## Performance and Persistent Cache Pass (2026-08-11)
+
+- Removed eager dashboard long-image rendering from startup, pull-to-refresh,
+  automatic refresh, cache clearing, and quick actions. The image is now
+  rendered only after the share command is selected.
+- Replaced downloader and server-monitor one-second `@Published` countdowns
+  with deadline-based tasks and localized `TimelineView` labels, preventing the
+  full dashboard/download hierarchy from being diffed every second.
+- Downloader list data now restores from an account-scoped safe snapshot,
+  loads enabled clients concurrently, pre-indexes site domains, caches filtered
+  and sorted results, batches speed updates, and ignores unchanged torrent
+  WebSocket frames. Live snapshot persistence is throttled.
+- Site filtering/sorting is recomputed only after data or filter changes. Log
+  filtering is evaluated once per render, while complete log text is built only
+  when copy/share is requested.
+- Replaced all `AsyncImage` use with a shared public-image cache backed by
+  `NSCache` and bounded `URLCache`. URLs containing token, passkey, authkey,
+  API-key, signature, secret, or credential query fields use an ephemeral
+  memory-only session.
+- Added stale-while-revalidate snapshots for downloads, scheduled tasks, and
+  notices. Task arguments/result bodies and notice bodies are intentionally
+  excluded from those snapshots.
+- Persistent business cache entries are isolated by server and username,
+  limited to 12 MiB each and 48 MiB total, expire after 45 days, and are
+  excluded from backups. Existing cache files are sanitized on first access;
+  passwords, Cookie/LocalStorage, authorization data, keys, tokens, passkeys,
+  authkeys, and credential-bearing feed URLs are removed without changing the
+  original cache timestamp.
+- This pass is statically verified on Windows. It does not claim measured frame
+  time, memory, energy, or network improvements until Instruments and device
+  testing are run from Xcode.
 
 ## Verified Functional Coverage
 

@@ -219,6 +219,72 @@ struct AppSessionCacheRecord: Sendable {
     let cachedAt: Date
 }
 
+private func normalizedCacheKey(_ key: String) -> String {
+    String(key.lowercased().filter { $0.isLetter || $0.isNumber })
+}
+
+private func isSensitiveCacheKey(_ key: String) -> Bool {
+    let key = normalizedCacheKey(key)
+    if key.contains("password") || key.contains("passwd") || key.contains("secret") || key.contains("token") {
+        return true
+    }
+    return [
+        "pwd", "pass", "cookie", "cookies", "passkey", "authkey", "authorization",
+        "localstorage", "apikey", "apisecret", "clientsecret", "credential", "credentials"
+    ].contains(key)
+}
+
+private func sanitizedCachedURL(_ value: String) -> String {
+    guard var components = URLComponents(string: value) else { return value }
+    let originalItems = components.queryItems ?? []
+    let filteredItems = originalItems.filter { item in
+        let name = normalizedCacheKey(item.name)
+        return !name.contains("token")
+            && !name.contains("secret")
+            && !["passkey", "authkey", "apikey", "signature", "credential"].contains(name)
+    }
+    guard components.user != nil || components.password != nil || filteredItems.count != originalItems.count else {
+        return value
+    }
+    components.user = nil
+    components.password = nil
+    components.queryItems = filteredItems.isEmpty ? nil : filteredItems
+    return components.string ?? value
+}
+
+private func cacheSafeObject(_ value: Any, keyHint: String? = nil) -> Any {
+    if let dictionary = value as? [String: Any] {
+        var result: [String: Any] = [:]
+        result.reserveCapacity(dictionary.count)
+        for (key, nestedValue) in dictionary where !isSensitiveCacheKey(key) {
+            let normalized = normalizedCacheKey(key)
+            if nestedValue is String,
+               ["rss", "rssurl", "feedurl", "torrents", "torrenturl", "torrentsurl"].contains(normalized) {
+                continue
+            }
+            result[key] = cacheSafeObject(nestedValue, keyHint: key)
+        }
+        return result
+    }
+    if let values = value as? [Any] {
+        return values.map { cacheSafeObject($0, keyHint: keyHint) }
+    }
+    if let string = value as? String, let keyHint {
+        let key = normalizedCacheKey(keyHint)
+        if key.contains("url") || key.contains("link") || key.contains("tracker") || key == "rss" || key == "announce" {
+            return sanitizedCachedURL(string)
+        }
+    }
+    return value
+}
+
+private func cacheSafePayload(_ payload: Data) -> Data? {
+    guard let object = try? JSONSerialization.jsonObject(with: payload, options: [.fragmentsAllowed]) else { return nil }
+    let safeObject = cacheSafeObject(object)
+    guard JSONSerialization.isValidJSONObject(safeObject) else { return nil }
+    return try? JSONSerialization.data(withJSONObject: safeObject, options: [.sortedKeys])
+}
+
 actor AppSessionCache {
     static let shared = AppSessionCache()
 
@@ -230,6 +296,12 @@ actor AppSessionCache {
     }
 
     private let directoryURL: URL
+    private var memory: [String: Envelope] = [:]
+    private var writesSinceTrim = 0
+    private var sanitizedLegacyFiles = false
+    private let maximumDiskBytes = 48 * 1_024 * 1_024
+    private let maximumEntryBytes = 12 * 1_024 * 1_024
+    private let maximumAge: TimeInterval = 45 * 24 * 60 * 60
 
     private init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -238,32 +310,66 @@ actor AppSessionCache {
             .appendingPathComponent("Harvest", isDirectory: true)
             .appendingPathComponent("session-cache", isDirectory: true)
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableDirectoryURL = directoryURL
+        try? mutableDirectoryURL.setResourceValues(values)
     }
 
     func read(scope: String, name: String) -> AppSessionCacheRecord? {
+        sanitizeLegacyCacheIfNeeded()
+        let key = memoryKey(scope: scope, name: name)
+        if let envelope = memory[key] {
+            return AppSessionCacheRecord(payload: envelope.payload, cachedAt: envelope.cachedAt)
+        }
         let url = fileURL(scope: scope, name: name)
         guard let data = try? Data(contentsOf: url),
-              let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-              envelope.scope == scope,
-              envelope.name == name else {
+              let decodedEnvelope = try? JSONDecoder().decode(Envelope.self, from: data),
+              decodedEnvelope.scope == scope,
+              decodedEnvelope.name == name,
+              decodedEnvelope.cachedAt >= Date().addingTimeInterval(-maximumAge),
+              decodedEnvelope.payload.count <= maximumEntryBytes else {
             try? FileManager.default.removeItem(at: url)
             return nil
         }
+        let safePayload = cacheSafePayload(decodedEnvelope.payload) ?? decodedEnvelope.payload
+        let envelope = Envelope(
+            scope: decodedEnvelope.scope,
+            name: decodedEnvelope.name,
+            cachedAt: decodedEnvelope.cachedAt,
+            payload: safePayload
+        )
+        memory[key] = envelope
+        if safePayload != decodedEnvelope.payload { persist(envelope, to: url) }
         return AppSessionCacheRecord(payload: envelope.payload, cachedAt: envelope.cachedAt)
     }
 
     func write(scope: String, name: String, payload: Data) {
-        let envelope = Envelope(scope: scope, name: name, cachedAt: Date(), payload: payload)
-        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        sanitizeLegacyCacheIfNeeded()
+        guard payload.count <= maximumEntryBytes else { return }
+        let envelope = Envelope(
+            scope: scope,
+            name: name,
+            cachedAt: Date(),
+            payload: cacheSafePayload(payload) ?? payload
+        )
+        memory[memoryKey(scope: scope, name: name)] = envelope
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        try? data.write(to: fileURL(scope: scope, name: name), options: .atomic)
+        persist(envelope, to: fileURL(scope: scope, name: name))
+        writesSinceTrim += 1
+        if writesSinceTrim >= 12 {
+            writesSinceTrim = 0
+            trimDiskCache()
+        }
     }
 
     func remove(scope: String, name: String) {
+        memory.removeValue(forKey: memoryKey(scope: scope, name: name))
         try? FileManager.default.removeItem(at: fileURL(scope: scope, name: name))
     }
 
     func clear(scope: String) {
+        memory = memory.filter { $0.value.scope != scope }
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: directoryURL,
             includingPropertiesForKeys: nil,
@@ -278,12 +384,80 @@ actor AppSessionCache {
     }
 
     func clearAll() {
+        memory.removeAll(keepingCapacity: false)
         try? FileManager.default.removeItem(at: directoryURL)
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
     }
 
+    private func persist(_ envelope: Envelope, to url: URL) {
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        try? data.write(to: url, options: .atomic)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var mutableURL = url
+        try? mutableURL.setResourceValues(values)
+    }
+
+    private func sanitizeLegacyCacheIfNeeded() {
+        guard !sanitizedLegacyFiles else { return }
+        sanitizedLegacyFiles = true
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for url in urls {
+            guard let data = try? Data(contentsOf: url),
+                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
+                  let safePayload = cacheSafePayload(envelope.payload),
+                  safePayload != envelope.payload else { continue }
+            persist(
+                Envelope(scope: envelope.scope, name: envelope.name, cachedAt: envelope.cachedAt, payload: safePayload),
+                to: url
+            )
+        }
+    }
+
+    private func trimDiskCache() {
+        let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let expirationDate = Date().addingTimeInterval(-maximumAge)
+        var entries: [(url: URL, date: Date, size: Int)] = []
+        entries.reserveCapacity(urls.count)
+        for url in urls {
+            let values = try? url.resourceValues(forKeys: keys)
+            let date = values?.contentModificationDate ?? .distantPast
+            if date < expirationDate {
+                removeCacheFile(url)
+            } else {
+                entries.append((url, date, values?.fileSize ?? 0))
+            }
+        }
+
+        var totalBytes = entries.reduce(0) { $0 + $1.size }
+        guard totalBytes > maximumDiskBytes else { return }
+        for entry in entries.sorted(by: { $0.date < $1.date }) where totalBytes > maximumDiskBytes {
+            removeCacheFile(entry.url)
+            totalBytes -= entry.size
+        }
+    }
+
+    private func removeCacheFile(_ url: URL) {
+        memory.removeValue(forKey: url.deletingPathExtension().lastPathComponent)
+        try? FileManager.default.removeItem(at: url)
+    }
+
     private func fileURL(scope: String, name: String) -> URL {
-        directoryURL.appendingPathComponent(stableHash("\(scope)|\(name)")).appendingPathExtension("json")
+        directoryURL.appendingPathComponent(memoryKey(scope: scope, name: name)).appendingPathExtension("json")
+    }
+
+    private func memoryKey(scope: String, name: String) -> String {
+        stableHash("\(scope)|\(name)")
     }
 
     private func stableHash(_ value: String) -> String {
@@ -417,6 +591,9 @@ final class APIClient {
         configuration.timeoutIntervalForRequest = 25
         configuration.timeoutIntervalForResource = 60
         configuration.waitsForConnectivity = true
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpMaximumConnectionsPerHost = 8
         session = URLSession(configuration: configuration)
     }
 
@@ -1063,6 +1240,7 @@ final class AppState: ObservableObject {
         }
         HTTPCookieStorage.shared.cookies?.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
         URLCache.shared.removeAllCachedResponses()
+        await RemoteImageDataCache.shared.removeAll()
         await AppLogStore.shared.clear()
         await AppSessionCache.shared.clearAll()
         KeychainStore.deleteAll()

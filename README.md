@@ -17,9 +17,13 @@ side by side.
 - Native iOS 26 Liquid Glass navigation with an ultra-thin-material fallback
 - Swift Concurrency and URLSession networking
 - Keychain token and credential storage
-- Account-scoped persistent caches for dashboard, sites, and media catalogs
+- Account-scoped persistent caches for dashboard, sites, media catalogs,
+  downloads, scheduled tasks, and notices
+- A separate memory/disk image cache for public artwork and site icons; signed
+  image URLs remain memory-only
 - Swift Charts dashboard visualizations
-- WebKit site browsing with Cookie, LocalStorage, and User-Agent injection
+- WebKit site browsing with Cookie, host-aware LocalStorage/token injection,
+  User-Agent switching, and persistent current-site cleanup
 - SF Symbols plus a new, project-local AppIcon
 
 ## GitHub unsigned IPA
@@ -53,15 +57,32 @@ Xcode build and an integration pass against a reachable Harvest server. See
 - Site overview, ten editable feature flags, daily/monthly status history,
   separate mail/announcement state, complete filters and sorting, timeline,
   levels, imports, structured/raw TOML generation, bulk operations,
-  authenticated browsing, credential sync, extraction, and bonus tools
+  authenticated browsing, credential sync, extraction, and pausable bonus tools
 - Configurable dashboard modules, traffic/server charts, privacy mode, current
   page screenshot sharing, a dedicated dashboard long image, and cached
   dashboard/site data with visible timestamps and background refresh
 - Downloader setup, persistent 1-60 second refresh settings, automatic-stop
-  countdown, pause/resume, WebSocket recovery, torrent filtering, bulk and
-  advanced controls, categories, tags, trackers, limits, and push workflows
+  countdown, pause/resume, WebSocket recovery, cached startup snapshots,
+  deduplicated live frames, precomputed torrent filtering, bulk and advanced
+  controls, categories, tags, trackers, limits, and push workflows
 - Scheduled-task lifecycle, Cron editing, migration-task assistance, Markdown
-  execution results, termination, deletion, and result-history management
+  execution results, termination, deletion, result-history management, and
+  stale-while-revalidate list restoration
 - Notice lifecycle, unread and app badges, local notifications, Markdown detail,
-  gap-free APP/server log pause/resume, updates, backup/import, users,
+  cached list restoration, gap-free APP/server log pause/resume, updates, backup/import, users,
   paginated authorization management, and maintenance
+
+## Performance and cache behavior
+
+- Dashboard share images and log share text are generated only when the user
+  requests them; automatic refresh no longer performs those expensive renders.
+- Downloader and server countdowns update through localized `TimelineView`
+  content instead of publishing an entire screen every second.
+- Downloader snapshots are loaded concurrently, duplicate WebSocket frames are
+  ignored, and site/torrent filters reuse precomputed indexes and sorted arrays.
+- Persistent business caches are isolated by server and username, capped at 12
+  MiB per entry and 48 MiB total, expire after 45 days, and are excluded from
+  device backup. Legacy cache files are sanitized on first access.
+- Passwords, Cookie/LocalStorage, authorization headers, API keys, tokens,
+  passkeys, authkeys, RSS credentials, and signed image URLs are never written
+  into the new persistent snapshots.

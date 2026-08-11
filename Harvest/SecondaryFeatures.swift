@@ -120,8 +120,13 @@ final class TasksViewModel: ObservableObject {
     @Published var crontabs: [[String: Any]] = []
     @Published var isLoading = true
     @Published var mode = "计划"
+    @Published private(set) var cachedAt: Date?
+    @Published private(set) var usingCachedData = false
+    private var restoredCache = false
+    private let sessionCacheKey = "tasks.snapshot.v1"
 
     func load(_ appState: AppState) async {
+        await restoreCacheIfNeeded(appState)
         isLoading = tasks.isEmpty && results.isEmpty
         defer { isLoading = false }
         async let taskResult = loadEndpoint(appState, path: APIPath.schedules, label: "计划任务")
@@ -143,7 +148,65 @@ final class TasksViewModel: ObservableObject {
             crontabs = jsonRows(crontabValue)
         }
         let errors = [values.0.errorMessage, values.1.errorMessage, values.2.errorMessage, values.3.errorMessage].compactMap { $0 }
-        if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
+        usingCachedData = !errors.isEmpty && (!tasks.isEmpty || !results.isEmpty)
+        if errors.isEmpty {
+            cachedAt = nil
+        } else if usingCachedData {
+            recordAppLog(.warning, "任务中心部分刷新失败，继续显示缓存：\(errors.joined(separator: "；"))")
+        } else {
+            appState.presentedError = errors.joined(separator: "\n")
+        }
+        if errors.isEmpty { await persistCache(appState) }
+    }
+
+    private func restoreCacheIfNeeded(_ appState: AppState) async {
+        guard !restoredCache else { return }
+        restoredCache = true
+        guard let cached = await appState.readSessionCache(sessionCacheKey),
+              let root = cached.value as? [String: Any] else { return }
+        tasks = (root["tasks"] as? [[String: Any]] ?? []).map(TaskItem.init)
+        results = (root["results"] as? [[String: Any]] ?? []).map(TaskResultItem.init)
+        taskTypes = root["task_types"] as? [String] ?? []
+        crontabs = root["crontabs"] as? [[String: Any]] ?? []
+        guard !tasks.isEmpty || !results.isEmpty else { return }
+        cachedAt = cached.cachedAt
+        usingCachedData = true
+        isLoading = false
+    }
+
+    private func persistCache(_ appState: AppState) async {
+        let taskRows: [[String: Any]] = tasks.map { task in
+            [
+                "id": task.id,
+                "name": task.name,
+                "task": task.taskType,
+                "description": task.description,
+                "enable": task.enabled,
+                "crontab_id": task.crontabID,
+                "crontab": [
+                    "minute": task.minute,
+                    "hour": task.hour,
+                    "day_of_month": task.dayOfMonth,
+                    "month_of_year": task.monthOfYear,
+                    "day_of_week": task.dayOfWeek,
+                    "schedule": task.schedule
+                ]
+            ]
+        }
+        let resultRows: [[String: Any]] = results.map { result in
+            [
+                "id": result.id,
+                "task_id": result.taskID,
+                "name": result.name,
+                "status": result.status,
+                "created_at": result.createdAt,
+                "updated_at": result.finishedAt
+            ]
+        }
+        await appState.writeSessionCache(
+            ["tasks": taskRows, "results": resultRows, "task_types": taskTypes, "crontabs": crontabs],
+            name: sessionCacheKey
+        )
     }
 
     private func loadEndpoint(
@@ -168,7 +231,10 @@ final class TasksViewModel: ObservableObject {
     }
 
     func remove(_ appState: AppState, task: TaskItem) async {
-        if await appState.perform("\(APIPath.schedules)/\(task.id)", method: .delete) { tasks.removeAll { $0.id == task.id } }
+        if await appState.perform("\(APIPath.schedules)/\(task.id)", method: .delete) {
+            tasks.removeAll { $0.id == task.id }
+            await persistCache(appState)
+        }
     }
 
     func terminate(_ appState: AppState, result: TaskResultItem) async {
@@ -185,11 +251,17 @@ final class TasksViewModel: ObservableObject {
         if await appState.perform(
             APIPath.taskResults + urlPathSegment(result.taskID),
             method: .delete
-        ) { results.removeAll { $0.id == result.id } }
+        ) {
+            results.removeAll { $0.id == result.id }
+            await persistCache(appState)
+        }
     }
 
     func clearResults(_ appState: AppState) async {
-        if await appState.perform(APIPath.taskResults, method: .delete) { results = [] }
+        if await appState.perform(APIPath.taskResults, method: .delete) {
+            results = []
+            await persistCache(appState)
+        }
     }
 }
 
@@ -208,6 +280,11 @@ struct TasksView: View {
             if model.isLoading { LoadingState() }
             else {
                 List {
+                    if model.usingCachedData {
+                        SessionCacheBanner(cachedAt: model.cachedAt)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                            .listRowBackground(Color.clear)
+                    }
                     Section { Picker("视图", selection: $model.mode) { Text("计划").tag("计划"); Text("执行记录").tag("执行记录") }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16)) }
                     if model.mode == "计划" {
                         if model.tasks.isEmpty {
@@ -315,7 +392,11 @@ struct TaskRow: View {
     let run: () -> Void
     var body: some View {
         HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 8).fill(item.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 44, height: 44).overlay(Image(systemName: item.enabled ? "clock.badge.checkmark" : "pause.circle").foregroundStyle(item.enabled ? HarvestTheme.green : .secondary))
+            SymbolBadge(
+                icon: item.enabled ? "clock.badge.checkmark" : "pause.circle.fill",
+                color: item.enabled ? HarvestTheme.green : .secondary,
+                size: 44
+            )
             VStack(alignment: .leading, spacing: 5) { Text(item.name).font(.headline); Text(item.taskType).font(.caption).foregroundStyle(.secondary); Text(item.schedule).font(.caption2).foregroundStyle(.tertiary) }
             Spacer()
             Button(action: run) { Image(systemName: "play.fill").frame(width: 34, height: 34).background(HarvestTheme.green.opacity(0.12), in: Circle()).foregroundStyle(HarvestTheme.green) }.buttonStyle(.plain).accessibilityLabel("立即执行")
@@ -1512,9 +1593,15 @@ struct MediaRow: View {
     let item: MediaItem
     var body: some View {
         HStack(spacing: 12) {
-            AsyncImage(url: URL(string: item.poster)) { phase in
-                switch phase { case .success(let image): image.resizable().scaledToFill(); default: RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)).overlay(Image(systemName: "film").foregroundStyle(.secondary)) }
-            }.frame(width: 62, height: 88).clipShape(RoundedRectangle(cornerRadius: 6))
+            CachedRemoteImage(url: URL(string: item.poster)) { image in
+                image.resizable().scaledToFill()
+            } placeholder: {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.secondary.opacity(0.12))
+                    .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+            }
+            .frame(width: 62, height: 88)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             VStack(alignment: .leading, spacing: 6) { Text(item.title).font(.headline); if !item.subtitle.isEmpty { Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }; Text(item.overview).font(.caption).foregroundStyle(.secondary).lineLimit(2); HStack { if item.score > 0 { Label(String(format: "%.1f", item.score), systemImage: "star.fill").foregroundStyle(HarvestTheme.amber) }; if !item.year.isEmpty { Text(item.year) }; Text(item.source).foregroundStyle(HarvestTheme.green) }.font(.caption2) }
         }.padding(.vertical, 5)
     }
@@ -1588,14 +1675,14 @@ struct MediaDetailSheet: View {
             List {
                 Section {
                     HStack(alignment: .top, spacing: 14) {
-                        AsyncImage(url: URL(string: poster)) { phase in
-                            switch phase {
-                            case .success(let image): image.resizable().scaledToFill()
-                            default: Color.secondary.opacity(0.12).overlay(Image(systemName: "film").foregroundStyle(.secondary))
-                            }
+                        CachedRemoteImage(url: URL(string: poster)) { image in
+                            image.resizable().scaledToFill()
+                        } placeholder: {
+                            Color.secondary.opacity(0.12)
+                                .overlay(Image(systemName: "film").foregroundStyle(.secondary))
                         }
                         .frame(width: 104, height: 150)
-                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         VStack(alignment: .leading, spacing: 8) {
                             Text(title).font(.title3.weight(.semibold))
                             if !subtitle.isEmpty { Text(subtitle).font(.caption).foregroundStyle(.secondary) }
@@ -1834,11 +1921,10 @@ private struct MediaVendorRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            AsyncImage(url: URL(string: vendor.string("icon", "grey_icon") ?? "")) { phase in
-                switch phase {
-                case .success(let image): image.resizable().scaledToFit()
-                default: Image(systemName: "play.tv").foregroundStyle(.secondary)
-                }
+            CachedRemoteImage(url: URL(string: vendor.string("icon", "grey_icon") ?? "")) { image in
+                image.resizable().scaledToFit()
+            } placeholder: {
+                Image(systemName: "play.tv").foregroundStyle(.secondary)
             }
             .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 3) {
@@ -1861,11 +1947,10 @@ private struct MediaTrailerCard: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            AsyncImage(url: URL(string: trailer.string("cover_url", "cover") ?? "")) { phase in
-                switch phase {
-                case .success(let image): image.resizable().scaledToFill()
-                default: Color.secondary.opacity(0.12)
-                }
+            CachedRemoteImage(url: URL(string: trailer.string("cover_url", "cover") ?? "")) { image in
+                image.resizable().scaledToFill()
+            } placeholder: {
+                Color.secondary.opacity(0.12)
             }
             .frame(maxWidth: .infinity)
             .frame(height: 160)
@@ -2338,14 +2423,14 @@ struct MediaCarousel: View {
                         ForEach(items.prefix(12)) { item in
                             Button { onSelect(item) } label: {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    AsyncImage(url: URL(string: item.poster)) { phase in
-                                        switch phase {
-                                        case .success(let image): image.resizable().scaledToFill()
-                                        default: Color.secondary.opacity(0.12).overlay(Image(systemName: "film").foregroundStyle(.secondary))
-                                        }
+                                    CachedRemoteImage(url: URL(string: item.poster)) { image in
+                                        image.resizable().scaledToFill()
+                                    } placeholder: {
+                                        Color.secondary.opacity(0.12)
+                                            .overlay(Image(systemName: "film").foregroundStyle(.secondary))
                                     }
                                     .frame(width: 112, height: 156)
-                                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                     Text(item.title).font(.caption.weight(.semibold)).lineLimit(1).foregroundStyle(.primary)
                                     if item.score > 0 { Text(String(format: "★ %.1f", item.score)).font(.caption2).foregroundStyle(HarvestTheme.amber) }
                                 }
@@ -2381,5 +2466,5 @@ private struct MediaCollectionSheet: View {
 
 struct NewsLinkRow: View {
     let title: String; let subtitle: String; let icon: String; let color: Color
-    var body: some View { HStack(spacing: 12) { Image(systemName: icon).font(.title3).foregroundStyle(color).frame(width: 42, height: 42).background(color.opacity(0.13), in: RoundedRectangle(cornerRadius: 8)); VStack(alignment: .leading, spacing: 4) { Text(title).font(.headline); Text(subtitle).font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary) }.cardSurface() }
+    var body: some View { HStack(spacing: 12) { SymbolBadge(icon: icon, color: color, size: 42); VStack(alignment: .leading, spacing: 4) { Text(title).font(.headline); Text(subtitle).font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary) }.cardSurface() }
 }

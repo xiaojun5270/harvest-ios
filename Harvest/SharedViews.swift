@@ -2,6 +2,169 @@ import Foundation
 import SwiftUI
 import UIKit
 
+actor RemoteImageDataCache {
+    static let shared = RemoteImageDataCache()
+
+    private let memoryCache: NSCache<NSURL, NSData>
+    private let diskCache: URLCache
+    private let session: URLSession
+    private let privateSession: URLSession
+    private var inFlight: [URL: Task<Data, Error>] = [:]
+
+    private init() {
+        let memory = NSCache<NSURL, NSData>()
+        memory.totalCostLimit = 48 * 1_024 * 1_024
+        memory.countLimit = 240
+        let cache = URLCache(
+            memoryCapacity: 32 * 1_024 * 1_024,
+            diskCapacity: 192 * 1_024 * 1_024,
+            diskPath: "harvest-public-images"
+        )
+        let configuration = URLSessionConfiguration.default
+        configuration.urlCache = cache
+        configuration.requestCachePolicy = .returnCacheDataElseLoad
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        configuration.waitsForConnectivity = true
+        configuration.httpMaximumConnectionsPerHost = 6
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieStorage = nil
+        let publicSession = URLSession(configuration: configuration)
+        let privateConfiguration = URLSessionConfiguration.ephemeral
+        privateConfiguration.urlCache = nil
+        privateConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        privateConfiguration.timeoutIntervalForRequest = 20
+        privateConfiguration.timeoutIntervalForResource = 45
+        privateConfiguration.waitsForConnectivity = true
+        privateConfiguration.httpShouldSetCookies = false
+        privateConfiguration.httpCookieStorage = nil
+        memoryCache = memory
+        diskCache = cache
+        session = publicSession
+        privateSession = URLSession(configuration: privateConfiguration)
+    }
+
+    func data(for url: URL) async throws -> Data {
+        if let cached = memoryCache.object(forKey: url as NSURL) {
+            return cached as Data
+        }
+
+        let persistToDisk = isPublicCacheURL(url)
+        let cachePolicy: URLRequest.CachePolicy = persistToDisk ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData
+        var request = URLRequest(url: url, cachePolicy: cachePolicy, timeoutInterval: 20)
+        request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("Harvest-iOS/1.0", forHTTPHeaderField: "User-Agent")
+        if persistToDisk, let cached = diskCache.cachedResponse(for: request), !cached.data.isEmpty {
+            memoryCache.setObject(cached.data as NSData, forKey: url as NSURL, cost: cached.data.count)
+            return cached.data
+        }
+        if let task = inFlight[url] { return try await task.value }
+
+        let task = Task<Data, Error> {
+            let activeSession = persistToDisk ? session : privateSession
+            let (data, response) = try await activeSession.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                throw APIError(statusCode: http.statusCode, message: "图片加载失败（\(http.statusCode)）")
+            }
+            guard !data.isEmpty, data.count <= 20 * 1_024 * 1_024 else {
+                throw APIError(statusCode: 0, message: "图片数据无效")
+            }
+            if persistToDisk {
+                let cached = CachedURLResponse(response: response, data: data, storagePolicy: .allowed)
+                diskCache.storeCachedResponse(cached, for: request)
+            }
+            memoryCache.setObject(data as NSData, forKey: url as NSURL, cost: data.count)
+            return data
+        }
+        inFlight[url] = task
+        do {
+            let data = try await task.value
+            inFlight[url] = nil
+            return data
+        } catch {
+            inFlight[url] = nil
+            throw error
+        }
+    }
+
+    func removeAll() {
+        inFlight.values.forEach { $0.cancel() }
+        inFlight.removeAll()
+        memoryCache.removeAllObjects()
+        diskCache.removeAllCachedResponses()
+        RemoteDecodedImageCache.shared.removeAll()
+    }
+
+    private func isPublicCacheURL(_ url: URL) -> Bool {
+        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return true }
+        return !items.contains { item in
+            let key = item.name.lowercased().filter { $0.isLetter || $0.isNumber }
+            return key.contains("token")
+                || key.contains("secret")
+                || ["passkey", "authkey", "apikey", "signature", "credential"].contains(key)
+        }
+    }
+}
+
+private final class RemoteDecodedImageCache: @unchecked Sendable {
+    static let shared = RemoteDecodedImageCache()
+    private let cache = NSCache<NSURL, UIImage>()
+
+    private init() {
+        cache.totalCostLimit = 72 * 1_024 * 1_024
+        cache.countLimit = 180
+    }
+
+    func image(for url: URL) -> UIImage? { cache.object(forKey: url as NSURL) }
+
+    func insert(_ image: UIImage, for url: URL) {
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.setObject(image, forKey: url as NSURL, cost: cost)
+    }
+
+    func removeAll() { cache.removeAllObjects() }
+}
+
+struct CachedRemoteImage<Content: View, Placeholder: View>: View {
+    let url: URL?
+    private let content: (Image) -> Content
+    private let placeholder: () -> Placeholder
+    @State private var loadedImage: UIImage?
+
+    init(
+        url: URL?,
+        @ViewBuilder content: @escaping (Image) -> Content,
+        @ViewBuilder placeholder: @escaping () -> Placeholder
+    ) {
+        self.url = url
+        self.content = content
+        self.placeholder = placeholder
+    }
+
+    var body: some View {
+        Group {
+            if let loadedImage {
+                content(Image(uiImage: loadedImage))
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: url) {
+            loadedImage = nil
+            guard let url else { return }
+            if let cached = RemoteDecodedImageCache.shared.image(for: url) {
+                loadedImage = cached
+                return
+            }
+            guard let data = try? await RemoteImageDataCache.shared.data(for: url),
+                  !Task.isCancelled,
+                  let image = UIImage(data: data) else { return }
+            RemoteDecodedImageCache.shared.insert(image, for: url)
+            loadedImage = image
+        }
+    }
+}
+
 private func setupValue(_ value: String?, fallback: String) -> String {
     let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return normalized.isEmpty ? fallback : normalized
@@ -267,7 +430,7 @@ struct SetupWizardView: View {
                     Button(step == 2 ? "完成" : "下一步") { Task { await advance() } }.disabled(isSubmitting)
                 }
             }
-            .overlay { if isSubmitting { ZStack { Color.black.opacity(0.12).ignoresSafeArea(); ProgressView().controlSize(.large).padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8)) } } }
+            .overlay { if isSubmitting { ZStack { Color.black.opacity(0.12).ignoresSafeArea(); ProgressView().controlSize(.large).padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)) } } }
         }
     }
 
@@ -447,38 +610,27 @@ struct MainShellView: View {
     @State private var availableAppUpdate: String?
     @State private var handledNoticePresentation = 0
 
-    private let tabTitles = [
-        0: "资讯",
-        1: "站点",
-        2: "仪表盘",
-        3: "下载",
-        4: "任务",
-        5: "搜索"
-    ]
-
     var body: some View {
         NavigationStack {
             TabView(selection: $appState.selectedTab) {
                 if appState.mediaTMDBEnabled || appState.mediaDoubanEnabled {
-                    NewsView().tabItem { Label("资讯", systemImage: "newspaper") }.tag(0)
+                    NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
                 }
                 if appState.profile?.isSuperuser == true {
-                    SitesView().tabItem { Label("站点", systemImage: "globe.americas") }.tag(1)
-                    DashboardView().tabItem { Label("仪表盘", systemImage: "rectangle.3.group") }.tag(2)
+                    SitesView().tabItem { Label("站点", systemImage: "globe.asia.australia.fill") }.tag(1)
+                    DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
                 }
-                DownloadsView().tabItem { Label("下载", systemImage: "arrow.down.circle") }.tag(3)
+                DownloadsView().tabItem { Label("下载", systemImage: "arrow.down.circle.fill") }.tag(3)
                 if appState.profile?.isSuperuser == true {
                     TasksView().tabItem { Label("任务", systemImage: "checklist") }.tag(4)
                 }
-                SearchView().tabItem { Label("搜索", systemImage: "magnifyingglass") }.tag(5)
+                SearchView().tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }.tag(5)
             }
+            .harvestNavigationChrome()
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    HStack(spacing: 8) {
-                        BrandMark(size: 28)
-                        Text(tabTitles[appState.selectedTab] ?? "Harvest")
-                            .font(.headline)
-                    }
+                    BrandMark(size: 28)
+                        .accessibilityHidden(true)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     CurrentScreenShareButton()
@@ -488,6 +640,7 @@ struct MainShellView: View {
                             showingAppUpdate = true
                         } label: {
                             Image(systemName: "arrow.up.circle.fill")
+                                .symbolRenderingMode(.hierarchical)
                                 .foregroundStyle(HarvestTheme.coral)
                         }
                         .accessibilityLabel("发现 APP 新版本")
@@ -495,6 +648,7 @@ struct MainShellView: View {
                     Button { showingNotices = true } label: {
                         ZStack(alignment: .topTrailing) {
                             Image(systemName: appState.unreadNoticeCount > 0 ? "bell.fill" : "bell")
+                                .symbolRenderingMode(.hierarchical)
                                 .frame(width: 26, height: 26)
                             if appState.unreadNoticeCount > 0 {
                                 Text(appState.unreadNoticeCount > 99 ? "99+" : "\(appState.unreadNoticeCount)")
@@ -509,7 +663,9 @@ struct MainShellView: View {
                         .frame(width: 34, height: 30)
                     }
                         .accessibilityLabel("消息")
-                    Button { showingSettings = true } label: { Image(systemName: "gearshape") }
+                    Button { showingSettings = true } label: {
+                        Image(systemName: "gearshape.fill").symbolRenderingMode(.hierarchical)
+                    }
                         .accessibilityLabel("设置")
                 }
             }
@@ -588,7 +744,7 @@ struct CurrentScreenShareButton: View {
             if isCapturing {
                 ProgressView().controlSize(.small)
             } else {
-                Image(systemName: "camera.viewfinder")
+                Image(systemName: "camera.viewfinder").symbolRenderingMode(.hierarchical)
             }
         }
         .disabled(isCapturing)
@@ -639,16 +795,16 @@ struct LabeledField: View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             HStack(spacing: 10) {
-                Image(systemName: icon).foregroundStyle(HarvestTheme.green).frame(width: 20)
+                SymbolBadge(icon: icon, color: HarvestTheme.green, size: 30)
                 TextField(prompt, text: $text)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(keyboard)
             }
             .padding(.horizontal, 13)
-            .padding(.vertical, 13)
-            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.08)))
+            .padding(.vertical, 9)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.08)))
         }
     }
 }
@@ -662,18 +818,19 @@ struct SecureLabeledField: View {
         VStack(alignment: .leading, spacing: 7) {
             Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             HStack(spacing: 10) {
-                Image(systemName: "key").foregroundStyle(HarvestTheme.green).frame(width: 20)
+                SymbolBadge(icon: "key.fill", color: HarvestTheme.green, size: 30)
                 Group { if visible { TextField("密码", text: $text) } else { SecureField("密码", text: $text) } }
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                 Button { visible.toggle() } label: { Image(systemName: visible ? "eye.slash" : "eye") }
                     .foregroundStyle(.secondary)
+                    .frame(width: 30, height: 30)
                     .accessibilityLabel(visible ? "隐藏密码" : "显示密码")
             }
             .padding(.horizontal, 13)
-            .padding(.vertical, 13)
-            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.08)))
+            .padding(.vertical, 9)
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.primary.opacity(0.08)))
         }
     }
 }
@@ -696,6 +853,28 @@ struct SectionHeader: View {
     }
 }
 
+struct SymbolBadge: View {
+    let icon: String
+    let color: Color
+    var size: CGFloat = 38
+
+    var body: some View {
+        Image(systemName: icon)
+            .font(.system(size: size * 0.42, weight: .semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(color)
+            .frame(width: size, height: size)
+            .background(
+                color.opacity(0.12),
+                in: RoundedRectangle(cornerRadius: min(12, size * 0.32), style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: min(12, size * 0.32), style: .continuous)
+                    .stroke(color.opacity(0.12))
+            )
+    }
+}
+
 struct MetricCard: View {
     let label: String
     let value: String
@@ -706,11 +885,11 @@ struct MetricCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Image(systemName: icon).foregroundStyle(color)
+                SymbolBadge(icon: icon, color: color, size: 36)
                 Spacer()
+                Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             }
             Text(value).font(.title2.weight(.bold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
-            Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             Text(detail).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
         }
         .padding(14)
@@ -761,8 +940,7 @@ struct SessionCacheBanner: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            Image(systemName: "externaldrive.badge.clock")
-                .foregroundStyle(HarvestTheme.green)
+            SymbolBadge(icon: "externaldrive.badge.clock", color: HarvestTheme.green, size: 30)
             Text(message)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(HarvestTheme.green)
@@ -789,6 +967,17 @@ struct SessionCacheBanner: View {
 }
 
 extension View {
+    @ViewBuilder
+    func harvestNavigationChrome() -> some View {
+        if #available(iOS 26.0, *) {
+            self
+        } else {
+            self
+                .toolbarBackground(.ultraThinMaterial, for: .navigationBar, .tabBar)
+                .toolbarBackground(.visible, for: .navigationBar, .tabBar)
+        }
+    }
+
     func cardSurface() -> some View {
         self.padding(16)
             .background(

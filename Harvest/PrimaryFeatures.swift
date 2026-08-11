@@ -400,7 +400,7 @@ final class DashboardViewModel: ObservableObject {
     @Published private(set) var cachedAt: Date?
     @Published private(set) var serverConnected = false
     @Published private(set) var serverMonitoring = false
-    @Published private(set) var serverRemainingSeconds = 0
+    @Published private(set) var serverDeadline: Date?
     @Published private(set) var serverHistory: [DashboardServerPoint] = []
     @Published private(set) var serverError: String?
     @Published private(set) var authorizationInfo: [String: Any]?
@@ -457,8 +457,9 @@ final class DashboardViewModel: ObservableObject {
         }
     }
 
-    var serverCountdownText: String {
-        String(format: "%d:%02d", serverRemainingSeconds / 60, serverRemainingSeconds % 60)
+    func serverCountdownText(at date: Date = Date()) -> String {
+        let remaining = max(0, Int((serverDeadline?.timeIntervalSince(date) ?? 0).rounded(.up)))
+        return String(format: "%d:%02d", remaining / 60, remaining % 60)
     }
 
     var latestServerPoint: DashboardServerPoint? { serverHistory.last }
@@ -501,7 +502,7 @@ final class DashboardViewModel: ObservableObject {
         serverMonitoring = true
         serverConnected = false
         serverError = nil
-        serverRemainingSeconds = continuous ? serverDuration * 60 : 0
+        serverDeadline = continuous ? Date().addingTimeInterval(TimeInterval(serverDuration * 60)) : nil
         let token = UUID()
         serverWatchToken = token
         serverWatchTask = Task { [weak self] in
@@ -509,16 +510,11 @@ final class DashboardViewModel: ObservableObject {
         }
         guard continuous else { return }
         serverCountdownTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(1)) }
-                catch { return }
-                guard let self, self.isCurrentServerWatch(token) else { return }
-                if self.serverRemainingSeconds <= 1 {
-                    self.stopActiveServerMonitoring(clearRemaining: true)
-                    return
-                }
-                self.serverRemainingSeconds -= 1
-            }
+            guard let self else { return }
+            do { try await Task.sleep(for: .seconds(self.serverDuration * 60)) }
+            catch { return }
+            guard self.isCurrentServerWatch(token) else { return }
+            self.stopActiveServerMonitoring(clearRemaining: true)
         }
     }
 
@@ -531,7 +527,7 @@ final class DashboardViewModel: ObservableObject {
         serverWatchTask = nil
         serverCountdownTask?.cancel()
         serverCountdownTask = nil
-        if clearRemaining { serverRemainingSeconds = 0 }
+        if clearRemaining { serverDeadline = nil }
     }
 
     private func watchServer(_ appState: AppState, token: UUID, continuous: Bool) async {
@@ -550,28 +546,32 @@ final class DashboardViewModel: ObservableObject {
                     let cpu = payload.dict("cpu")
                     let memory = payload.dict("memory")
                     let network = payload.dict("network")
-                    snapshot.cpu = cpu?.double("percent") ?? snapshot.cpu
-                    snapshot.memory = memory?.double("percent") ?? snapshot.memory
-                    snapshot.uploadSpeed = network?.double("uploadSpeed", "upload_speed") ?? snapshot.uploadSpeed
-                    snapshot.downloadSpeed = network?.double("downloadSpeed", "download_speed") ?? snapshot.downloadSpeed
-                    serverHistory.append(DashboardServerPoint(
+                    var updatedSnapshot = snapshot
+                    updatedSnapshot.cpu = cpu?.double("percent") ?? updatedSnapshot.cpu
+                    updatedSnapshot.memory = memory?.double("percent") ?? updatedSnapshot.memory
+                    updatedSnapshot.uploadSpeed = network?.double("uploadSpeed", "upload_speed") ?? updatedSnapshot.uploadSpeed
+                    updatedSnapshot.downloadSpeed = network?.double("downloadSpeed", "download_speed") ?? updatedSnapshot.downloadSpeed
+                    snapshot = updatedSnapshot
+                    var updatedHistory = serverHistory
+                    updatedHistory.append(DashboardServerPoint(
                         date: parseDate(payload.string("timestamp", "time", "created_at")) ?? Date(),
                         isDocker: payload.bool("isDocker", "is_docker") ?? false,
-                        cpu: snapshot.cpu,
+                        cpu: updatedSnapshot.cpu,
                         cpuUsageSeconds: cpu?.double("usageSeconds", "usage_seconds", "usage") ?? 0,
                         cpuLimitCores: cpu?.double("limitCores", "limit_cores", "cores") ?? 0,
-                        memory: snapshot.memory,
+                        memory: updatedSnapshot.memory,
                         memoryUsage: memory?.double("usage") ?? 0,
                         memoryWorkingSet: memory?.double("workingSet", "working_set") ?? 0,
                         memoryLimit: memory?.double("limit", "total") ?? 0,
-                        uploadSpeed: snapshot.uploadSpeed,
-                        downloadSpeed: snapshot.downloadSpeed,
+                        uploadSpeed: updatedSnapshot.uploadSpeed,
+                        downloadSpeed: updatedSnapshot.downloadSpeed,
                         bytesSent: network?.double("bytesSent", "bytes_sent") ?? 0,
                         bytesReceived: network?.double("bytesRecv", "bytes_recv", "bytesReceived", "bytes_received") ?? 0
                     ))
-                    if serverHistory.count > 60 { serverHistory.removeFirst(serverHistory.count - 60) }
-                    serverConnected = true
-                    serverError = nil
+                    if updatedHistory.count > 60 { updatedHistory.removeFirst(updatedHistory.count - 60) }
+                    serverHistory = updatedHistory
+                    if !serverConnected { serverConnected = true }
+                    if serverError != nil { serverError = nil }
                     if !continuous {
                         finishCurrentServerMonitoring(token)
                         return
@@ -614,7 +614,7 @@ final class DashboardViewModel: ObservableObject {
         serverWatchTask = nil
         serverCountdownTask?.cancel()
         serverCountdownTask = nil
-        serverRemainingSeconds = 0
+        serverDeadline = nil
     }
 }
 
@@ -869,6 +869,7 @@ private struct DashboardCacheClearSheet: View {
             defaults.set(values, forKey: key)
         }
         URLCache.shared.removeAllCachedResponses()
+        await RemoteImageDataCache.shared.removeAll()
         await appState.clearSessionCache()
         appState.setPrivacyMode(false)
         appState.setMediaTMDBEnabled(false)
@@ -946,14 +947,13 @@ struct DashboardView: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .refreshable { await model.load(appState, days: trendDays); renderShareImage() }
+        .refreshable { await model.load(appState, days: trendDays) }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
             await model.load(appState, days: trendDays)
-            renderShareImage()
             guard autoRefresh else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(max(30, refreshInterval)))
-                if !Task.isCancelled { await model.load(appState, days: trendDays); renderShareImage() }
+                if !Task.isCancelled { await model.load(appState, days: trendDays) }
             }
         }
         .task(id: "\(showServerResources)-\(serverResourceAutoStart)-\(serverResourceInterval)-\(serverResourceDuration)") {
@@ -1000,7 +1000,6 @@ struct DashboardView: View {
         .sheet(isPresented: $showCacheClear) {
             DashboardCacheClearSheet {
                 await model.load(appState, days: trendDays)
-                renderShareImage()
             }
             .environmentObject(appState)
         }
@@ -1071,12 +1070,21 @@ struct DashboardView: View {
             if showServerResources {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack(alignment: .top, spacing: 12) {
-                        SectionHeader(
-                            title: "服务器资源",
-                            subtitle: model.serverError ?? (model.serverMonitoring
-                                ? "每 \(serverResourceInterval) 秒采样 · \(model.serverCountdownText) 后停止"
-                                : "实时监控已停止")
-                        )
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("服务器资源").font(.title3.weight(.bold))
+                            if let error = model.serverError {
+                                Text(error).font(.caption).foregroundStyle(.secondary)
+                            } else if model.serverMonitoring {
+                                TimelineView(.periodic(from: .now, by: 1)) { context in
+                                    Text("每 \(serverResourceInterval) 秒采样 · \(model.serverCountdownText(at: context.date)) 后停止")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            } else {
+                                Text("实时监控已停止").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 0)
                         Button { model.toggleServerMonitoring(appState) } label: {
                             Image(systemName: model.serverMonitoring ? "pause.fill" : "play.fill")
                                 .frame(width: 30, height: 30)
@@ -1248,7 +1256,7 @@ struct DashboardView: View {
 
     @MainActor private func runGlobal(_ path: String) async {
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
-        if await appState.perform(endpoint, method: .get) { await model.load(appState, days: trendDays); renderShareImage() }
+        if await appState.perform(endpoint, method: .get) { await model.load(appState, days: trendDays) }
     }
 
     @MainActor private func runQuickAction(_ action: DashboardQuickAction) async {
@@ -1260,7 +1268,6 @@ struct DashboardView: View {
             await runGlobal(APIPath.siteStatus)
         case .refreshDashboard:
             await model.load(appState, days: trendDays)
-            renderShareImage()
         case .signSites:
             await runGlobal(APIPath.siteSign)
         }
@@ -2386,28 +2393,41 @@ private enum SiteLevelMilestone {
 
 @MainActor
 final class SitesViewModel: ObservableObject {
-    @Published var sites: [SiteItem] = []
-    @Published private var siteConfigs: [String: [String: Any]] = [:]
+    private(set) var sites: [SiteItem] = [] { didSet { rebuildFilteredSites() } }
+    @Published private(set) var filtered: [SiteItem] = []
+    private var siteConfigs: [String: [String: Any]] = [:] { didSet { rebuildFilteredSites() } }
     @Published var isLoading = true
     @Published private(set) var usingCachedData = false
     @Published private(set) var cachedAt: Date?
-    @Published var query = ""
+    @Published var query = "" { didSet { rebuildFilteredSites() } }
     @Published var availability: SiteAvailabilityFilter = .alive {
-        didSet { UserDefaults.standard.set(availability.rawValue, forKey: SiteFilterStorageKey.availability) }
+        didSet {
+            UserDefaults.standard.set(availability.rawValue, forKey: SiteFilterStorageKey.availability)
+            rebuildFilteredSites()
+        }
     }
     @Published var condition: SiteConditionFilter = .all {
-        didSet { UserDefaults.standard.set(condition.rawValue, forKey: SiteFilterStorageKey.condition) }
+        didSet {
+            UserDefaults.standard.set(condition.rawValue, forKey: SiteFilterStorageKey.condition)
+            rebuildFilteredSites()
+        }
     }
     @Published var sortField: SiteSortField = .updated {
-        didSet { UserDefaults.standard.set(sortField.rawValue, forKey: SiteFilterStorageKey.sortField) }
+        didSet {
+            UserDefaults.standard.set(sortField.rawValue, forKey: SiteFilterStorageKey.sortField)
+            rebuildFilteredSites()
+        }
     }
     @Published var ascending = true {
-        didSet { UserDefaults.standard.set(ascending, forKey: SiteFilterStorageKey.ascending) }
+        didSet {
+            UserDefaults.standard.set(ascending, forKey: SiteFilterStorageKey.ascending)
+            rebuildFilteredSites()
+        }
     }
-    @Published var selectedTags: Set<String> = []
-    @Published var selectedTypes: Set<String> = []
-    @Published var selectedUsername = ""
-    @Published var selectedEmail = ""
+    @Published var selectedTags: Set<String> = [] { didSet { rebuildFilteredSites() } }
+    @Published var selectedTypes: Set<String> = [] { didSet { rebuildFilteredSites() } }
+    @Published var selectedUsername = "" { didSet { rebuildFilteredSites() } }
+    @Published var selectedEmail = "" { didSet { rebuildFilteredSites() } }
     private var didRestoreCache = false
 
     init() {
@@ -2429,7 +2449,11 @@ final class SitesViewModel: ObservableObject {
             : defaults.bool(forKey: SiteFilterStorageKey.ascending)
     }
 
-    var filtered: [SiteItem] {
+    private func rebuildFilteredSites() {
+        filtered = computeFilteredSites()
+    }
+
+    private func computeFilteredSites() -> [SiteItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let values = sites.filter { site in
             if !normalizedQuery.isEmpty {
@@ -2559,7 +2583,7 @@ final class SitesViewModel: ObservableObject {
             sites = jsonRows(raw).map(SiteItem.init)
             cachedAt = nil
             usingCachedData = false
-            await appState.writeSessionCache(raw, name: cacheKey)
+            await appState.writeSessionCache(sites.map(sitePersistentCacheRow), name: cacheKey)
         } catch {
             if !usingCachedData { appState.presentedError = error.localizedDescription }
         }
@@ -2589,6 +2613,19 @@ final class SitesViewModel: ObservableObject {
     private func numberCompare(_ left: Double, _ right: Double) -> ComparisonResult {
         if left == right { return .orderedSame }
         return left < right ? .orderedAscending : .orderedDescending
+    }
+
+    private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
+        site.raw.filter { key, _ in
+            let normalized = key.lowercased().filter { $0.isLetter || $0.isNumber }
+            if normalized.contains("password") || normalized.contains("token") || normalized.contains("secret") {
+                return false
+            }
+            return ![
+                "cookie", "cookies", "passkey", "authkey", "localstorage",
+                "authorization", "apikey", "rss", "torrents"
+            ].contains(normalized)
+        }
     }
 
     private func config(for site: SiteItem) -> [String: Any]? {
@@ -3876,15 +3913,17 @@ struct SiteRow: View {
     var body: some View {
         HStack(spacing: 12) {
             ZStack {
-                RoundedRectangle(cornerRadius: 8).fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 48, height: 48)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
+                    .frame(width: 48, height: 48)
                 if let url = URL(string: site.iconURL), !site.iconURL.isEmpty {
-                    AsyncImage(url: url) { image in
+                    CachedRemoteImage(url: url) { image in
                         image.resizable().scaledToFit()
                     } placeholder: {
                         Image(systemName: site.enabled ? "globe.americas.fill" : "globe.americas")
                             .foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     .padding(7)
                 } else {
                     Image(systemName: site.enabled ? "globe.americas.fill" : "globe.americas").foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
@@ -5211,6 +5250,70 @@ private struct BrowserBonusPage: Identifiable {
     let items: [BrowserBonusItem]
 }
 
+@MainActor
+private final class BrowserBonusExchangeState: ObservableObject {
+    @Published private(set) var isRunning = false
+    @Published private(set) var isCancelled = false
+    @Published private(set) var completed = 0
+    @Published private(set) var total = 0
+    @Published private(set) var remaining = 0.0
+    @Published private(set) var countdown = 0
+    @Published var isPaused = false
+
+    var progress: Double { total > 0 ? Double(completed) / Double(total) : 0 }
+
+    func begin(quantity: Int, balance: Double) {
+        isRunning = true
+        isCancelled = false
+        isPaused = false
+        completed = 0
+        total = max(0, quantity)
+        remaining = max(0, balance)
+        countdown = 0
+    }
+
+    func recordCompletion(cost: Double) {
+        completed = min(total, completed + 1)
+        remaining = max(0, remaining - cost)
+    }
+
+    func togglePause() {
+        guard isRunning, !isCancelled else { return }
+        isPaused.toggle()
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isCancelled = true
+        isPaused = false
+        countdown = 0
+    }
+
+    func finish() {
+        isRunning = false
+        isPaused = false
+        countdown = 0
+    }
+
+    func waitUntilResumed() async throws {
+        while isPaused && !isCancelled {
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        try Task.checkCancellation()
+        if isCancelled { throw CancellationError() }
+    }
+
+    func waitBetweenSubmissions(seconds: Int) async throws {
+        guard seconds > 0 else { return }
+        for value in stride(from: seconds, through: 1, by: -1) {
+            countdown = value
+            try await waitUntilResumed()
+            try await Task.sleep(for: .seconds(1))
+        }
+        countdown = 0
+    }
+}
+
 private func browserJavaScriptLiteral(_ value: Any) -> String {
     guard JSONSerialization.isValidJSONObject(value),
           let data = try? JSONSerialization.data(withJSONObject: value),
@@ -5501,6 +5604,7 @@ struct SiteBrowserScreen: View {
     @State private var profileMetrics: [BrowserProfileMetric] = []
     @State private var showProfile = false
     @State private var bonusPage: BrowserBonusPage?
+    @StateObject private var bonusExchangeState = BrowserBonusExchangeState()
     @State private var screenshotImage: UIImage?
     @State private var showScreenshotShare = false
     @State private var isCapturingScreenshot = false
@@ -5521,6 +5625,8 @@ struct SiteBrowserScreen: View {
             cookie: site.cookie,
             localStorage: site.localStorage,
             userAgent: site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? browserSafariMacUserAgent : site.userAgent,
+            localStorageURLs: browserLocalStorageURLs,
+            installsLocalStorageAuthBridge: installsBrowserAuthBridge,
             session: session
         )
         .navigationTitle(title)
@@ -5668,8 +5774,8 @@ struct SiteBrowserScreen: View {
             ) { await saveProfile() }
         }
         .sheet(item: $bonusPage) { page in
-            BrowserBonusSheet(page: page) { item, quantity, delay in
-                await exchangeBonus(item: item, quantity: quantity, delaySeconds: delay)
+            BrowserBonusSheet(page: page, exchangeState: bonusExchangeState) { item, quantity, delay in
+                await exchangeBonus(item: item, quantity: quantity, delaySeconds: delay, balance: page.balance)
             }
         }
         .sheet(isPresented: $showScreenshotShare) {
@@ -5679,6 +5785,24 @@ struct SiteBrowserScreen: View {
 
     @MainActor private func copyCurrentLink() {
         UIPasteboard.general.string = (session.currentURL ?? URL(string: urlString))?.absoluteString ?? urlString
+    }
+
+    private var browserLocalStorageURLs: [String] {
+        [urlString, site.url, site.rss, site.torrentsURL] + configStrings(siteConfig["url"])
+    }
+
+    private var installsBrowserAuthBridge: Bool {
+        let storage = site.localStorage.lowercased()
+        guard storage.contains("auth") || storage.contains("token") else { return false }
+        let configuredIdentity = [
+            firstConfigString(siteConfig["name"]),
+            firstConfigString(siteConfig["nickname"]),
+            firstConfigString(siteConfig["tracker"])
+        ].compactMap { $0 }
+        let identity = ([site.siteKey, site.name, site.url, urlString] + configuredIdentity + configStrings(siteConfig["url"]))
+            .joined(separator: " ")
+            .lowercased()
+        return identity.contains("m-team") || identity.contains("mteam") || identity.contains("rousi")
     }
 
     private var browserShortcuts: [SitePageShortcut] {
@@ -5834,7 +5958,10 @@ struct SiteBrowserScreen: View {
     }
 
     private var hasProfileRules: Bool {
-        siteConfig.keys.contains { $0.hasPrefix("my_") && $0.hasSuffix("_rule") && !(firstConfigString(siteConfig[$0]) ?? "").isEmpty }
+        (firstConfigString(siteConfig["page_user"]) ?? "").contains("{}")
+            || siteConfig.keys.contains {
+                $0.hasPrefix("my_") && $0.hasSuffix("_rule") && !(firstConfigString(siteConfig[$0]) ?? "").isEmpty
+            }
     }
 
     private var hasBonusRules: Bool {
@@ -5986,25 +6113,42 @@ struct SiteBrowserScreen: View {
         }
     }
 
-    @MainActor private func exchangeBonus(item: BrowserBonusItem, quantity: Int, delaySeconds: Int) async -> Bool {
+    @MainActor private func exchangeBonus(
+        item: BrowserBonusItem,
+        quantity: Int,
+        delaySeconds: Int,
+        balance: Double
+    ) async -> Bool {
         guard quantity > 0 else { return false }
         isWorking = true
-        defer { isWorking = false }
+        bonusExchangeState.begin(quantity: quantity, balance: balance)
+        defer {
+            isWorking = false
+            bonusExchangeState.finish()
+        }
         do {
             for index in 0..<quantity {
-                try Task.checkCancellation()
+                try await bonusExchangeState.waitUntilResumed()
                 let raw = try await session.callAsyncJavaScript(browserBonusSubmitScript(item))
                 guard let parsed = parsedBrowserJavaScriptValue(raw),
                       let result = jsonDictionary(parsed),
                       result.bool("ok") == true else {
                     throw APIError(statusCode: 0, message: "第 \(index + 1) 次兑换失败")
                 }
-                if index < quantity - 1 { try await Task.sleep(for: .seconds(min(120, max(12, delaySeconds)))) }
+                bonusExchangeState.recordCompletion(cost: item.cost)
+                if bonusExchangeState.remaining < item.cost { break }
+                if index < quantity - 1 {
+                    try await bonusExchangeState.waitBetweenSubmissions(seconds: min(120, max(12, delaySeconds)))
+                }
             }
             session.reload()
-            return true
+            return !bonusExchangeState.isCancelled && bonusExchangeState.completed == quantity
+        } catch is CancellationError {
+            session.reload()
+            return false
         } catch {
             appState.presentedError = error.localizedDescription
+            session.reload()
             return false
         }
     }
@@ -6122,11 +6266,11 @@ private struct BrowserTorrentExtractionSheet: View {
                                 Image(systemName: selected.contains(item.id) ? "checkmark.circle.fill" : "circle")
                                     .foregroundStyle(selected.contains(item.id) ? HarvestTheme.green : .secondary)
                                 if let posterURL = URL(string: item.posterURL), !item.posterURL.isEmpty {
-                                    AsyncImage(url: posterURL) { phase in
-                                        switch phase {
-                                        case .success(let image): image.resizable().scaledToFill()
-                                        default: Color.secondary.opacity(0.1).overlay(Image(systemName: "photo").foregroundStyle(.secondary))
-                                        }
+                                    CachedRemoteImage(url: posterURL) { image in
+                                        image.resizable().scaledToFill()
+                                    } placeholder: {
+                                        Color.secondary.opacity(0.1)
+                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
                                     }
                                     .frame(width: 48, height: 68)
                                     .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -6217,14 +6361,20 @@ private struct BrowserProfileSheet: View {
 private struct BrowserBonusSheet: View {
     @Environment(\.dismiss) private var dismiss
     let page: BrowserBonusPage
+    @ObservedObject var exchangeState: BrowserBonusExchangeState
     let onExchange: (BrowserBonusItem, Int, Int) async -> Bool
     @State private var selectedID: String
     @State private var quantity = 1
     @State private var delaySeconds = 12
-    @State private var isWorking = false
+    @State private var isStarting = false
 
-    init(page: BrowserBonusPage, onExchange: @escaping (BrowserBonusItem, Int, Int) async -> Bool) {
+    init(
+        page: BrowserBonusPage,
+        exchangeState: BrowserBonusExchangeState,
+        onExchange: @escaping (BrowserBonusItem, Int, Int) async -> Bool
+    ) {
         self.page = page
+        self.exchangeState = exchangeState
         self.onExchange = onExchange
         _selectedID = State(initialValue: page.items.first?.id ?? "")
     }
@@ -6234,8 +6384,8 @@ private struct BrowserBonusSheet: View {
     }
 
     private var maximumQuantity: Int {
-        guard let item = selectedItem, item.cost > 0, page.balance > 0 else { return 1 }
-        return max(1, Int(page.balance / item.cost))
+        guard let item = selectedItem, item.cost > 0, page.balance > 0 else { return 0 }
+        return max(0, Int(page.balance / item.cost))
     }
 
     var body: some View {
@@ -6254,31 +6404,57 @@ private struct BrowserBonusSheet: View {
                             Text("\(item.name) · \(formatCompactNumber(item.cost))").tag(item.id)
                         }
                     }
-                    Stepper("数量：\(quantity)", value: $quantity, in: 1...maximumQuantity)
+                    Stepper("数量：\(quantity)", value: $quantity, in: 1...max(1, maximumQuantity))
                     Stepper("提交间隔：\(delaySeconds) 秒", value: $delaySeconds, in: 12...120)
+                }
+                .disabled(exchangeState.isRunning || isStarting)
+
+                if exchangeState.isRunning {
+                    Section("兑换进度") {
+                        ProgressView(value: exchangeState.progress)
+                        LabeledContent("已完成", value: "\(exchangeState.completed) / \(exchangeState.total)")
+                        LabeledContent("剩余魔力", value: formatCompactNumber(exchangeState.remaining))
+                        if exchangeState.countdown > 0 {
+                            LabeledContent("下次提交", value: "\(exchangeState.countdown) 秒")
+                        }
+                        HStack {
+                            Button {
+                                exchangeState.togglePause()
+                            } label: {
+                                Label(exchangeState.isPaused ? "继续" : "暂停", systemImage: exchangeState.isPaused ? "play.fill" : "pause.fill")
+                            }
+                            Spacer()
+                            Button(role: .destructive) {
+                                exchangeState.stop()
+                            } label: {
+                                Label("停止", systemImage: "stop.fill")
+                            }
+                        }
+                    }
                 }
             }
             .navigationTitle("魔力值兑换")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() }.disabled(isWorking) }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }.disabled(exchangeState.isRunning || isStarting)
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isWorking ? "兑换中" : "兑换") {
+                    Button(exchangeState.isRunning || isStarting ? "兑换中" : "兑换") {
                         guard let item = selectedItem else { return }
                         Task {
-                            isWorking = true
+                            isStarting = true
                             let succeeded = await onExchange(item, quantity, delaySeconds)
-                            isWorking = false
-                            if succeeded { dismiss() }
+                            isStarting = false
+                            if succeeded || exchangeState.isCancelled { dismiss() }
                         }
                     }
-                    .disabled(selectedItem == nil || isWorking || quantity > maximumQuantity)
+                    .disabled(selectedItem == nil || exchangeState.isRunning || isStarting || maximumQuantity == 0 || quantity > maximumQuantity)
                 }
             }
-            .onChange(of: selectedID) { _, _ in quantity = min(quantity, maximumQuantity) }
-            .overlay { if isWorking { ProgressView().controlSize(.large) } }
+            .onChange(of: selectedID) { _, _ in quantity = min(quantity, max(1, maximumQuantity)) }
         }
-        .interactiveDismissDisabled(isWorking)
+        .interactiveDismissDisabled(exchangeState.isRunning || isStarting)
         .presentationDetents([.medium, .large])
     }
 }
@@ -6290,7 +6466,7 @@ private struct SiteDetailIcon: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
             if let url = URL(string: site.iconURL), !site.iconURL.isEmpty {
-                AsyncImage(url: url) { image in image.resizable().scaledToFit() } placeholder: {
+                CachedRemoteImage(url: url) { image in image.resizable().scaledToFit() } placeholder: {
                     Image(systemName: "globe.americas.fill").foregroundStyle(HarvestTheme.green)
                 }
                 .padding(10)
@@ -6670,7 +6846,7 @@ private func torrentFileName(_ preferred: String?, fallback: String) -> String {
     return name
 }
 
-struct TorrentItem: Identifiable {
+struct TorrentItem: Identifiable, @unchecked Sendable {
     let id: String
     var torrentHash: String
     var numericID: Int
@@ -6773,47 +6949,65 @@ private enum DownloaderRefreshDefaults {
     static let range = 1...60
 }
 
+private struct TorrentDerivedState {
+    var filtered: [TorrentItem] = []
+    var categories: [String] = []
+    var tags: [String] = []
+    var sites: [String] = []
+    var siteLabels: [String: String] = [:]
+}
+
 @MainActor
 final class DownloadsViewModel: ObservableObject {
     @Published var downloaders: [DownloaderItem] = []
-    @Published var torrents: [TorrentItem] = []
-    @Published var sites: [SiteItem] = []
+    private(set) var torrents: [TorrentItem] = [] {
+        didSet { rebuildTorrentMetadata() }
+    }
+    private(set) var sites: [SiteItem] = [] {
+        didSet {
+            rebuildSiteIndex()
+            rebuildTorrentMetadata()
+        }
+    }
     @Published var isLoading = true
-    @Published var query = ""
-    @Published var filter = "全部"
-    @Published var downloaderFilter = 0
-    @Published var categoryFilter = ""
-    @Published var tagFilters: Set<String> = []
-    @Published var siteFilter = ""
-    @Published var sortField = TorrentSortField.name
-    @Published var sortAscending = true
+    @Published var query = "" { didSet { rebuildFilteredTorrents() } }
+    @Published var filter = "全部" { didSet { rebuildFilteredTorrents() } }
+    @Published var downloaderFilter = 0 { didSet { rebuildFilteredTorrents() } }
+    @Published var categoryFilter = "" { didSet { rebuildFilteredTorrents() } }
+    @Published var tagFilters: Set<String> = [] { didSet { rebuildFilteredTorrents() } }
+    @Published var siteFilter = "" { didSet { rebuildFilteredTorrents() } }
+    @Published var sortField = TorrentSortField.name { didSet { rebuildFilteredTorrents() } }
+    @Published var sortAscending = true { didSet { rebuildFilteredTorrents() } }
     @Published var socketConnections: Set<Int> = []
     @Published private(set) var refreshEnabled = true
     @Published private(set) var refreshPaused = false
     @Published private(set) var refreshInterval = DownloaderRefreshDefaults.interval
     @Published private(set) var refreshDuration = DownloaderRefreshDefaults.duration
-    @Published private(set) var refreshRemainingSeconds = 0
+    @Published private(set) var refreshDeadline: Date?
+    @Published private(set) var cachedAt: Date?
+    @Published private(set) var usingCachedData = false
+    @Published private var derived = TorrentDerivedState()
     private var speedWatchTask: Task<Void, Never>?
     private var downloaderWatchTasks: [Int: Task<Void, Never>] = [:]
     private var downloaderWatchTokens: [Int: UUID] = [:]
     private var downloaderWatchSignatures: [Int: String] = [:]
+    private var torrentSnapshotSignatures: [Int: Int] = [:]
     private var countdownTask: Task<Void, Never>?
+    private var cacheWriteTask: Task<Void, Never>?
     private var isViewActive = false
     private var isWatching = false
+    private var restoredCache = false
+    private var siteHostLabels: [(host: String, label: String)] = []
+    private var siteKeyLabels: [(key: String, label: String)] = []
+    private let sessionCacheKey = "downloads.snapshot.v1"
 
     let statusFilters = ["全部", "下载中", "做种中", "等待中", "已暂停", "错误"]
 
-    var availableCategories: [String] {
-        Array(Set(torrents.map(\.category).filter { !$0.isEmpty })).sorted()
-    }
+    var availableCategories: [String] { derived.categories }
 
-    var availableTags: [String] {
-        Array(Set(torrents.flatMap(\.tags))).sorted()
-    }
+    var availableTags: [String] { derived.tags }
 
-    var availableSites: [String] {
-        Array(Set(torrents.map { siteLabel(for: $0) }.filter { !$0.isEmpty })).sorted()
-    }
+    var availableSites: [String] { derived.sites }
 
     var activeFilterCount: Int {
         (filter == "全部" ? 0 : 1)
@@ -6824,13 +7018,21 @@ final class DownloadsViewModel: ObservableObject {
             + (sortField == .name && sortAscending ? 0 : 1)
     }
 
-    var filtered: [TorrentItem] {
+    var filtered: [TorrentItem] { derived.filtered }
+
+    private func rebuildFilteredTorrents() {
+        var next = derived
+        next.filtered = makeFilteredTorrents(siteLabels: next.siteLabels)
+        derived = next
+    }
+
+    private func makeFilteredTorrents(siteLabels: [String: String]) -> [TorrentItem] {
         var result = torrents.filter { item in
             let queryMatch = query.isEmpty || item.name.localizedCaseInsensitiveContains(query)
             let downloaderMatch = downloaderFilter == 0 || item.downloaderID == downloaderFilter
             let categoryMatch = categoryFilter.isEmpty || item.category == categoryFilter
-            let tagMatch = tagFilters.isEmpty || !Set(item.tags).isDisjoint(with: tagFilters)
-            let siteMatch = siteFilter.isEmpty || siteLabel(for: item) == siteFilter
+            let tagMatch = tagFilters.isEmpty || item.tags.contains(where: tagFilters.contains)
+            let siteMatch = siteFilter.isEmpty || siteLabels[item.id] == siteFilter
             return queryMatch && downloaderMatch && categoryMatch && tagMatch && siteMatch && matchesStatus(item)
         }
         result.sort { left, right in
@@ -6855,6 +7057,38 @@ final class DownloadsViewModel: ObservableObject {
         return result
     }
 
+    private func rebuildTorrentMetadata() {
+        var next = derived
+        var labels: [String: String] = [:]
+        labels.reserveCapacity(torrents.count)
+        for torrent in torrents {
+            let label = resolvedSiteLabel(for: torrent)
+            if !label.isEmpty { labels[torrent.id] = label }
+        }
+        next.categories = Array(Set(torrents.lazy.map(\.category).filter { !$0.isEmpty })).sorted()
+        next.tags = Array(Set(torrents.lazy.flatMap(\.tags))).sorted()
+        next.siteLabels = labels
+        next.sites = Array(Set(labels.values)).sorted()
+        next.filtered = makeFilteredTorrents(siteLabels: labels)
+        derived = next
+    }
+
+    private func rebuildSiteIndex() {
+        var hostLabels: [(String, String)] = []
+        var keyLabels: [(String, String)] = []
+        for site in sites {
+            for value in [site.url, site.torrentsURL, site.rss] {
+                guard var host = URL(string: value)?.host?.lowercased(), !host.isEmpty else { continue }
+                if host.hasPrefix("www.") { host.removeFirst(4) }
+                hostLabels.append((host, site.name))
+            }
+            let key = site.siteKey.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            if !key.isEmpty { keyLabels.append((key, site.name)) }
+        }
+        siteHostLabels = hostLabels
+        siteKeyLabels = keyLabels
+    }
+
     func resetFilters() {
         filter = "全部"
         downloaderFilter = 0
@@ -6866,6 +7100,7 @@ final class DownloadsViewModel: ObservableObject {
     }
 
     func load(_ appState: AppState) async {
+        await restoreCacheIfNeeded(appState)
         isLoading = downloaders.isEmpty && torrents.isEmpty
         defer {
             isLoading = false
@@ -6877,19 +7112,42 @@ final class DownloadsViewModel: ObservableObject {
             let previousTorrents = torrents
             var collected: [TorrentItem] = []
             var successfulDownloaderLoads = 0
-            var firstDownloaderError: Error?
-            for downloader in downloaders where downloader.enabled {
-                do {
-                    let main = try await appState.api("\(APIPath.downloaderMain)\(downloader.id)")
+            var firstDownloaderError: String?
+            let enabledDownloaders = downloaders.filter(\.enabled)
+            let loads = await withTaskGroup(of: (Int, Data?, String?).self) { group in
+                for downloader in enabledDownloaders {
+                    let downloaderID = downloader.id
+                    group.addTask {
+                        do {
+                            let main = try await appState.api("\(APIPath.downloaderMain)\(downloaderID)")
+                            guard JSONSerialization.isValidJSONObject(main),
+                                  let data = try? JSONSerialization.data(withJSONObject: main) else {
+                                return (downloaderID, nil, "下载器返回了无效数据")
+                            }
+                            return (downloaderID, data, nil)
+                        } catch {
+                            return (downloaderID, nil, error.localizedDescription)
+                        }
+                    }
+                }
+                var values: [(Int, Data?, String?)] = []
+                for await value in group { values.append(value) }
+                return values
+            }
+            let downloaderByID = Dictionary(uniqueKeysWithValues: enabledDownloaders.map { ($0.id, $0) })
+            for (downloaderID, data, errorMessage) in loads {
+                guard let downloader = downloaderByID[downloaderID] else { continue }
+                if let data,
+                   let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
                     successfulDownloaderLoads += 1
-                    collected.append(contentsOf: jsonRows(main).map {
+                    collected.append(contentsOf: jsonRows(value).map {
                         var row = $0
                         row["downloader_id"] = downloader.id
                         row["downloader_category"] = downloader.category
                         return TorrentItem(row)
                     })
-                } catch {
-                    firstDownloaderError = firstDownloaderError ?? error
+                } else {
+                    firstDownloaderError = firstDownloaderError ?? errorMessage
                     collected.append(contentsOf: previousTorrents.filter { $0.downloaderID == downloader.id })
                 }
             }
@@ -6897,17 +7155,134 @@ final class DownloadsViewModel: ObservableObject {
             if successfulDownloaderLoads == 0,
                downloaders.contains(where: \.enabled),
                let firstDownloaderError {
-                appState.presentedError = firstDownloaderError.localizedDescription
+                if previousTorrents.isEmpty { appState.presentedError = firstDownloaderError }
+                else { recordAppLog(.warning, "下载器实时数据不可用，继续显示缓存：\(firstDownloaderError)") }
             }
-            if sites.isEmpty {
+            if sites.isEmpty || usingCachedData {
                 do {
                     let siteRaw = try await appState.api(APIPath.sites)
                     sites = jsonRows(siteRaw).map(SiteItem.init)
-                } catch {
-                    sites = []
-                }
+                } catch { }
             }
-        } catch { appState.presentedError = error.localizedDescription }
+            usingCachedData = successfulDownloaderLoads < enabledDownloaders.count
+            if !usingCachedData { cachedAt = nil }
+            if !usingCachedData { await persistCache(appState) }
+        } catch {
+            usingCachedData = !downloaders.isEmpty || !torrents.isEmpty
+            if usingCachedData {
+                recordAppLog(.warning, "下载页刷新失败，继续显示缓存：\(error.localizedDescription)")
+            } else {
+                appState.presentedError = error.localizedDescription
+            }
+        }
+    }
+
+    private func restoreCacheIfNeeded(_ appState: AppState) async {
+        guard !restoredCache else { return }
+        restoredCache = true
+        guard let cached = await appState.readSessionCache(sessionCacheKey),
+              let root = cached.value as? [String: Any] else { return }
+        let cachedDownloaders = (root["downloaders"] as? [[String: Any]] ?? []).map(DownloaderItem.init)
+        let cachedTorrents = (root["torrents"] as? [[String: Any]] ?? []).map(TorrentItem.init)
+        let cachedSites = (root["sites"] as? [[String: Any]] ?? []).map(SiteItem.init)
+        guard !cachedDownloaders.isEmpty || !cachedTorrents.isEmpty else { return }
+        downloaders = cachedDownloaders
+        torrents = cachedTorrents
+        sites = cachedSites
+        cachedAt = cached.cachedAt
+        usingCachedData = true
+        isLoading = false
+    }
+
+    private func persistCache(_ appState: AppState) async {
+        guard !downloaders.isEmpty || !torrents.isEmpty else { return }
+        await appState.writeSessionCache(cacheSnapshot(), name: sessionCacheKey)
+    }
+
+    private func scheduleCachePersistence(_ appState: AppState) {
+        guard cacheWriteTask == nil else { return }
+        cacheWriteTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(15)) }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            await self.persistCache(appState)
+            self.cacheWriteTask = nil
+        }
+    }
+
+    private func cacheSnapshot() -> [String: Any] {
+        [
+            "downloaders": downloaders.map(downloaderCacheRow),
+            "torrents": torrents.map(torrentCacheRow),
+            "sites": sites.map(siteCacheRow)
+        ]
+    }
+
+    private func downloaderCacheRow(_ item: DownloaderItem) -> [String: Any] {
+        [
+            "id": item.id,
+            "name": item.name,
+            "category": item.category,
+            "protocol": item.networkProtocol,
+            "host": item.host,
+            "external_host": item.externalHost,
+            "port": item.port,
+            "enable": item.enabled,
+            "brush": item.brush,
+            "sort_id": item.sortID,
+            "main": item.main,
+            "status": [
+                "uploadSpeed": item.uploadSpeed,
+                "downloadSpeed": item.downloadSpeed,
+                "activeTorrentCount": item.activeTorrentCount,
+                "pausedTorrentCount": item.pausedTorrentCount,
+                "torrentCount": item.totalTorrentCount,
+                "freeSpace": item.freeSpace,
+                "uploadedSession": item.uploadedSession,
+                "downloadedSession": item.downloadedSession,
+                "uploadLimit": item.uploadLimit,
+                "downloadLimit": item.downloadLimit,
+                "alternativeSpeedEnabled": item.alternativeSpeedEnabled,
+                "connectionStatus": item.connectionStatus,
+                "version": item.version
+            ]
+        ]
+    }
+
+    private func torrentCacheRow(_ item: TorrentItem) -> [String: Any] {
+        [
+            "id": item.numericID,
+            "hash": item.torrentHash,
+            "name": item.name,
+            "downloader_id": item.downloaderID,
+            "downloader_category": item.downloaderCategory,
+            "state": item.status,
+            "progress": item.progress,
+            "size": item.size,
+            "upload_speed": item.uploadSpeed,
+            "download_speed": item.downloadSpeed,
+            "ratio": item.ratio,
+            "category": item.category,
+            "tags": item.tags,
+            "site": siteLabel(for: item),
+            "error_string": item.errorText,
+            "force_start": item.forceStart,
+            "auto_tmm": item.autoManaged,
+            "super_seeding": item.superSeeding
+        ]
+    }
+
+    private func siteCacheRow(_ item: SiteItem) -> [String: Any] {
+        [
+            "id": item.id,
+            "site": item.siteKey,
+            "nickname": item.name,
+            "mirror": item.url,
+            "rss": item.rss,
+            "torrents": item.torrentsURL,
+            "icon": item.iconURL,
+            "available": item.enabled
+        ]
     }
 
     func exportTorrent(_ appState: AppState, torrent: TorrentItem) async -> ExportedTorrentFile? {
@@ -6935,12 +7310,21 @@ final class DownloadsViewModel: ObservableObject {
     }
 
     func siteLabel(for torrent: TorrentItem) -> String {
+        derived.siteLabels[torrent.id] ?? resolvedSiteLabel(for: torrent)
+    }
+
+    private func resolvedSiteLabel(for torrent: TorrentItem) -> String {
         if !torrent.siteHint.isEmpty { return torrent.siteHint }
         let trackerText = torrent.trackerURLs.joined(separator: " ").lowercased()
-        for site in sites {
-            let hosts = [site.url, site.torrentsURL, site.rss].compactMap { URL(string: $0)?.host?.lowercased() }
-            if hosts.contains(where: { trackerText.contains($0) }) { return site.name }
-            if !site.siteKey.isEmpty && trackerText.contains(site.siteKey.lowercased()) { return site.name }
+        for tracker in torrent.trackerURLs {
+            guard var host = URL(string: tracker)?.host?.lowercased(), !host.isEmpty else { continue }
+            if host.hasPrefix("www.") { host.removeFirst(4) }
+            if let match = siteHostLabels.first(where: { host == $0.host || host.hasSuffix(".\($0.host)") }) {
+                return match.label
+            }
+        }
+        if let match = siteKeyLabels.first(where: { trackerText.contains($0.key) }) {
+            return match.label
         }
         for tracker in torrent.trackerURLs {
             if let host = URL(string: tracker)?.host, !host.isEmpty { return host }
@@ -7103,6 +7487,7 @@ final class DownloadsViewModel: ObservableObject {
             torrents.removeAll { $0.downloaderID == downloader.id }
             if downloaderFilter == downloader.id { downloaderFilter = 0 }
             reconcileWatching(appState)
+            scheduleCachePersistence(appState)
         }
     }
 
@@ -7110,10 +7495,9 @@ final class DownloadsViewModel: ObservableObject {
         _ = await appState.perform("\(APIPath.downloaderRepeat)/\(downloader.id)", method: .get)
     }
 
-    var refreshCountdownText: String {
-        let minutes = refreshRemainingSeconds / 60
-        let seconds = refreshRemainingSeconds % 60
-        return String(format: "%d:%02d", minutes, seconds)
+    func refreshCountdownText(at date: Date = Date()) -> String {
+        let remaining = max(0, Int((refreshDeadline?.timeIntervalSince(date) ?? 0).rounded(.up)))
+        return String(format: "%d:%02d", remaining / 60, remaining % 60)
     }
 
     func startWatching(
@@ -7177,21 +7561,15 @@ final class DownloadsViewModel: ObservableObject {
         stopActiveWatching(clearRemaining: false)
         guard isViewActive, refreshEnabled, !refreshPaused else { return }
         isWatching = true
-        refreshRemainingSeconds = refreshDuration * 60
+        refreshDeadline = Date().addingTimeInterval(TimeInterval(refreshDuration * 60))
         reconcileWatching(appState)
         countdownTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(1)) }
-                catch { return }
-                guard let self, self.isWatching else { return }
-                if self.refreshRemainingSeconds <= 1 {
-                    self.refreshRemainingSeconds = 0
-                    self.refreshPaused = true
-                    self.stopActiveWatching(clearRemaining: true)
-                    return
-                }
-                self.refreshRemainingSeconds -= 1
-            }
+            guard let self else { return }
+            do { try await Task.sleep(for: .seconds(self.refreshDuration * 60)) }
+            catch { return }
+            guard self.isWatching else { return }
+            self.refreshPaused = true
+            self.stopActiveWatching(clearRemaining: true)
         }
     }
 
@@ -7205,8 +7583,9 @@ final class DownloadsViewModel: ObservableObject {
         downloaderWatchTasks = [:]
         downloaderWatchTokens = [:]
         downloaderWatchSignatures = [:]
+        torrentSnapshotSignatures = [:]
         socketConnections = []
-        if clearRemaining { refreshRemainingSeconds = 0 }
+        if clearRemaining { refreshDeadline = nil }
     }
 
     private func reconcileWatching(_ appState: AppState) {
@@ -7256,16 +7635,24 @@ final class DownloadsViewModel: ObservableObject {
                     guard isWatching, !Task.isCancelled else { return }
                     let data = (event["data"] as? [String: Any]) ?? jsonPayloadDictionary(event) ?? [:]
                     guard !data.isEmpty else { continue }
-                    for index in downloaders.indices {
-                        let downloader = downloaders[index]
+                    var liveByKey: [String: [String: Any]] = [:]
+                    for (key, value) in data {
+                        if let value = value as? [String: Any] { liveByKey[key.lowercased()] = value }
+                    }
+                    var updated = downloaders
+                    var changed = false
+                    for index in updated.indices {
+                        let downloader = updated[index]
                         let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
-                        guard let match = data.first(where: { key, _ in
-                            key.lowercased() == websocketKey || key == String(downloader.id)
-                        }), let live = match.value as? [String: Any] else { continue }
+                        guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
                         var merged = downloader.raw
                         merged["status"] = live
-                        downloaders[index] = DownloaderItem(merged)
+                        let next = DownloaderItem(merged)
+                        guard downloaderLiveSignature(next) != downloaderLiveSignature(downloader) else { continue }
+                        updated[index] = next
+                        changed = true
                     }
+                    if changed { downloaders = updated }
                 }
             } catch { }
             if isWatching && !Task.isCancelled { try? await Task.sleep(for: .seconds(3)) }
@@ -7289,16 +7676,29 @@ final class DownloadsViewModel: ObservableObject {
                         socketConnections.insert(downloader.id)
                     }
                     let payload = jsonPayloadDictionary(event) ?? event
-                    let rows = jsonRows(payload)
-                    guard !rows.isEmpty else { continue }
-                    let incoming = rows.map {
-                        var row = $0
-                        row["downloader_id"] = downloader.id
-                        row["downloader_category"] = downloader.category
-                        return TorrentItem(row)
-                    }
-                    torrents.removeAll { $0.downloaderID == downloader.id }
-                    torrents.append(contentsOf: incoming)
+                    guard JSONSerialization.isValidJSONObject(payload),
+                          let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { continue }
+                    let downloaderID = downloader.id
+                    let downloaderCategory = downloader.category
+                    let incoming = await Task.detached(priority: .utility) {
+                        guard let value = try? JSONSerialization.jsonObject(with: payloadData, options: [.fragmentsAllowed]) else {
+                            return [TorrentItem]()
+                        }
+                        return jsonRows(value).map {
+                            var row = $0
+                            row["downloader_id"] = downloaderID
+                            row["downloader_category"] = downloaderCategory
+                            return TorrentItem(row)
+                        }
+                    }.value
+                    guard !incoming.isEmpty else { continue }
+                    let signature = torrentSnapshotSignature(incoming)
+                    guard torrentSnapshotSignatures[downloader.id] != signature else { continue }
+                    torrentSnapshotSignatures[downloader.id] = signature
+                    var updated = torrents.filter { $0.downloaderID != downloader.id }
+                    updated.append(contentsOf: incoming)
+                    torrents = updated
+                    scheduleCachePersistence(appState)
                 }
                 if isCurrentWatch(downloader.id, token: token) { socketConnections.remove(downloader.id) }
             } catch {
@@ -7312,6 +7712,41 @@ final class DownloadsViewModel: ObservableObject {
 
     private func isCurrentWatch(_ downloaderID: Int, token: UUID) -> Bool {
         isWatching && downloaderWatchTokens[downloaderID] == token
+    }
+
+    private func downloaderLiveSignature(_ item: DownloaderItem) -> Int {
+        var hasher = Hasher()
+        hasher.combine(item.uploadSpeed)
+        hasher.combine(item.downloadSpeed)
+        hasher.combine(item.activeTorrentCount)
+        hasher.combine(item.pausedTorrentCount)
+        hasher.combine(item.totalTorrentCount)
+        hasher.combine(item.freeSpace)
+        hasher.combine(item.uploadedSession)
+        hasher.combine(item.downloadedSession)
+        hasher.combine(item.uploadLimit)
+        hasher.combine(item.downloadLimit)
+        hasher.combine(item.alternativeSpeedEnabled)
+        hasher.combine(item.connectionStatus)
+        hasher.combine(item.version)
+        return hasher.finalize()
+    }
+
+    private func torrentSnapshotSignature(_ items: [TorrentItem]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(items.count)
+        for item in items {
+            hasher.combine(item.id)
+            hasher.combine(item.status)
+            hasher.combine(item.progress)
+            hasher.combine(item.uploadSpeed)
+            hasher.combine(item.downloadSpeed)
+            hasher.combine(item.ratio)
+            hasher.combine(item.category)
+            hasher.combine(item.tags)
+            hasher.combine(item.errorText)
+        }
+        return hasher.finalize()
     }
 }
 
@@ -7343,6 +7778,10 @@ struct DownloadsView: View {
             if model.isLoading { LoadingState() }
             else {
                 LazyVStack(spacing: 16) {
+                    if model.usingCachedData {
+                        SessionCacheBanner(cachedAt: model.cachedAt)
+                            .padding(.horizontal, 16)
+                    }
                     if !model.downloaders.isEmpty {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 10) {
@@ -7370,14 +7809,18 @@ struct DownloadsView: View {
 
                     VStack(spacing: 12) {
                         HStack {
-                            StatusPill(
-                                label: !model.refreshEnabled
-                                    ? "自动刷新已关闭"
-                                    : (model.refreshPaused ? "自动刷新已暂停" : model.refreshCountdownText),
-                                color: !model.refreshEnabled
-                                    ? .secondary
-                                    : (model.refreshPaused ? HarvestTheme.amber : HarvestTheme.green)
-                            )
+                            if !model.refreshEnabled {
+                                StatusPill(label: "自动刷新已关闭", color: .secondary)
+                            } else if model.refreshPaused {
+                                StatusPill(label: "自动刷新已暂停", color: HarvestTheme.amber)
+                            } else {
+                                TimelineView(.periodic(from: .now, by: 1)) { context in
+                                    StatusPill(
+                                        label: model.refreshCountdownText(at: context.date),
+                                        color: HarvestTheme.green
+                                    )
+                                }
+                            }
                             Text(model.socketConnections.isEmpty ? "未连接" : "\(model.socketConnections.count) 个连接")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
@@ -7392,6 +7835,7 @@ struct DownloadsView: View {
                             Spacer()
                             Button { Task { await model.load(appState) } } label: {
                                 Image(systemName: "arrow.clockwise")
+                                    .symbolRenderingMode(.hierarchical)
                                     .frame(width: 28, height: 28)
                             }
                             .buttonStyle(.bordered)
@@ -7399,6 +7843,7 @@ struct DownloadsView: View {
                             .help("立即刷新")
                             Button { showRefreshSettings = true } label: {
                                 Image(systemName: "gearshape")
+                                    .symbolRenderingMode(.hierarchical)
                                     .frame(width: 28, height: 28)
                             }
                             .buttonStyle(.bordered)
@@ -7406,6 +7851,7 @@ struct DownloadsView: View {
                             .help("刷新设置")
                             Button { model.toggleRefreshPause(appState) } label: {
                                 Image(systemName: model.refreshPaused ? "play.fill" : "pause.fill")
+                                    .symbolRenderingMode(.hierarchical)
                                     .frame(width: 28, height: 28)
                             }
                             .buttonStyle(.bordered)
@@ -7493,7 +7939,10 @@ struct DownloadsView: View {
                 Button {
                     isSelecting.toggle()
                     if !isSelecting { selectedTorrentIDs = [] }
-                } label: { Image(systemName: isSelecting ? "checkmark.circle.fill" : "checkmark.circle") }
+                } label: {
+                    Image(systemName: isSelecting ? "checkmark.circle.fill" : "checkmark.circle")
+                        .symbolRenderingMode(.hierarchical)
+                }
                     .accessibilityLabel(isSelecting ? "结束批量选择" : "批量选择")
                 Menu {
                     Button {
@@ -7784,7 +8233,13 @@ struct DownloaderCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack {
-                Image(systemName: item.category == "Tr" || item.category.lowercased().contains("trans") ? "point.3.connected.trianglepath.dotted" : "bolt.horizontal.circle").foregroundStyle(HarvestTheme.green)
+                SymbolBadge(
+                    icon: item.category == "Tr" || item.category.lowercased().contains("trans")
+                        ? "point.3.connected.trianglepath.dotted"
+                        : "bolt.horizontal.circle.fill",
+                    color: HarvestTheme.green,
+                    size: 36
+                )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.name).font(.headline).lineLimit(1)
                     if !item.version.isEmpty { Text(item.version).font(.caption2).foregroundStyle(.secondary) }
@@ -8124,6 +8579,8 @@ struct TorrentRow: View {
                             .font(.title3).foregroundStyle(isSelected ? HarvestTheme.green : .secondary)
                     }
                     .buttonStyle(.plain)
+                } else {
+                    SymbolBadge(icon: statusIcon, color: progressColor, size: 34)
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
@@ -8151,7 +8608,7 @@ struct TorrentRow: View {
             HStack { Text("\(Int(item.progress * 100))%").fontWeight(.semibold); Text(formatBytes(item.size)); Spacer(); Label(formatSpeed(item.downloadSpeed), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue); Label(formatSpeed(item.uploadSpeed), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green) }.font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
         }
         .cardSurface()
-        .contentShape(Rectangle())
+        .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .onTapGesture(perform: onSelect)
         .confirmationDialog("确定删除种子「\(item.name)」？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("仅删除种子", role: .destructive) {
@@ -8166,7 +8623,17 @@ struct TorrentRow: View {
         }
     }
 
-    private var progressColor: Color { item.progress >= 1 ? HarvestTheme.green : item.downloadSpeed > 0 ? HarvestTheme.blue : HarvestTheme.amber }
+    private var progressColor: Color {
+        item.hasError ? HarvestTheme.coral : item.progress >= 1 ? HarvestTheme.green : item.downloadSpeed > 0 ? HarvestTheme.blue : HarvestTheme.amber
+    }
+
+    private var statusIcon: String {
+        if item.hasError { return "exclamationmark.triangle.fill" }
+        if item.progress >= 1 { return "checkmark.circle.fill" }
+        if item.downloadSpeed > 0 { return "arrow.down.circle.fill" }
+        if item.uploadSpeed > 0 { return "arrow.up.circle.fill" }
+        return "pause.circle.fill"
+    }
 
     private var metadataLine: String {
         var values = [item.status]
@@ -8865,6 +9332,9 @@ struct AddTorrentSheet: View {
         if let value = Int(downloadLimit), value > 0 { body["download_limit"] = value }
         if let value = Double(ratioLimit) { body["ratio_limit"] = value }
         if let value = Int(seedingTimeLimit) { body["seeding_time_limit"] = value }
+        let torrentIDs = urls.compactMap(torrentIDFromInput).uniqued()
+        if torrentIDs.count == 1 { body["ids"] = torrentIDs[0] }
+        else if !torrentIDs.isEmpty { body["ids"] = torrentIDs }
 
         if isQBittorrent {
             body["use_auto_torrent_management"] = autoManagement
@@ -8888,13 +9358,10 @@ struct AddTorrentSheet: View {
                 appState.presentedError = "批量推送需要可识别的站点 ID"
                 return
             }
-            let ids = urls.compactMap(torrentIDFromInput).uniqued()
-            guard !ids.isEmpty else {
+            guard !torrentIDs.isEmpty else {
                 appState.presentedError = "批量推送未解析到种子 ID，请输入种子 ID 或详情链接"
                 return
             }
-            if ids.count == 1 { body["ids"] = ids[0] }
-            else { body["ids"] = ids }
             if let data = try? JSONSerialization.data(withJSONObject: tagValues),
                let encoded = String(data: data, encoding: .utf8) { body["tags"] = encoded }
             if await appState.perform("\(APIPath.pushTorrentMonkey)\(downloaderID)/\(batchSiteID)", method: .post, body: body) {
@@ -9143,6 +9610,26 @@ private struct DownloaderPreferenceDraft: Identifiable {
     }
 }
 
+private struct DownloaderPreferenceChoice: Identifiable {
+    let value: String
+    let title: String
+    var id: String { value }
+}
+
+private let transmissionWritablePreferenceKeys: Set<String> = [
+    "download-dir", "incomplete-dir", "incomplete-dir-enabled", "rename-partial-files",
+    "speed-limit-down", "speed-limit-up", "speed-limit-down-enabled", "speed-limit-up-enabled",
+    "alt-speed-down", "alt-speed-up", "alt-speed-enabled", "alt-speed-time-enabled",
+    "alt-speed-time-begin", "alt-speed-time-end", "alt-speed-time-day",
+    "peer-limit-global", "peer-limit-per-torrent", "peer-port", "port-forwarding-enabled",
+    "peer-port-random-on-start", "tcp-enabled", "download-queue-enabled", "download-queue-size",
+    "seed-queue-enabled", "seed-queue-size", "queue-stalled-enabled", "queue-stalled-minutes",
+    "seedRatioLimited", "seedRatioLimit", "idle-seeding-limit-enabled", "idle-seeding-limit",
+    "dht-enabled", "pex-enabled", "lpd-enabled", "utp-enabled", "encryption",
+    "blocklist-enabled", "blocklist-url", "start-added-torrents", "trash-original-torrent-files",
+    "cache-size-mb"
+]
+
 struct DownloaderSettingsSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -9205,32 +9692,45 @@ struct DownloaderSettingsSheet: View {
     }
 
     @ViewBuilder private func preferenceControl(_ draft: DownloaderPreferenceDraft) -> some View {
-        switch draft.kind {
-        case .boolean:
-            VStack(alignment: .leading, spacing: 3) {
-                Toggle(preferenceLabel(draft.key), isOn: boolBinding(draft.key))
-                Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
-            }
-        case .integer, .decimal:
+        let choices = preferenceChoices(draft.key, transmission: isTransmission)
+        if !choices.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
-                TextField(preferenceLabel(draft.key), text: textBinding(draft.key))
-                    .keyboardType(draft.kind == .integer ? .numbersAndPunctuation : .decimalPad)
-                Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
-            }
-        case .text:
-            VStack(alignment: .leading, spacing: 4) {
-                if draft.key.lowercased().contains("password") {
-                    SecureField(preferenceLabel(draft.key), text: textBinding(draft.key))
-                } else {
-                    TextField(preferenceLabel(draft.key), text: textBinding(draft.key), axis: .vertical).lineLimit(1...5)
+                Picker(preferenceLabel(draft.key), selection: textBinding(draft.key)) {
+                    if !choices.contains(where: { $0.value == draft.text }) {
+                        Text("当前值：\(draft.text)").tag(draft.text)
+                    }
+                    ForEach(choices) { choice in Text(choice.title).tag(choice.value) }
                 }
                 Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
             }
-        case .json:
-            VStack(alignment: .leading, spacing: 5) {
-                Text(preferenceLabel(draft.key)).font(.subheadline)
-                TextEditor(text: textBinding(draft.key)).font(.caption.monospaced()).frame(minHeight: 100)
-                Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+        } else {
+            switch draft.kind {
+            case .boolean:
+                VStack(alignment: .leading, spacing: 3) {
+                    Toggle(preferenceLabel(draft.key), isOn: boolBinding(draft.key))
+                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                }
+            case .integer, .decimal:
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField(preferenceLabel(draft.key), text: textBinding(draft.key))
+                        .keyboardType(draft.kind == .integer ? .numbersAndPunctuation : .decimalPad)
+                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                }
+            case .text:
+                VStack(alignment: .leading, spacing: 4) {
+                    if draft.key.lowercased().contains("password") {
+                        SecureField(preferenceLabel(draft.key), text: textBinding(draft.key))
+                    } else {
+                        TextField(preferenceLabel(draft.key), text: textBinding(draft.key), axis: .vertical).lineLimit(1...5)
+                    }
+                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                }
+            case .json:
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(preferenceLabel(draft.key)).font(.subheadline)
+                    TextEditor(text: textBinding(draft.key)).font(.caption.monospaced()).frame(minHeight: 100)
+                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                }
             }
         }
     }
@@ -9264,7 +9764,10 @@ struct DownloaderSettingsSheet: View {
             )
             let root = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) ?? [:]
             let preferences = root.dict("prefs", "preferences") ?? root
-            drafts = preferences.keys.sorted().compactMap { key in
+            let editableKeys = preferences.keys.filter { key in
+                !isTransmission || transmissionWritablePreferenceKeys.contains(key)
+            }
+            drafts = editableKeys.sorted().compactMap { key in
                 guard let value = preferences[key] else { return nil }
                 return DownloaderPreferenceDraft(key: key, value: value, section: preferenceSection(key, transmission: isTransmission))
             }
@@ -9285,6 +9788,52 @@ struct DownloaderSettingsSheet: View {
                 body: value
             ) { dismiss() }
         } catch { parseError = error.localizedDescription }
+    }
+}
+
+private func preferenceChoices(_ key: String, transmission: Bool) -> [DownloaderPreferenceChoice] {
+    func choices(_ values: [(String, String)]) -> [DownloaderPreferenceChoice] {
+        values.map { DownloaderPreferenceChoice(value: $0.0, title: $0.1) }
+    }
+    if transmission {
+        guard key == "encryption" else { return [] }
+        return choices([
+            ("tolerated", "允许明文"), ("preferred", "优先加密"), ("required", "强制加密")
+        ])
+    }
+    switch key {
+    case "locale":
+        return choices([("zh_CN", "简体中文"), ("en", "English"), ("ja", "日本語"), ("ko", "한국어")])
+    case "torrent_content_layout":
+        return choices([("Original", "原始"), ("Subfolder", "子文件夹"), ("NoSubfolder", "无子文件夹")])
+    case "torrent_stop_condition":
+        return choices([("None", "无"), ("MetadataReceived", "获取元数据后"), ("FilesChecked", "文件校验后")])
+    case "proxy_type":
+        return choices([("None", "无"), ("SOCKS4", "SOCKS4"), ("SOCKS5", "SOCKS5"), ("HTTP", "HTTP")])
+    case "resume_data_storage_type":
+        return choices([("Legacy", "传统模式"), ("SQLite", "SQLite")])
+    case "torrent_content_remove_option":
+        return choices([("Delete", "删除"), ("MoveToTrash", "移动到回收站")])
+    case "file_log_age_type":
+        return choices([("0", "天"), ("1", "月"), ("2", "年")])
+    case "scheduler_days":
+        return choices([("0", "每天"), ("62", "工作日"), ("65", "周末")])
+    case "encryption":
+        return choices([("0", "允许加密"), ("1", "强制加密"), ("2", "禁用加密")])
+    case "max_ratio_act":
+        return choices([("0", "停止 Torrent"), ("1", "删除 Torrent")])
+    case "dyndns_service":
+        return choices([("0", "DynDNS"), ("1", "NoIP")])
+    case "disk_io_type":
+        return choices([("0", "默认"), ("1", "mmap")])
+    case "disk_io_read_mode", "disk_io_write_mode":
+        return choices([("0", "禁用 OS 缓存"), ("1", "启用 OS 缓存")])
+    case "utp_tcp_mixed_mode":
+        return choices([("0", "优先使用 TCP"), ("1", "优先使用 µTP"), ("2", "仅 TCP")])
+    case "upload_choking_algorithm":
+        return choices([("0", "固定上传槽位"), ("1", "反阻塞")])
+    default:
+        return []
     }
 }
 

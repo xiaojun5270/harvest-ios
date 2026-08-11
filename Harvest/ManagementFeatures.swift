@@ -32,6 +32,10 @@ struct NoticeView: View {
     @State private var isLoading = true
     @State private var selectedNotice: NoticeItem?
     @State private var confirmDeleteAll = false
+    @State private var cachedAt: Date?
+    @State private var usingCachedData = false
+    @State private var restoredCache = false
+    private let sessionCacheKey = "notices.snapshot.v1"
 
     var body: some View {
         NavigationStack {
@@ -39,17 +43,24 @@ struct NoticeView: View {
                 if isLoading { LoadingState() }
                 else if notices.isEmpty { EmptyState(icon: "bell.slash", title: "没有消息", detail: "站点公告、任务结果和系统提醒会出现在这里") }
                 else {
-                    List(notices) { notice in
-                        Button { selectedNotice = notice } label: { NoticeRow(item: notice) }
-                            .buttonStyle(.plain)
-                            .swipeActions(edge: .leading) {
-                                if !notice.read {
-                                    Button { Task { await markRead(notice) } } label: { Label("已读", systemImage: "checkmark") }.tint(HarvestTheme.green)
+                    List {
+                        if usingCachedData {
+                            SessionCacheBanner(cachedAt: cachedAt)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                                .listRowBackground(Color.clear)
+                        }
+                        ForEach(notices) { notice in
+                            Button { selectedNotice = notice } label: { NoticeRow(item: notice) }
+                                .buttonStyle(.plain)
+                                .swipeActions(edge: .leading) {
+                                    if !notice.read {
+                                        Button { Task { await markRead(notice) } } label: { Label("已读", systemImage: "checkmark") }.tint(HarvestTheme.green)
+                                    }
                                 }
-                            }
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button(role: .destructive) { Task { await delete(notice) } } label: { Label("删除", systemImage: "trash") }
-                            }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button(role: .destructive) { Task { await delete(notice) } } label: { Label("删除", systemImage: "trash") }
+                                }
+                        }
                     }
                     .listStyle(.plain)
                     .refreshable { await load() }
@@ -72,6 +83,7 @@ struct NoticeView: View {
                                             }
                                             appState.clearDeliveredNotices()
                                             await syncUnreadCount()
+                                            await persistCache()
                                         }
                                     }
                                 } label: { Label("全部已读", systemImage: "checkmark.circle") }
@@ -97,12 +109,32 @@ struct NoticeView: View {
     }
 
     private func load() async {
+        if !restoredCache {
+            restoredCache = true
+            if let cached = await appState.readSessionCache(sessionCacheKey) {
+                let restored = jsonRows(cached.value).map(NoticeItem.init)
+                if !restored.isEmpty {
+                    notices = restored
+                    cachedAt = cached.cachedAt
+                    usingCachedData = true
+                    isLoading = false
+                    await syncUnreadCount()
+                }
+            }
+        }
+        isLoading = notices.isEmpty
         defer { isLoading = false }
         do {
             notices = jsonRows(try await appState.api(APIPath.notices)).map(NoticeItem.init)
+            usingCachedData = false
+            cachedAt = nil
+            await persistCache()
             await syncUnreadCount()
         }
-        catch { appState.presentedError = error.localizedDescription }
+        catch {
+            if notices.isEmpty { appState.presentedError = error.localizedDescription }
+            else { recordAppLog(.warning, "消息刷新失败，继续显示缓存：\(error.localizedDescription)") }
+        }
     }
 
     private func markRead(_ notice: NoticeItem) async -> Bool {
@@ -111,6 +143,7 @@ struct NoticeView: View {
             if let index = notices.firstIndex(where: { $0.serverID == notice.serverID }) { notices[index].read = true }
             appState.clearDeliveredNotice(id: notice.serverID)
             await syncUnreadCount()
+            await persistCache()
             return true
         }
         return false
@@ -122,6 +155,7 @@ struct NoticeView: View {
             notices.removeAll { $0.serverID == notice.serverID }
             appState.clearDeliveredNotice(id: notice.serverID)
             await syncUnreadCount()
+            await persistCache()
             return true
         }
         return false
@@ -132,7 +166,23 @@ struct NoticeView: View {
             notices = []
             appState.clearDeliveredNotices()
             await syncUnreadCount()
+            await appState.removeSessionCache(sessionCacheKey)
         }
+    }
+
+    private func persistCache() async {
+        let rows: [[String: Any]] = notices.map { notice in
+            [
+                "id": notice.serverID,
+                "title": notice.title,
+                "category": notice.category,
+                "created_at": notice.createdAt,
+                "url": notice.url,
+                "is_read": notice.read
+            ]
+        }
+        if rows.isEmpty { await appState.removeSessionCache(sessionCacheKey) }
+        else { await appState.writeSessionCache(rows, name: sessionCacheKey) }
     }
 
     private func syncUnreadCount() async {
@@ -2312,7 +2362,11 @@ struct BackendOptionsView: View {
                 List(model.options) { option in
                     Button { selected = option } label: {
                         HStack(spacing: 12) {
-                            RoundedRectangle(cornerRadius: 8).fill(option.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 40, height: 40).overlay(Image(systemName: option.icon).foregroundStyle(option.active ? HarvestTheme.green : .secondary))
+                            SymbolBadge(
+                                icon: option.icon,
+                                color: option.active ? HarvestTheme.green : .secondary,
+                                size: 40
+                            )
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(option.displayName).font(.headline).foregroundStyle(.primary)
                                 Text(option.serverID == nil ? "尚未创建" : "\(option.value.count) 个参数").font(.caption).foregroundStyle(.secondary)
@@ -2447,7 +2501,7 @@ private struct BackendOptionValueField: View {
     var body: some View {
         switch kind {
         case .toggle:
-            Toggle(label, isOn: Binding(get: { value as? Bool ?? false }, set: { value = $0 }))
+            Toggle(label, isOn: Binding(get: { (value as? Bool) ?? false }, set: { value = $0 }))
                 .disabled(readOnly)
         case .integer:
             BackendOptionIntegerField(label: label, value: $value, readOnly: readOnly, help: definition?.help)
@@ -2464,7 +2518,7 @@ private struct BackendOptionValueField: View {
     }
 
     @ViewBuilder private func textField(multiline: Bool) -> some View {
-        let text = Binding<String>(get: { value as? String ?? String(describing: value) }, set: { value = $0 })
+        let text = Binding<String>(get: { (value as? String) ?? String(describing: value) }, set: { value = $0 })
         VStack(alignment: .leading, spacing: 5) {
             if definition?.sensitive == true && !revealSensitive {
                 HStack {
@@ -3231,6 +3285,8 @@ struct LogView: View {
     @State private var streamRestartGeneration = 0
     @State private var paused = false
     @State private var following = true
+    @State private var shareText = ""
+    @State private var showingShare = false
 
     private let levels = ["ALL", "DEBUG", "INFO", "WARN", "ERROR"]
     private let pageSize = 100
@@ -3255,6 +3311,7 @@ struct LogView: View {
     }
 
     var body: some View {
+        let visibleEntries = filtered
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
                 VStack(spacing: 10) {
@@ -3288,7 +3345,7 @@ struct LogView: View {
 
                 if isLoading {
                     LoadingState()
-                } else if filtered.isEmpty {
+                } else if visibleEntries.isEmpty {
                     EmptyState(icon: "doc.text", title: query.isEmpty ? "没有日志" : "没有匹配日志")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -3304,7 +3361,7 @@ struct LogView: View {
                             }
                             .disabled(isLoadingOlder)
                         }
-                        ForEach(filtered) { entry in
+                        ForEach(visibleEntries) { entry in
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack {
                                     Text(entry.level)
@@ -3342,7 +3399,7 @@ struct LogView: View {
                         } label: { Label("到底部", systemImage: "arrow.down.to.line") }
                         Divider()
                         Button { UIPasteboard.general.string = logText } label: { Label("复制当前日志", systemImage: "doc.on.doc") }
-                            .disabled(filtered.isEmpty)
+                            .disabled(visibleEntries.isEmpty)
                         Button { Task { await clearCurrent() } } label: { Label("清空当前视图", systemImage: "trash") }
                             .disabled(entries.isEmpty)
                         Button {
@@ -3364,12 +3421,19 @@ struct LogView: View {
                     }
                     .accessibilityLabel("日志工具")
 
-                    ShareLink(item: logText) { Image(systemName: "square.and.arrow.up") }
+                    Button {
+                        shareText = logText
+                        showingShare = true
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .disabled(visibleEntries.isEmpty)
                         .accessibilityLabel("分享日志")
                 }
             }
         }
         .searchable(text: $query, prompt: "筛选日志")
+        .sheet(isPresented: $showingShare) { ActivityShareSheet(items: [shareText]) }
         .navigationTitle("日志中心")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: "\(source.rawValue)-\(level)-\(streamRestartGeneration)") {
@@ -3719,7 +3783,7 @@ final class BrowserSessionModel: ObservableObject {
             .joined(separator: "; ")
         let script = "JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
         let result = try await webView.evaluateJavaScript(script)
-        let localStorageText = result as? String ?? "{}"
+        let localStorageText = (result as? String) ?? "{}"
         guard !cookieText.isEmpty || localStorageText != "{}" else {
             throw APIError(statusCode: 0, message: "当前页面没有可同步的 Cookie 或 LocalStorage")
         }
@@ -3763,7 +3827,14 @@ final class BrowserSessionModel: ObservableObject {
                 }
             }
         }
-        _ = try? await webView.evaluateJavaScript("window.localStorage.clear(); window.sessionStorage.clear();")
+        _ = try? await webView.evaluateJavaScript("""
+        (() => {
+          const marker = '__harvest_local_storage_injected__';
+          try { window.localStorage.clear(); } catch (_) {}
+          try { window.sessionStorage.clear(); } catch (_) {}
+          try { window.sessionStorage.setItem(marker, 'cleared'); } catch (_) {}
+        })();
+        """)
         webView.reload()
     }
 }
@@ -3774,6 +3845,8 @@ struct NativeBrowserView: UIViewRepresentable {
     let cookie: String
     let localStorage: String
     let userAgent: String
+    let localStorageURLs: [String]
+    let installsLocalStorageAuthBridge: Bool
     let session: BrowserSessionModel?
 
     init(
@@ -3782,6 +3855,8 @@ struct NativeBrowserView: UIViewRepresentable {
         cookie: String = "",
         localStorage: String = "",
         userAgent: String = "",
+        localStorageURLs: [String] = [],
+        installsLocalStorageAuthBridge: Bool = false,
         session: BrowserSessionModel? = nil
     ) {
         self.urlString = urlString
@@ -3789,6 +3864,8 @@ struct NativeBrowserView: UIViewRepresentable {
         self.cookie = cookie
         self.localStorage = localStorage
         self.userAgent = userAgent
+        self.localStorageURLs = localStorageURLs
+        self.installsLocalStorageAuthBridge = installsLocalStorageAuthBridge
         self.session = session
     }
 
@@ -3801,6 +3878,7 @@ struct NativeBrowserView: UIViewRepresentable {
             configuration.userContentController.addUserScript(
                 WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true)
             )
+            context.coordinator.localStorageScript = script
         }
 
         let view = WKWebView(frame: .zero, configuration: configuration)
@@ -3833,11 +3911,22 @@ struct NativeBrowserView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.session = session
         session?.attach(uiView)
+        let nextScript = localStorageScript()
+        guard context.coordinator.localStorageScript != nextScript else { return }
+        context.coordinator.localStorageScript = nextScript
+        uiView.configuration.userContentController.removeAllUserScripts()
+        if let nextScript {
+            uiView.configuration.userContentController.addUserScript(
+                WKUserScript(source: nextScript, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+            )
+        }
+        if uiView.url != nil { uiView.reload() }
     }
 
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         weak var session: BrowserSessionModel?
+        var localStorageScript: String?
 
         init(session: BrowserSessionModel?) { self.session = session }
 
@@ -3935,36 +4024,152 @@ struct NativeBrowserView: UIViewRepresentable {
 
     private func localStorageScript() -> String? {
         let storage = localStorage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !storage.isEmpty,
-              let host = URL(string: urlString)?.host,
-              let hostLiteral = javaScriptLiteral(host.lowercased()),
-              let storageLiteral = javaScriptLiteral(storage) else { return nil }
+        guard !storage.isEmpty, let storageLiteral = javaScriptLiteral(storage) else { return nil }
+
+        var allowedHosts: Set<String> = []
+        for value in [urlString] + localStorageURLs {
+            guard let host = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines))?.host?.lowercased(),
+                  !host.isEmpty else { continue }
+            allowedHosts.insert(host)
+            let baseHost: String
+            if host.hasPrefix("www.") { baseHost = String(host.dropFirst(4)) }
+            else if host.hasPrefix("m.") { baseHost = String(host.dropFirst(2)) }
+            else { baseHost = host }
+            allowedHosts.insert(baseHost)
+            allowedHosts.insert("www.\(baseHost)")
+            allowedHosts.insert("m.\(baseHost)")
+        }
+        guard !allowedHosts.isEmpty,
+              let hostsData = try? JSONSerialization.data(withJSONObject: allowedHosts.sorted()),
+              let hostsLiteral = String(data: hostsData, encoding: .utf8) else { return nil }
+        let authBridge = installsLocalStorageAuthBridge ? "true" : "false"
         return """
         (() => {
-          if (window.location.hostname.toLowerCase() !== \(hostLiteral)) return;
+          const allowedHosts = new Set(\(hostsLiteral));
+          if (!allowedHosts.has(window.location.hostname.toLowerCase())) return 0;
+          const marker = '__harvest_local_storage_injected__';
+          try {
+            if (window.sessionStorage.getItem(marker) === 'cleared') return 0;
+          } catch (_) {}
           const raw = \(storageLiteral);
           const setItem = (key, value) => {
-            if (key === undefined || key === null || String(key).length === 0) return;
+            if (key === undefined || key === null || String(key).length === 0) return 0;
             const text = typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '');
             window.localStorage.setItem(String(key), text);
+            return 1;
           };
           const applyObject = (data) => {
+            let count = 0;
             if (Array.isArray(data)) {
-              data.forEach((item) => { if (Array.isArray(item) && item.length >= 2) setItem(item[0], item[1]); });
+              data.forEach((item) => { if (Array.isArray(item) && item.length >= 2) count += setItem(item[0], item[1]); });
             } else if (data && typeof data === 'object') {
-              Object.keys(data).forEach((key) => setItem(key, data[key]));
+              Object.keys(data).forEach((key) => { count += setItem(key, data[key]); });
             }
+            return count;
           };
-          const applyText = (text) => text.split(';').forEach((part) => {
-            const index = part.indexOf('=');
-            if (index > 0) setItem(part.slice(0, index).trim(), part.slice(index + 1).trim());
-          });
+          const applyText = (text) => {
+            let count = 0;
+            text.split(';').forEach((part) => {
+              const index = part.indexOf('=');
+              if (index > 0) count += setItem(part.slice(0, index).trim(), part.slice(index + 1).trim());
+            });
+            return count;
+          };
           const text = String(raw).trim();
+          let count = 0;
           if (text.startsWith('{') || text.startsWith('[')) {
-            try { applyObject(JSON.parse(text)); } catch (_) { applyText(text); }
+            try { count = applyObject(JSON.parse(text)); } catch (_) { count = applyText(text); }
           } else {
-            applyText(text);
+            count = applyText(text);
           }
+          if (count > 0) {
+            try { window.sessionStorage.setItem(marker, 'injected'); } catch (_) {}
+          }
+
+          const installAuthBridge = \(authBridge);
+          if (installAuthBridge && !window.__harvest_api_auth_bridge_installed__) {
+            window.__harvest_api_auth_bridge_installed__ = true;
+            const tokenFromStorage = () => {
+              for (const key of ['auth', 'token', 'accessToken', 'access_token', 'jwt']) {
+                try {
+                  const value = window.localStorage.getItem(key);
+                  if (value && String(value).trim()) return String(value).trim();
+                } catch (_) {}
+              }
+              return '';
+            };
+            const authHeader = () => {
+              const token = tokenFromStorage();
+              if (!token) return '';
+              return token.toLowerCase().startsWith('bearer ') ? token : 'Bearer ' + token;
+            };
+            const apiHosts = () => {
+              const hosts = new Set();
+              const addHost = (value) => {
+                if (!value) return;
+                try {
+                  const url = new URL(String(value), window.location.href);
+                  if (url.host) hosts.add(url.host.toLowerCase());
+                } catch (_) {}
+              };
+              for (const key of ['apiHost', 'api_host', 'baseApi', 'base_api', 'apiBase', 'api_base']) {
+                try { addHost(window.localStorage.getItem(key)); } catch (_) {}
+              }
+              if (window.location.hostname.toLowerCase().includes('m-team')) {
+                hosts.add('api.m-team.cc');
+                hosts.add('api2.m-team.cc');
+              }
+              return hosts;
+            };
+            const shouldAttachAuth = (value) => {
+              if (!value) return false;
+              try {
+                const url = new URL(String(value), window.location.href);
+                return apiHosts().has(url.host.toLowerCase());
+              } catch (_) { return false; }
+            };
+
+            if (typeof window.fetch === 'function') {
+              const nativeFetch = window.fetch.bind(window);
+              window.fetch = (input, init) => {
+                try {
+                  const target = input && typeof input === 'object' && 'url' in input ? input.url : input;
+                  const headerValue = authHeader();
+                  if (!headerValue || !shouldAttachAuth(target)) return nativeFetch(input, init);
+                  const headers = new Headers(typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined);
+                  if (init && init.headers) new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+                  if (!headers.has('authorization')) headers.set('Authorization', headerValue);
+                  return nativeFetch(input, Object.assign({}, init || {}, { headers }));
+                } catch (_) { return nativeFetch(input, init); }
+              };
+            }
+
+            const xhr = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (xhr && xhr.open && xhr.send && xhr.setRequestHeader) {
+              const nativeOpen = xhr.open;
+              const nativeSend = xhr.send;
+              const nativeSetRequestHeader = xhr.setRequestHeader;
+              xhr.open = function(method, url) {
+                this.__harvest_auth_url = url;
+                this.__harvest_has_auth_header = false;
+                return nativeOpen.apply(this, arguments);
+              };
+              xhr.setRequestHeader = function(name, value) {
+                if (String(name || '').toLowerCase() === 'authorization') this.__harvest_has_auth_header = true;
+                return nativeSetRequestHeader.apply(this, arguments);
+              };
+              xhr.send = function() {
+                try {
+                  const headerValue = authHeader();
+                  if (headerValue && !this.__harvest_has_auth_header && shouldAttachAuth(this.__harvest_auth_url)) {
+                    nativeSetRequestHeader.call(this, 'Authorization', headerValue);
+                  }
+                } catch (_) {}
+                return nativeSend.apply(this, arguments);
+              };
+            }
+          }
+          return count;
         })();
         """
     }
