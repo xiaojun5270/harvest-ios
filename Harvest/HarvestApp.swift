@@ -103,12 +103,13 @@ struct RootView: View {
 struct LaunchView: View {
     var body: some View {
         ZStack {
-            Color(uiColor: .systemBackground).ignoresSafeArea()
+            // Keep the in-app restore screen visually identical to the native launch screen.
+            Color.white.ignoresSafeArea()
             VStack(spacing: 16) {
                 BrandMark(size: 84)
                 ProgressView()
                     .controlSize(.small)
-                    .tint(HarvestTheme.green)
+                    .tint(HarvestTheme.amber)
             }
         }
     }
@@ -118,32 +119,14 @@ struct BrandMark: View {
     var size: CGFloat = 72
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                .fill(HarvestTheme.ink)
-                .overlay(
-                    RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                        .stroke(Color.white.opacity(0.10), lineWidth: max(0.5, size * 0.012))
-                )
-            Path { path in
-                path.move(to: CGPoint(x: size * 0.24, y: size * 0.26))
-                path.addLine(to: CGPoint(x: size * 0.24, y: size * 0.73))
-                path.move(to: CGPoint(x: size * 0.76, y: size * 0.26))
-                path.addLine(to: CGPoint(x: size * 0.76, y: size * 0.73))
-                path.move(to: CGPoint(x: size * 0.24, y: size * 0.50))
-                path.addLine(to: CGPoint(x: size * 0.76, y: size * 0.50))
-            }
-            .stroke(HarvestTheme.mint, style: StrokeStyle(lineWidth: size * 0.095, lineCap: .round))
-            Circle()
-                .fill(HarvestTheme.coral)
-                .frame(width: size * 0.14, height: size * 0.14)
-                .offset(x: size * 0.26, y: -size * 0.24)
-            Circle()
-                .fill(HarvestTheme.amber)
-                .frame(width: size * 0.11, height: size * 0.11)
-                .offset(x: -size * 0.27, y: size * 0.25)
-        }
-        .frame(width: size, height: size)
-        .accessibilityLabel("Harvest")
+        Image("LaunchMark")
+            .resizable()
+            .renderingMode(.original)
+            .interpolation(.high)
+            .scaledToFit()
+            .frame(width: size, height: size)
+            .background(Color.white, in: RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            .accessibilityLabel("Harvest")
     }
 }

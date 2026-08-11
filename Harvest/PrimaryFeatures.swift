@@ -2545,6 +2545,9 @@ final class SitesViewModel: ObservableObject {
             .filter { !$0.isEmpty }
             .sorted()
     }
+    var activeSiteCount: Int { sites.lazy.filter(\.enabled).count }
+    var pendingSignInCount: Int { sites.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
+    var unreadCount: Int { sites.reduce(0) { $0 + $1.unread } }
     var hasFilters: Bool {
         availability != .alive || condition != .all || !selectedTags.isEmpty || !selectedTypes.isEmpty
             || !selectedUsername.isEmpty || !selectedEmail.isEmpty || sortField != .updated || !ascending
@@ -2738,7 +2741,15 @@ struct SitesView: View {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                             .padding(.horizontal, 16)
                             .padding(.top, 8)
+                            .padding(.bottom, 8)
                     }
+                    SiteListSummaryBar(
+                        visibleCount: model.filtered.count,
+                        totalCount: model.sites.count,
+                        activeCount: model.activeSiteCount,
+                        pendingSignInCount: model.pendingSignInCount,
+                        unreadCount: model.unreadCount
+                    )
                     List {
                         ForEach(model.filtered) { site in
                             Button {
@@ -2756,9 +2767,14 @@ struct SitesView: View {
                                     Button { Task { await model.operate(appState, site: site, path: APIPath.siteStatus) } } label: { Label("刷新", systemImage: "arrow.clockwise") }.tint(HarvestTheme.blue)
                                     Button(role: .destructive) { deletingSite = site } label: { Label("删除", systemImage: "trash") }
                                 }
+                                .listRowInsets(EdgeInsets())
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
                         }
                     }
                     .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(uiColor: .systemBackground))
                     .refreshable { await model.load(appState) }
                 }
             }
@@ -3969,6 +3985,7 @@ private func safeFileName(_ value: String) -> String {
 }
 
 struct SiteRow: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let site: SiteItem
     let privacy: Bool
     let iconURL: URL?
@@ -3980,47 +3997,286 @@ struct SiteRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(site.enabled ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
-                    .frame(width: 48, height: 48)
-                if let iconURL {
-                    CachedRemoteImage(url: iconURL) { image in
-                        image.resizable().scaledToFit()
-                    } placeholder: {
-                        Image(systemName: site.enabled ? "globe.americas.fill" : "globe.americas")
-                            .foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
+        VStack(spacing: 0) {
+            if dynamicTypeSize.isAccessibilitySize {
+                accessibilityLayout
+            } else {
+                standardLayout
+            }
+            Divider()
+                .padding(.leading, dynamicTypeSize.isAccessibilitySize ? 16 : 88)
+        }
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    private var standardLayout: some View {
+        HStack(alignment: .center, spacing: 14) {
+            siteLogo(size: 58)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    HStack(spacing: 5) {
+                        Text(site.name)
+                            .font(.headline)
+                            .lineLimit(1)
+                        signStatusIcon
                     }
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(7)
-                } else {
-                    Image(systemName: site.enabled ? "globe.americas.fill" : "globe.americas").foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
+                    .layoutPriority(1)
+                    Spacer(minLength: 8)
+                    Text(ratioText)
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(ratioColor)
+                        .lineLimit(1)
+                        .accessibilityLabel("分享率 \(ratioText)")
                 }
-            }
-            VStack(alignment: .leading, spacing: 5) {
-                HStack { Text(site.name).font(.headline).lineLimit(1); if site.signed { Image(systemName: "checkmark.seal.fill").foregroundStyle(HarvestTheme.green).font(.caption) } }
-                Text(site.username.isEmpty ? site.url : site.username).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                HStack(spacing: 10) {
-                    Label(privacy ? "••••" : formatBytes(site.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
-                    Label(privacy ? "••••" : formatBytes(site.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
-                }.font(.caption2.monospacedDigit())
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 5) {
-                Text(String(format: "%.2f", site.ratio)).font(.subheadline.weight(.semibold)).monospacedDigit()
-                Text("\(site.seeding) 做种").font(.caption2).foregroundStyle(.secondary)
+
                 HStack(spacing: 6) {
-                    if site.mail > 0 { Label("\(site.mail)", systemImage: "envelope.fill") }
-                    if site.notice > 0 { Label("\(site.notice)", systemImage: "bell.fill") }
-                    if site.mail == 0, site.notice == 0, site.unread > 0 {
-                        Label("\(site.unread)", systemImage: "bell.badge.fill")
+                    Text(identityText)
+                        .lineLimit(1)
+                    if !site.level.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("·")
+                        Text(site.level)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 8)
+                    Label("\(site.seeding) 做种", systemImage: "leaf.fill")
+                        .lineLimit(1)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) {
+                        trafficMetrics
+                        Spacer(minLength: 0)
+                        unreadIndicators
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        trafficMetrics
+                        unreadIndicators
                     }
                 }
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(HarvestTheme.coral)
             }
-        }.padding(.vertical, 5)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var accessibilityLayout: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                siteLogo(size: 52)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 6) {
+                        Text(site.name).font(.headline)
+                        signStatusIcon
+                    }
+                    Text(identityText).font(.caption).foregroundStyle(.secondary)
+                    if !site.level.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(site.level).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            trafficMetrics
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) {
+                    statusMetrics
+                    Spacer(minLength: 0)
+                    unreadIndicators
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    statusMetrics
+                    unreadIndicators
+                }
+            }
+            .font(.caption.weight(.semibold))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+    }
+
+    private func siteLogo(size: CGFloat) -> some View {
+        let radius = min(14, size * 0.24)
+        return ZStack {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .fill(site.enabled ? HarvestTheme.green.opacity(0.10) : Color.secondary.opacity(0.10))
+            CachedRemoteImage(url: iconURL) { image in
+                image
+                    .resizable()
+                    .scaledToFit()
+                    .padding(6)
+            } placeholder: {
+                Image(systemName: site.enabled ? "globe.asia.australia.fill" : "globe.asia.australia")
+                    .font(.system(size: size * 0.34, weight: .medium))
+                    .foregroundStyle(site.enabled ? HarvestTheme.green : .secondary)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.75)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            Circle()
+                .fill(site.enabled ? HarvestTheme.green : HarvestTheme.coral)
+                .frame(width: 11, height: 11)
+                .overlay(Circle().stroke(Color(uiColor: .systemBackground), lineWidth: 2))
+                .offset(x: 2, y: 2)
+        }
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder private var signStatusIcon: some View {
+        if site.signed || site.signIn {
+            Image(systemName: site.signed ? "checkmark.seal.fill" : "checkmark.seal")
+                .font(.caption)
+                .foregroundStyle(site.signed ? HarvestTheme.green : HarvestTheme.amber)
+                .accessibilityLabel(site.signed ? "今日已签到" : "今日待签到")
+        }
+    }
+
+    @ViewBuilder private var unreadIndicators: some View {
+        HStack(spacing: 7) {
+            if site.mail > 0 { Label("\(site.mail)", systemImage: "envelope.fill") }
+            if site.notice > 0 { Label("\(site.notice)", systemImage: "bell.fill") }
+            if site.mail == 0, site.notice == 0, site.unread > 0 {
+                Label("\(site.unread)", systemImage: "bell.badge.fill")
+            }
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(HarvestTheme.coral)
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var trafficMetrics: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) {
+                uploadMetric
+                downloadMetric
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                uploadMetric
+                downloadMetric
+            }
+        }
+    }
+
+    private var uploadMetric: some View {
+        SiteTransferMetric(
+            label: "上传",
+            value: privateValue(formatBytes(site.uploaded)),
+            icon: "arrow.up",
+            color: HarvestTheme.green
+        )
+    }
+
+    private var downloadMetric: some View {
+        SiteTransferMetric(
+            label: "下载",
+            value: privateValue(formatBytes(site.downloaded)),
+            icon: "arrow.down",
+            color: HarvestTheme.blue
+        )
+    }
+
+    private var statusMetrics: some View {
+        HStack(spacing: 16) {
+            Label(ratioText, systemImage: "arrow.triangle.2.circlepath")
+                .foregroundStyle(ratioColor)
+            Label("\(site.seeding) 做种", systemImage: "leaf.fill")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var identityText: String {
+        let username = site.username.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !username.isEmpty { return username }
+        if let host = URL(string: site.url)?.host, !host.isEmpty { return host }
+        return site.siteKey.isEmpty ? "未设置账号" : site.siteKey
+    }
+
+    private var ratioText: String { privateValue(String(format: "%.2f", site.ratio)) }
+    private var ratioColor: Color { !privacy && site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : .primary }
+    private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
+
+    private var accessibilitySummary: String {
+        let state = site.enabled ? "可用" : "停用"
+        let traffic = privacy
+            ? "流量数据已隐藏"
+            : "上传 \(formatBytes(site.uploaded))，下载 \(formatBytes(site.downloaded))，分享率 \(String(format: "%.2f", site.ratio))"
+        let signStatus = site.signed ? "，今日已签到" : (site.signIn ? "，今日待签到" : "")
+        let unread = site.unread > 0 ? "，未读 \(site.unread)" : ""
+        return "\(site.name)，\(state)\(signStatus)，\(traffic)，\(site.seeding) 个做种\(unread)"
+    }
+}
+
+private struct SiteTransferMetric: View {
+    let label: String
+    let value: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+            Text(value)
+                .monospacedDigit()
+                .minimumScaleFactor(0.76)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(color)
+        .lineLimit(1)
+        .accessibilityLabel("\(label) \(value)")
+    }
+}
+
+private struct SiteListSummaryBar: View {
+    let visibleCount: Int
+    let totalCount: Int
+    let activeCount: Int
+    let pendingSignInCount: Int
+    let unreadCount: Int
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            summaryContent(showActive: true)
+            summaryContent(showActive: false)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func summaryContent(showActive: Bool) -> some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 4) {
+                Text("\(visibleCount)")
+                    .font(.subheadline.weight(.bold).monospacedDigit())
+                Text("/ \(totalCount) 个站点")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+            .accessibilityLabel("显示 \(visibleCount)，共 \(totalCount) 个站点")
+            Spacer(minLength: 4)
+            if showActive {
+                summaryMetric("可用", value: activeCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
+            }
+            summaryMetric("待签", value: pendingSignInCount, icon: "checkmark.seal", color: HarvestTheme.amber)
+            summaryMetric("未读", value: unreadCount, icon: "bell.badge.fill", color: HarvestTheme.coral)
+        }
+    }
+
+    private func summaryMetric(_ label: String, value: Int, icon: String, color: Color) -> some View {
+        Label("\(label) \(value)", systemImage: icon)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .accessibilityLabel("\(label) \(value)")
     }
 }
 
@@ -7104,7 +7360,15 @@ final class DownloadsViewModel: ObservableObject {
     private var restoredCache = false
     private var siteHostLabels: [(host: String, label: String)] = []
     private var siteKeyLabels: [(key: String, label: String)] = []
-    private let sessionCacheKey = "downloads.snapshot.v1"
+    private let sessionCacheKey: String
+    private let includesTorrentData: Bool
+
+    init(includesTorrentData: Bool = true) {
+        self.includesTorrentData = includesTorrentData
+        self.sessionCacheKey = includesTorrentData
+            ? "downloads.snapshot.v1"
+            : "downloads.downloaders.snapshot.v1"
+    }
 
     let statusFilters = ["全部", "下载中", "做种中", "等待中", "已暂停", "错误"]
 
@@ -7214,6 +7478,15 @@ final class DownloadsViewModel: ObservableObject {
         do {
             let raw = try await appState.api(APIPath.downloaders, query: ["with_status": true])
             downloaders = jsonRows(raw).map(DownloaderItem.init)
+            // The compact downloads screen only needs aggregate downloader status.
+            guard includesTorrentData else {
+                torrents = []
+                sites = []
+                usingCachedData = false
+                cachedAt = nil
+                await persistCache(appState)
+                return
+            }
             let previousTorrents = torrents
             var collected: [TorrentItem] = []
             var successfulDownloaderLoads = 0
@@ -7285,11 +7558,19 @@ final class DownloadsViewModel: ObservableObject {
     private func restoreCacheIfNeeded(_ appState: AppState) async {
         guard !restoredCache else { return }
         restoredCache = true
-        guard let cached = await appState.readSessionCache(sessionCacheKey),
+        var cached = await appState.readSessionCache(sessionCacheKey)
+        if cached == nil, !includesTorrentData {
+            cached = await appState.readSessionCache("downloads.snapshot.v1")
+        }
+        guard let cached,
               let root = cached.value as? [String: Any] else { return }
         let cachedDownloaders = (root["downloaders"] as? [[String: Any]] ?? []).map(DownloaderItem.init)
-        let cachedTorrents = (root["torrents"] as? [[String: Any]] ?? []).map(TorrentItem.init)
-        let cachedSites = (root["sites"] as? [[String: Any]] ?? []).map(SiteItem.init)
+        let cachedTorrents: [TorrentItem] = includesTorrentData
+            ? (root["torrents"] as? [[String: Any]] ?? []).map(TorrentItem.init)
+            : []
+        let cachedSites: [SiteItem] = includesTorrentData
+            ? (root["sites"] as? [[String: Any]] ?? []).map(SiteItem.init)
+            : []
         guard !cachedDownloaders.isEmpty || !cachedTorrents.isEmpty else { return }
         downloaders = cachedDownloaders
         torrents = cachedTorrents
@@ -7701,6 +7982,16 @@ final class DownloadsViewModel: ObservableObject {
             }
         }
 
+        guard includesTorrentData else {
+            downloaderWatchTasks.values.forEach { $0.cancel() }
+            downloaderWatchTasks = [:]
+            downloaderWatchTokens = [:]
+            downloaderWatchSignatures = [:]
+            torrentSnapshotSignatures = [:]
+            socketConnections = []
+            return
+        }
+
         let enabledDownloaders = downloaders.filter(\.enabled)
         let enabledIDs = Set(enabledDownloaders.map(\.id))
         for id in Set(downloaderWatchTasks.keys).subtracting(enabledIDs) {
@@ -7857,7 +8148,7 @@ final class DownloadsViewModel: ObservableObject {
 
 struct DownloadsView: View {
     @EnvironmentObject private var appState: AppState
-    @StateObject private var model = DownloadsViewModel()
+    @StateObject private var model = DownloadsViewModel(includesTorrentData: false)
     @AppStorage(DownloaderRefreshDefaults.enabledKey) private var refreshEnabled = true
     @AppStorage(DownloaderRefreshDefaults.intervalKey) private var refreshInterval = DownloaderRefreshDefaults.interval
     @AppStorage(DownloaderRefreshDefaults.durationKey) private var refreshDuration = DownloaderRefreshDefaults.duration
@@ -7867,13 +8158,6 @@ struct DownloadsView: View {
     @State private var editingDownloader: DownloaderItem?
     @State private var settingsDownloader: DownloaderItem?
     @State private var toolsDownloader: DownloaderItem?
-    @State private var selectedTorrent: TorrentItem?
-    @State private var selectedTorrentIDs: Set<String> = []
-    @State private var isSelecting = false
-    @State private var actionTorrents: [TorrentItem] = []
-    @State private var showAdvancedActions = false
-    @State private var showFilters = false
-    @State private var exportedFile: ExportedTorrentFile?
     @State private var deletingDownloader: DownloaderItem?
     @State private var repeatingDownloader: DownloaderItem?
     @State private var showRefreshSettings = false
@@ -7887,13 +8171,22 @@ struct DownloadsView: View {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                             .padding(.horizontal, 16)
                     }
-                    if !model.downloaders.isEmpty {
+                    if model.downloaders.isEmpty {
+                        EmptyState(
+                            icon: "externaldrive.badge.plus",
+                            title: "暂无下载器",
+                            detail: "添加下载器后，这里会显示连接状态、速度和空间信息。",
+                            actionTitle: "添加下载器"
+                        ) {
+                            showAddDownloader = true
+                        }
+                        .frame(minHeight: 260)
+                    } else {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 10) {
                                 ForEach(model.downloaders) { downloader in
                                     DownloaderCard(
                                         item: downloader,
-                                        onShowTorrents: { model.downloaderFilter = downloader.id },
                                         onAddTorrent: {
                                             addTorrentDownloaderID = downloader.id
                                             showAddTorrent = true
@@ -7911,151 +8204,33 @@ struct DownloadsView: View {
                             .padding(.horizontal, 16)
                         }
                     }
-
-                    VStack(spacing: 12) {
-                        HStack {
-                            if !model.refreshEnabled {
-                                StatusPill(label: "自动刷新已关闭", color: .secondary)
-                            } else if model.refreshPaused {
-                                StatusPill(label: "自动刷新已暂停", color: HarvestTheme.amber)
-                            } else {
-                                TimelineView(.periodic(from: .now, by: 1)) { context in
-                                    StatusPill(
-                                        label: model.refreshCountdownText(at: context.date),
-                                        color: HarvestTheme.green
-                                    )
-                                }
-                            }
-                            Text(model.socketConnections.isEmpty ? "未连接" : "\(model.socketConnections.count) 个连接")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Spacer()
-                            Text("\(model.filtered.count) 个任务")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        HStack(spacing: 8) {
-                            Spacer()
-                            Button { Task { await model.load(appState) } } label: {
-                                Image(systemName: "arrow.clockwise")
-                                    .symbolRenderingMode(.hierarchical)
-                                    .frame(width: 28, height: 28)
-                            }
-                            .buttonStyle(.bordered)
-                            .accessibilityLabel("立即刷新")
-                            .help("立即刷新")
-                            Button { showRefreshSettings = true } label: {
-                                Image(systemName: "gearshape")
-                                    .symbolRenderingMode(.hierarchical)
-                                    .frame(width: 28, height: 28)
-                            }
-                            .buttonStyle(.bordered)
-                            .accessibilityLabel("刷新设置")
-                            .help("刷新设置")
-                            Button { model.toggleRefreshPause(appState) } label: {
-                                Image(systemName: model.refreshPaused ? "play.fill" : "pause.fill")
-                                    .symbolRenderingMode(.hierarchical)
-                                    .frame(width: 28, height: 28)
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!model.refreshEnabled)
-                            .accessibilityLabel(model.refreshPaused ? "恢复自动刷新" : "暂停自动刷新")
-                            .help(model.refreshPaused ? "恢复自动刷新" : "暂停自动刷新")
-                        }
-                        HStack(spacing: 10) {
-                            Menu {
-                                Picker("状态", selection: $model.filter) {
-                                    ForEach(model.statusFilters, id: \.self) { Text($0).tag($0) }
-                                }
-                            } label: {
-                                Label(model.filter, systemImage: "circle.dotted.circle")
-                            }
-                            .buttonStyle(.bordered)
-                            Button { showFilters = true } label: {
-                                Label(
-                                    model.activeFilterCount == 0 ? "筛选" : "筛选 \(model.activeFilterCount)",
-                                    systemImage: "line.3.horizontal.decrease.circle"
-                                )
-                            }
-                            .buttonStyle(.bordered)
-                            Spacer()
-                        }
-                        if isSelecting {
-                            HStack(spacing: 10) {
-                                Text("已选 \(selectedTorrentIDs.count) 项").font(.subheadline.weight(.semibold))
-                                Spacer()
-                                Button(selectedTorrentIDs.count == model.filtered.count ? "取消全选" : "全选") {
-                                    if selectedTorrentIDs.count == model.filtered.count { selectedTorrentIDs = [] }
-                                    else { selectedTorrentIDs = Set(model.filtered.map(\.id)) }
-                                }
-                                Button("操作") {
-                                    actionTorrents = model.torrents.filter { selectedTorrentIDs.contains($0.id) }
-                                    showAdvancedActions = !actionTorrents.isEmpty
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(selectedTorrentIDs.isEmpty)
-                            }
-                            .padding(12)
-                            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
-                        }
-                        if model.filtered.isEmpty {
-                            EmptyState(icon: "arrow.down.doc", title: "没有种子任务", detail: "推送磁力链接或种子地址后会显示在这里", actionTitle: "添加种子") {
-                                addTorrentDownloaderID = model.downloaderFilter
-                                showAddTorrent = true
-                            }
-                                .frame(minHeight: 260)
-                        } else {
-                            LazyVStack(spacing: 9) {
-                                ForEach(model.filtered) { torrent in
-                                    TorrentRow(
-                                        item: torrent,
-                                        model: model,
-                                        isSelecting: isSelecting,
-                                        isSelected: selectedTorrentIDs.contains(torrent.id),
-                                        onSelect: {
-                                            if isSelecting { toggleSelection(torrent) }
-                                            else { selectedTorrent = torrent }
-                                        },
-                                        onToggleSelection: { toggleSelection(torrent) },
-                                        onAdvanced: {
-                                            actionTorrents = [torrent]
-                                            showAdvancedActions = true
-                                        },
-                                        onExport: {
-                                            Task { exportedFile = await model.exportTorrent(appState, torrent: torrent) }
-                                        }
-                                    )
-                                }
-                            }
-                        }
-                    }.padding(.horizontal, 16)
                 }.padding(.vertical, 12)
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .searchable(text: $model.query, prompt: "搜索种子")
         .refreshable { await model.load(appState) }
         .navigationTitle("下载")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    isSelecting.toggle()
-                    if !isSelecting { selectedTorrentIDs = [] }
-                } label: {
-                    Image(systemName: isSelecting ? "checkmark.circle.fill" : "checkmark.circle")
+                Button { Task { await model.load(appState) } } label: {
+                    Image(systemName: "arrow.clockwise")
                         .symbolRenderingMode(.hierarchical)
                 }
-                    .accessibilityLabel(isSelecting ? "结束批量选择" : "批量选择")
+                .accessibilityLabel("刷新下载器")
+                .help("刷新下载器")
+                Button { model.toggleRefreshPause(appState) } label: {
+                    Image(systemName: model.refreshPaused ? "play.fill" : "pause.fill")
+                        .symbolRenderingMode(.hierarchical)
+                }
+                .disabled(!model.refreshEnabled)
+                .accessibilityLabel(model.refreshPaused ? "恢复自动刷新" : "暂停自动刷新")
+                .help(model.refreshPaused ? "恢复自动刷新" : "暂停自动刷新")
                 Menu {
-                    Button {
-                        addTorrentDownloaderID = 0
-                        showAddTorrent = true
-                    } label: { Label("添加种子", systemImage: "link.badge.plus") }
+                    Button { showRefreshSettings = true } label: { Label("刷新设置", systemImage: "gearshape") }
                     Button { showAddDownloader = true } label: { Label("添加下载器", systemImage: "externaldrive.badge.plus") }
-                } label: { Image(systemName: "plus") }
+                } label: { Image(systemName: "ellipsis.circle") }
+                .accessibilityLabel("下载器操作")
             }
         }
         .task {
@@ -8083,22 +8258,12 @@ struct DownloadsView: View {
         .sheet(item: $editingDownloader) { downloader in DownloaderEditorSheet(downloader: downloader) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $settingsDownloader) { downloader in DownloaderSettingsSheet(downloader: downloader).environmentObject(appState) }
         .sheet(item: $toolsDownloader) { downloader in DownloaderToolsSheet(downloader: downloader).environmentObject(appState) }
-        .sheet(item: $selectedTorrent) { torrent in TorrentDetailSheet(item: torrent, model: model).environmentObject(appState).presentationDetents([.medium, .large]) }
-        .sheet(isPresented: $showFilters) { TorrentFilterSheet(model: model) }
         .sheet(isPresented: $showRefreshSettings) {
             DownloaderRefreshSettingsSheet(
                 enabled: $refreshEnabled,
                 interval: $refreshInterval,
                 duration: $refreshDuration
             )
-        }
-        .sheet(item: $exportedFile) { file in ActivityShareSheet(items: [file.url]) }
-        .sheet(isPresented: $showAdvancedActions) {
-            TorrentAdvancedActionsSheet(torrents: actionTorrents, model: model) {
-                selectedTorrentIDs = []
-                isSelecting = false
-            }
-            .environmentObject(appState)
         }
         .confirmationDialog(
             "确定删除下载器「\(deletingDownloader?.name ?? "")」？",
@@ -8128,11 +8293,6 @@ struct DownloadsView: View {
         }
     }
 
-    private func toggleSelection(_ torrent: TorrentItem) {
-        if selectedTorrentIDs.contains(torrent.id) { selectedTorrentIDs.remove(torrent.id) }
-        else { selectedTorrentIDs.insert(torrent.id) }
-    }
-
     private func synchronizeRefreshSettings() {
         model.updateRefreshConfiguration(
             appState,
@@ -8155,7 +8315,7 @@ struct DownloaderRefreshSettingsSheet: View {
                 Section {
                     Toggle("自动刷新数据", isOn: $enabled)
                 } footer: {
-                    Text("关闭后停止下载器速度和种子列表的实时连接。")
+                    Text("关闭后停止下载器状态和速度的实时连接。")
                 }
 
                 if enabled {
@@ -8322,7 +8482,6 @@ private struct CompactFlowLayout: Layout {
 
 struct DownloaderCard: View {
     let item: DownloaderItem
-    let onShowTorrents: () -> Void
     let onAddTorrent: () -> Void
     let onEdit: () -> Void
     let onSettings: () -> Void
@@ -8351,7 +8510,6 @@ struct DownloaderCard: View {
                 }
                 Spacer(minLength: 6)
                 Menu {
-                    Button(action: onShowTorrents) { Label("种子列表", systemImage: "list.bullet.rectangle") }
                     Button(action: onAddTorrent) { Label("添加种子", systemImage: "link.badge.plus") }
                     Divider()
                     Button(action: onEdit) { Label("编辑", systemImage: "pencil") }

@@ -2428,11 +2428,21 @@ struct OptionEditorSheet: View {
                             .disabled((editedValue["token"] as? String ?? "").isEmpty)
                     }
                 }
-                if !option.isReadOnly {
+                if !option.isReadOnly && needsJSONEditor {
                     Section("高级") {
-                        Button { showRawEditor = true } label: { Label("编辑完整 JSON", systemImage: "curlybraces") }
-                        Text("未知字段和嵌套值可在完整 JSON 中编辑，保存时会原样提交。")
-                            .font(.caption).foregroundStyle(.secondary)
+                        Button { showRawEditor = true } label: {
+                            HStack(spacing: 12) {
+                                Label("JSON 配置", systemImage: "curlybraces")
+                                Spacer()
+                                Text("\(editedValue.count) 项")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
                     }
                 }
             }
@@ -2458,6 +2468,15 @@ struct OptionEditorSheet: View {
     private var orderedKeys: [String] {
         let known = option.definition?.fields.map(\.key) ?? []
         return known + editedValue.keys.filter { !known.contains($0) }.sorted()
+    }
+
+    private var needsJSONEditor: Bool {
+        guard let definition = option.definition else { return true }
+        let knownKeys = Set(definition.fields.map(\.key)).union(definition.additionalDefaults.keys)
+        if editedValue.keys.contains(where: { !knownKeys.contains($0) }) { return true }
+        return editedValue.values.contains { value in
+            value is [String: Any] || value is [Any] || value is NSNull
+        }
     }
 
     private func valueBinding(for key: String) -> Binding<Any> {
@@ -2578,49 +2597,184 @@ private struct BackendOptionIntegerField: View {
 private struct BackendOptionJSONEditor: View {
     @Environment(\.dismiss) private var dismiss
     let apply: ([String: Any]) -> Void
+    private let originalText: String
     @State private var text: String
     @State private var errorMessage: String?
+    @State private var isValid = true
+    @State private var fieldCount: Int
+    @State private var confirmDiscard = false
+    @FocusState private var editorFocused: Bool
 
     init(value: [String: Any], apply: @escaping ([String: Any]) -> Void) {
         self.apply = apply
-        let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
-        _text = State(initialValue: data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+        let formatted = Self.formattedJSON(value)
+        originalText = formatted
+        _text = State(initialValue: formatted)
+        _fieldCount = State(initialValue: value.count)
     }
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("配置 JSON") {
-                    TextEditor(text: $text)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(minHeight: 320)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    if let errorMessage {
-                        Label(errorMessage, systemImage: "exclamationmark.triangle")
-                            .font(.caption).foregroundStyle(HarvestTheme.coral)
+            VStack(spacing: 0) {
+                HStack(spacing: 8) {
+                    Label(
+                        isValid ? "JSON 有效" : "JSON 无效",
+                        systemImage: isValid ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .foregroundStyle(isValid ? HarvestTheme.green : HarvestTheme.coral)
+                    Spacer()
+                    if isValid {
+                        Text("\(fieldCount) 个顶层字段")
+                            .foregroundStyle(.secondary)
                     }
                 }
+                .font(.caption)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color(uiColor: .secondarySystemBackground))
+
+                Divider()
+
+                TextEditor(text: $text)
+                    .font(.system(size: 14, design: .monospaced))
+                    .lineSpacing(3)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(uiColor: .systemBackground))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($editorFocused)
+                    .accessibilityLabel("配置 JSON")
+
+                if let errorMessage {
+                    Divider()
+                    Label(errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(HarvestTheme.coral)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(HarvestTheme.coral.opacity(0.08))
+                }
             }
-            .navigationTitle("完整 JSON").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("配置 JSON")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("应用") { applyJSON() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { cancelEditing() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("应用到表单") { applyJSON() }
+                        .disabled(!isValid)
+                }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button { formatJSON() } label: {
+                        Label("格式化", systemImage: "text.alignleft")
+                    }
+                    .disabled(!isValid)
+                    Spacer()
+                    Button { restoreOriginal() } label: {
+                        Label("恢复", systemImage: "arrow.counterclockwise")
+                    }
+                    .disabled(!hasChanges)
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("收起") { editorFocused = false }
+                }
+            }
+            .onChange(of: text) { _, _ in validateJSON() }
+            .interactiveDismissDisabled(hasChanges)
+            .confirmationDialog("放弃未应用的 JSON 修改？", isPresented: $confirmDiscard, titleVisibility: .visible) {
+                Button("放弃修改", role: .destructive) { dismiss() }
+                Button("继续编辑", role: .cancel) {}
             }
         }
     }
 
-    private func applyJSON() {
-        guard let data = text.data(using: .utf8) else { return }
+    private var hasChanges: Bool { text != originalText }
+
+    private static func formattedJSON(_ value: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(
+                withJSONObject: value,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+              ),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return string
+    }
+
+    private func decodedObject() throws -> [String: Any] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw EditorError.empty }
+        guard let data = trimmed.data(using: .utf8) else { throw EditorError.invalidEncoding }
+        let decoded = try JSONSerialization.jsonObject(with: data)
+        guard let object = decoded as? [String: Any] else { throw EditorError.rootObjectRequired }
+        return object
+    }
+
+    private func validateJSON() {
         do {
-            guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                errorMessage = "配置必须是 JSON 对象"
-                return
-            }
-            apply(value)
+            let value = try decodedObject()
+            fieldCount = value.count
+            isValid = true
+            errorMessage = nil
+        } catch {
+            fieldCount = 0
+            isValid = false
+            errorMessage = validationMessage(for: error)
+        }
+    }
+
+    private func formatJSON() {
+        do {
+            text = Self.formattedJSON(try decodedObject())
+            validateJSON()
+        } catch {
+            isValid = false
+            errorMessage = validationMessage(for: error)
+        }
+    }
+
+    private func restoreOriginal() {
+        text = originalText
+        validateJSON()
+    }
+
+    private func cancelEditing() {
+        if hasChanges { confirmDiscard = true }
+        else { dismiss() }
+    }
+
+    private func applyJSON() {
+        do {
+            apply(try decodedObject())
             dismiss()
         } catch {
-            errorMessage = "JSON 格式错误：\(error.localizedDescription)"
+            isValid = false
+            errorMessage = validationMessage(for: error)
+        }
+    }
+
+    private func validationMessage(for error: Error) -> String {
+        if let error = error as? EditorError { return error.localizedDescription }
+        return "JSON 格式错误：\(error.localizedDescription)"
+    }
+
+    private enum EditorError: LocalizedError {
+        case empty
+        case invalidEncoding
+        case rootObjectRequired
+
+        var errorDescription: String? {
+            switch self {
+            case .empty: "JSON 内容不能为空"
+            case .invalidEncoding: "JSON 必须使用 UTF-8 文本"
+            case .rootObjectRequired: "配置顶层必须是 JSON 对象"
+            }
         }
     }
 }
