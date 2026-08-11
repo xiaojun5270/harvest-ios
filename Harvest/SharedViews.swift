@@ -1,4 +1,11 @@
+import Foundation
 import SwiftUI
+import UIKit
+
+private func setupValue(_ value: String?, fallback: String) -> String {
+    let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return normalized.isEmpty ? fallback : normalized
+}
 
 struct LoginView: View {
     @EnvironmentObject private var appState: AppState
@@ -8,6 +15,12 @@ struct LoginView: View {
     @State private var showPassword = false
     @State private var showHistory = false
     @State private var showSetup = false
+    @State private var showAppUpdate = false
+    @State private var confirmClearAllData = false
+    @State private var isClearingData = false
+    @State private var showClearCompleted = false
+    @State private var isCheckingServer = false
+    @State private var setupStatus: HarvestSetupStatus?
 
     var body: some View {
         NavigationStack {
@@ -34,7 +47,12 @@ struct LoginView: View {
 
                         Button {
                             Task {
-                                if (await appState.requiresSetup(server: server)) == true {
+                                guard !isCheckingServer else { return }
+                                isCheckingServer = true
+                                defer { isCheckingServer = false }
+                                let status = await appState.fetchSetupStatus(server: server)
+                                if status?.needsSetup == true {
+                                    setupStatus = status
                                     showSetup = true
                                 } else {
                                     await appState.login(server: server, username: username, password: password)
@@ -42,8 +60,8 @@ struct LoginView: View {
                             }
                         } label: {
                             HStack {
-                                if appState.isBusy { ProgressView().tint(.white) }
-                                Text(appState.isBusy ? "连接中" : "连接 Harvest")
+                                if appState.isBusy || isCheckingServer { ProgressView().tint(.white) }
+                                Text(appState.isBusy || isCheckingServer ? "连接中" : "连接 Harvest")
                                     .fontWeight(.semibold)
                             }
                             .frame(maxWidth: .infinity)
@@ -51,7 +69,7 @@ struct LoginView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(HarvestTheme.green)
-                        .disabled(appState.isBusy)
+                        .disabled(appState.isBusy || isCheckingServer)
 
                         if !appState.loginHistory.isEmpty {
                             Button {
@@ -62,6 +80,15 @@ struct LoginView: View {
                             }
                             .buttonStyle(.bordered)
                         }
+
+                        Button(role: .destructive) {
+                            confirmClearAllData = true
+                        } label: {
+                            Label("清理所有持久化数据", systemImage: "trash.slash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(appState.isBusy || isClearingData)
 
                         HStack(spacing: 8) {
                             Image(systemName: "lock.shield")
@@ -74,6 +101,21 @@ struct LoginView: View {
                     .padding(.horizontal, 22)
                     .padding(.bottom, 28)
                 }
+                .overlay(alignment: .topTrailing) {
+                    HStack(spacing: 8) {
+                        CurrentScreenShareButton()
+                            .environmentObject(appState)
+                            .buttonStyle(.bordered)
+                        Button { showAppUpdate = true } label: {
+                            Image(systemName: "arrow.up.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(HarvestTheme.green)
+                        .accessibilityLabel("APP 升级")
+                    }
+                        .padding(.top, 12)
+                        .padding(.trailing, 16)
+                }
             }
             .navigationTitle("登录")
             .toolbar(.hidden, for: .navigationBar)
@@ -83,7 +125,7 @@ struct LoginView: View {
                     .presentationDetents([.medium, .large])
             }
             .sheet(isPresented: $showSetup) {
-                SetupWizardView(server: server) { adminUser, adminPassword in
+                SetupWizardView(server: server, setupStatus: setupStatus) { adminUser, adminPassword in
                     username = adminUser
                     password = adminPassword
                     Task { await appState.login(server: server, username: adminUser, password: adminPassword) }
@@ -91,9 +133,45 @@ struct LoginView: View {
                 .environmentObject(appState)
                 .interactiveDismissDisabled()
             }
+            .sheet(isPresented: $showAppUpdate) {
+                AppUpdatePromptView()
+                    .environmentObject(appState)
+                    .presentationDetents([.medium, .large])
+            }
+            .confirmationDialog(
+                "清理所有持久化数据？",
+                isPresented: $confirmClearAllData,
+                titleVisibility: .visible
+            ) {
+                Button("清理", role: .destructive) {
+                    Task {
+                        isClearingData = true
+                        await appState.clearAllPersistentData()
+                        server = ""
+                        username = ""
+                        password = ""
+                        showPassword = false
+                        isClearingData = false
+                        showClearCompleted = true
+                    }
+                }
+            } message: {
+                Text("将清除登录状态、历史账号、钥匙串令牌与密码、所有设置、APP 日志、网页 Cookie 和缓存。")
+            }
+            .alert("清理完成", isPresented: $showClearCompleted) {
+                Button("好", role: .cancel) { }
+            } message: {
+                Text("本机持久化数据已全部清除。")
+            }
             .onAppear {
                 server = UserDefaults.standard.string(forKey: "harvest.baseURL") ?? ""
-                if let first = appState.loginHistory.first { username = first.username }
+                let history = appState.loginHistory
+                let record = history.first(where: { $0.server == server }) ?? history.first
+                if let record {
+                    if server.isEmpty { server = record.server }
+                    username = record.username
+                    password = appState.savedPassword(for: record) ?? ""
+                }
             }
         }
     }
@@ -103,6 +181,7 @@ struct SetupWizardView: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let server: String
+    let setupStatus: HarvestSetupStatus?
     let onComplete: (String, String) -> Void
 
     @State private var step = 0
@@ -119,6 +198,22 @@ struct SetupWizardView: View {
     @State private var isSubmitting = false
     @State private var errorMessage: String?
 
+    init(
+        server: String,
+        setupStatus: HarvestSetupStatus? = nil,
+        onComplete: @escaping (String, String) -> Void
+    ) {
+        self.server = server
+        self.setupStatus = setupStatus
+        self.onComplete = onComplete
+        let defaults = setupStatus?.defaults(for: "pgsql")
+        _host = State(initialValue: setupValue(defaults?.host, fallback: "go-harvest-postgres"))
+        _port = State(initialValue: setupValue(defaults?.port, fallback: "5432"))
+        _database = State(initialValue: setupValue(defaults?.name, fallback: "goharvest"))
+        _databaseUser = State(initialValue: setupValue(defaults?.user, fallback: "goharvest"))
+        _databasePassword = State(initialValue: defaults?.password ?? "")
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -134,6 +229,7 @@ struct SetupWizardView: View {
                 if step == 0 {
                     Section("数据库类型") {
                         Picker("类型", selection: $databaseType) { Text("PostgreSQL").tag("pgsql"); Text("SQLite").tag("sqlite") }.pickerStyle(.segmented)
+                            .onChange(of: databaseType) { _, value in applyDatabaseDefaults(value) }
                         Text(databaseType == "pgsql" ? "适合长期运行与多用户部署" : "适合轻量部署，数据保存在服务端文件中")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -146,7 +242,7 @@ struct SetupWizardView: View {
                             TextField("数据库账号", text: $databaseUser).textInputAutocapitalization(.never)
                             SecureField("数据库密码", text: $databasePassword)
                         } else {
-                            TextField("数据库文件", text: $database).textInputAutocapitalization(.never)
+                            LabeledContent("数据库文件", value: database)
                         }
                         Toggle("调试模式", isOn: $debug)
                     }
@@ -178,14 +274,20 @@ struct SetupWizardView: View {
     private func advance() async {
         errorMessage = nil
         if step == 0 {
-            if databaseType == "sqlite" { database = "db/data.sqlite3" }
+            applyDatabaseDefaults(databaseType)
             step = 1
             return
         }
         if step == 1 {
-            guard databaseType == "sqlite" || (!host.isEmpty && Int(port) != nil && !database.isEmpty && !databaseUser.isEmpty) else {
-                errorMessage = "请填写有效的数据库连接信息"
-                return
+            if databaseType == "pgsql" {
+                guard let databasePort = Int(port),
+                      (1...65_535).contains(databasePort),
+                      !host.isEmpty,
+                      !database.isEmpty,
+                      !databaseUser.isEmpty else {
+                    errorMessage = "请填写有效的数据库连接信息"
+                    return
+                }
             }
             isSubmitting = true
             defer { isSubmitting = false }
@@ -206,10 +308,27 @@ struct SetupWizardView: View {
         isSubmitting = true
         defer { isSubmitting = false }
         do {
-            try await appState.setupAdministrator(server: server, username: adminUser, password: adminPassword)
+            try await appState.setupAdministrator(
+                server: server,
+                username: adminUser,
+                password: adminPassword
+            )
             dismiss()
             onComplete(adminUser, adminPassword)
         } catch { errorMessage = error.localizedDescription }
+    }
+
+    private func applyDatabaseDefaults(_ type: String) {
+        let defaults = setupStatus?.defaults(for: type)
+        if type == "sqlite" {
+            database = setupValue(defaults?.name, fallback: "db/data.sqlite3")
+            return
+        }
+        host = setupValue(defaults?.host, fallback: "go-harvest-postgres")
+        port = setupValue(defaults?.port, fallback: "5432")
+        database = setupValue(defaults?.name, fallback: "goharvest")
+        databaseUser = setupValue(defaults?.user, fallback: "goharvest")
+        databasePassword = defaults?.password ?? ""
     }
 }
 
@@ -227,6 +346,7 @@ struct LoginHistorySheet: View {
                     Button {
                         server = record.server
                         username = record.username
+                        password = appState.savedPassword(for: record) ?? ""
                         dismiss()
                         Task { await appState.quickLogin(record) }
                     } label: {
@@ -256,10 +376,76 @@ struct LoginHistorySheet: View {
     }
 }
 
+struct AccountSwitcherView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var switchingID: String?
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(appState.loginHistory) { record in
+                    let isCurrent = record.server == appState.baseURL
+                        && record.username == appState.profile?.username
+                    Button {
+                        guard !isCurrent else { return }
+                        switchingID = record.id
+                        Task {
+                            await appState.quickLogin(record)
+                            switchingID = nil
+                            if appState.baseURL == record.server,
+                               appState.profile?.username == record.username {
+                                dismiss()
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Circle()
+                                .fill((isCurrent ? HarvestTheme.green : HarvestTheme.blue).opacity(0.14))
+                                .frame(width: 40, height: 40)
+                                .overlay(
+                                    Image(systemName: isCurrent ? "checkmark" : "person.fill")
+                                        .foregroundStyle(isCurrent ? HarvestTheme.green : HarvestTheme.blue)
+                                )
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 6) {
+                                    Text(record.username).font(.headline)
+                                    if isCurrent { Text("当前").font(.caption2).foregroundStyle(HarvestTheme.green) }
+                                }
+                                Text(record.server).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                            Spacer()
+                            if switchingID == record.id { ProgressView().controlSize(.small) }
+                        }
+                        .foregroundStyle(.primary)
+                    }
+                    .disabled(isCurrent || switchingID != nil)
+                }
+            } header: {
+                Text("已保存账号")
+            }
+
+            Section {
+                Button(role: .destructive) {
+                    appState.logout()
+                } label: {
+                    Label("登录其他账号", systemImage: "person.badge.plus")
+                }
+            }
+        }
+        .navigationTitle("切换账号")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 struct MainShellView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showingSettings = false
     @State private var showingNotices = false
+    @State private var showingAppUpdate = false
+    @State private var availableAppUpdate: String?
+    @State private var handledNoticePresentation = 0
 
     private let tabTitles = [
         0: "资讯",
@@ -273,7 +459,9 @@ struct MainShellView: View {
     var body: some View {
         NavigationStack {
             TabView(selection: $appState.selectedTab) {
-                NewsView().tabItem { Label("资讯", systemImage: "newspaper") }.tag(0)
+                if appState.mediaTMDBEnabled || appState.mediaDoubanEnabled {
+                    NewsView().tabItem { Label("资讯", systemImage: "newspaper") }.tag(0)
+                }
                 if appState.profile?.isSuperuser == true {
                     SitesView().tabItem { Label("站点", systemImage: "globe.americas") }.tag(1)
                     DashboardView().tabItem { Label("仪表盘", systemImage: "rectangle.3.group") }.tag(2)
@@ -293,7 +481,33 @@ struct MainShellView: View {
                     }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button { showingNotices = true } label: { Image(systemName: "bell") }
+                    CurrentScreenShareButton()
+                        .environmentObject(appState)
+                    if availableAppUpdate != nil {
+                        Button {
+                            showingAppUpdate = true
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .foregroundStyle(HarvestTheme.coral)
+                        }
+                        .accessibilityLabel("发现 APP 新版本")
+                    }
+                    Button { showingNotices = true } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: appState.unreadNoticeCount > 0 ? "bell.fill" : "bell")
+                                .frame(width: 26, height: 26)
+                            if appState.unreadNoticeCount > 0 {
+                                Text(appState.unreadNoticeCount > 99 ? "99+" : "\(appState.unreadNoticeCount)")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, appState.unreadNoticeCount > 9 ? 4 : 3)
+                                    .frame(minWidth: 15, minHeight: 15)
+                                    .background(HarvestTheme.coral, in: Capsule())
+                                    .offset(x: 7, y: -5)
+                            }
+                        }
+                        .frame(width: 34, height: 30)
+                    }
                         .accessibilityLabel("消息")
                     Button { showingSettings = true } label: { Image(systemName: "gearshape") }
                         .accessibilityLabel("设置")
@@ -302,6 +516,115 @@ struct MainShellView: View {
         }
         .sheet(isPresented: $showingSettings) { SettingsView().environmentObject(appState) }
         .sheet(isPresented: $showingNotices) { NoticeView().environmentObject(appState).presentationDetents([.medium, .large]) }
+        .sheet(isPresented: $showingAppUpdate) {
+            AppUpdatePromptView().environmentObject(appState).presentationDetents([.medium, .large])
+        }
+        .task(id: appState.autoRefreshMinutes) {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(appState.autoRefreshMinutes * 60)) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                appState.requestAutomaticRefresh(force: true)
+            }
+        }
+        .task(id: appState.isAuthenticated) {
+            guard appState.isAuthenticated else { return }
+            await appState.requestNotificationAuthorization()
+            await appState.refreshNoticeState()
+            presentPendingNoticeIfNeeded()
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(60)) }
+                catch { return }
+                guard !Task.isCancelled else { return }
+                await appState.refreshNoticeState()
+            }
+        }
+        .task(id: appState.isAuthenticated) {
+            guard appState.isAuthenticated else {
+                availableAppUpdate = nil
+                return
+            }
+            let version = await availableAppUpdateVersion(appState)
+            guard !Task.isCancelled else { return }
+            availableAppUpdate = version
+            guard let version, !isAppUpdateVersionIgnored(version) else { return }
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled, !showingSettings, !showingNotices else { return }
+            showingAppUpdate = true
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                appState.requestAutomaticRefresh()
+                Task { await appState.refreshNoticeState() }
+            }
+        }
+        .onChange(of: appState.noticePresentationGeneration) { _, _ in
+            presentPendingNoticeIfNeeded()
+        }
+        .onChange(of: appState.mediaTMDBEnabled || appState.mediaDoubanEnabled) { _, enabled in
+            if !enabled && appState.selectedTab == 0 {
+                appState.selectedTab = appState.profile?.isSuperuser == true ? 2 : 3
+            }
+        }
+    }
+
+    private func presentPendingNoticeIfNeeded() {
+        guard appState.noticePresentationGeneration != handledNoticePresentation else { return }
+        handledNoticePresentation = appState.noticePresentationGeneration
+        showingNotices = true
+    }
+}
+
+struct CurrentScreenShareButton: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var shareImage: UIImage?
+    @State private var showingShare = false
+    @State private var isCapturing = false
+
+    var body: some View {
+        Button {
+            Task { await captureAndShare() }
+        } label: {
+            if isCapturing {
+                ProgressView().controlSize(.small)
+            } else {
+                Image(systemName: "camera.viewfinder")
+            }
+        }
+        .disabled(isCapturing)
+        .accessibilityLabel("截图分享当前页面")
+        .sheet(isPresented: $showingShare) {
+            if let shareImage { ActivityShareSheet(items: [shareImage]) }
+        }
+    }
+
+    @MainActor private func captureAndShare() async {
+        guard !isCapturing else { return }
+        isCapturing = true
+        let restorePrivacy = !appState.privacyMode
+        if restorePrivacy { appState.setPrivacyMode(true) }
+        try? await Task.sleep(for: .milliseconds(180))
+
+        defer {
+            if restorePrivacy { appState.setPrivacyMode(false) }
+            isCapturing = false
+        }
+        guard let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow }) else {
+            appState.presentedError = "无法获取当前页面截图"
+            return
+        }
+
+        let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
+        let image = renderer.image { context in
+            if !window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) {
+                window.layer.render(in: context.cgContext)
+            }
+        }
+        shareImage = image
+        showingShare = true
     }
 }
 
@@ -430,6 +753,38 @@ struct LoadingState: View {
             Text("正在同步").font(.caption).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, minHeight: 180)
+    }
+}
+
+struct SessionCacheBanner: View {
+    let cachedAt: Date?
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "externaldrive.badge.clock")
+                .foregroundStyle(HarvestTheme.green)
+            Text(message)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(HarvestTheme.green)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 10)
+        .background(
+            HarvestTheme.green.opacity(0.09),
+            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                .stroke(HarvestTheme.green.opacity(0.20))
+        )
+        .accessibilityElement(children: .combine)
+    }
+
+    private var message: String {
+        guard let cachedAt else { return "当前页面使用上次缓存数据" }
+        return "当前页面使用上次缓存数据 · \(cachedAt.formatted(date: .abbreviated, time: .shortened))"
     }
 }
 

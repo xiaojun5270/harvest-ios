@@ -17,6 +17,7 @@ side by side.
 - Native iOS 26 Liquid Glass navigation with an ultra-thin-material fallback
 - Swift Concurrency and URLSession networking
 - Keychain token and credential storage
+- Account-scoped persistent caches for dashboard, sites, and media catalogs
 - Swift Charts dashboard visualizations
 - WebKit site browsing with Cookie, LocalStorage, and User-Agent injection
 - SF Symbols plus a new, project-local AppIcon
@@ -34,18 +35,33 @@ certificate, or a compatible sideloading service before installation.
 
 ## Migration status
 
-The primary workflows below are implemented, but this is not yet an
-endpoint-for-endpoint port of the Flutter client. See
-[`MIGRATION_AUDIT.md`](MIGRATION_AUDIT.md) for the verified gaps and test limits.
+The migration audit maps active Flutter workflows to native screens and service
+calls, including first-run defaults, account-scoped cache restoration,
+download-refresh, and site-history parity. It does not treat static source
+coverage as proof of runtime 1:1 behavior. Runtime parity still requires an
+Xcode build and an integration pass against a reachable Harvest server. See
+[`MIGRATION_AUDIT.md`](MIGRATION_AUDIT.md) for the current evidence and limits.
 
 ## Implemented core workflows
 
-- Login history, Keychain credentials, access-token refresh, and first-run setup
-- TMDB/Douban news, media details, and combined media/resource search with SSE
-- Site overview, filtering, add/edit, authenticated browsing, refresh, sign-in,
-  repeat, detail, and delete
-- Dashboard totals, traffic chart, privacy mode, and server resource status
-- Downloader setup, torrent push, live polling, filtering, and controls
-- Scheduled task create/edit/enable/run/delete and execution-result management
-- Notice detail/read/delete operations, users, authorization, logs, cache,
-  notification test, service restart, appearance, account switching, and logout
+- HTTP/HTTPS login, server-provided first-run database defaults, setup,
+  Keychain credentials, token refresh, complete login-history restoration,
+  direct account switching, logout, and complete local-data cleanup
+- TMDB/Douban catalogs, details, search history, combined resource search over
+  cancellable/deduplicated SSE, incremental results, advanced filtering,
+  downloader push, and cached catalog restoration
+- Site overview, ten editable feature flags, daily/monthly status history,
+  separate mail/announcement state, complete filters and sorting, timeline,
+  levels, imports, structured/raw TOML generation, bulk operations,
+  authenticated browsing, credential sync, extraction, and bonus tools
+- Configurable dashboard modules, traffic/server charts, privacy mode, current
+  page screenshot sharing, a dedicated dashboard long image, and cached
+  dashboard/site data with visible timestamps and background refresh
+- Downloader setup, persistent 1-60 second refresh settings, automatic-stop
+  countdown, pause/resume, WebSocket recovery, torrent filtering, bulk and
+  advanced controls, categories, tags, trackers, limits, and push workflows
+- Scheduled-task lifecycle, Cron editing, migration-task assistance, Markdown
+  execution results, termination, deletion, and result-history management
+- Notice lifecycle, unread and app badges, local notifications, Markdown detail,
+  gap-free APP/server log pause/resume, updates, backup/import, users,
+  paginated authorization management, and maintenance

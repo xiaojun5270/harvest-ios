@@ -76,8 +76,39 @@ struct TaskResultItem: Identifiable {
         raw = json
     }
 
-    var isActive: Bool {
-        ["pending", "received", "started", "retry", "running", "progress"].contains(status.lowercased())
+    private var normalizedStatus: String {
+        status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var isWaiting: Bool {
+        ["pending", "queued", "received"].contains(normalizedStatus)
+    }
+
+    var isRunning: Bool {
+        ["started", "running", "progress", "retry"].contains(normalizedStatus)
+    }
+
+    var isActive: Bool { isWaiting || isRunning }
+
+    var isSuccess: Bool {
+        ["success", "succeeded", "done"].contains(normalizedStatus)
+    }
+
+    var isFailure: Bool {
+        ["failure", "failed", "error", "revoked"].contains(normalizedStatus)
+    }
+
+    var isCompleted: Bool { isSuccess || isFailure }
+
+    var statusLabel: String {
+        switch normalizedStatus {
+        case "success", "succeeded", "done": "成功"
+        case "failure", "failed", "error": "失败"
+        case "revoked": "已撤销"
+        case "started", "running", "progress", "retry": "执行中"
+        case "pending", "queued", "received": "等待中"
+        default: status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "未知" : status
+        }
     }
 }
 
@@ -93,18 +124,35 @@ final class TasksViewModel: ObservableObject {
     func load(_ appState: AppState) async {
         isLoading = tasks.isEmpty && results.isEmpty
         defer { isLoading = false }
-        do {
-            async let taskRaw = appState.api(APIPath.schedules)
-            async let resultRaw = appState.api(APIPath.taskResults)
-            async let typeRaw = appState.api(APIPath.taskTypes)
-            async let crontabRaw = appState.api(APIPath.crontabs)
-            let (taskValue, resultValue, typeValue, crontabValue) = try await (taskRaw, resultRaw, typeRaw, crontabRaw)
+        async let taskResult = loadEndpoint(appState, path: APIPath.schedules, label: "计划任务")
+        async let resultResult = loadEndpoint(appState, path: APIPath.taskResults, label: "执行结果")
+        async let typeResult = loadEndpoint(appState, path: APIPath.taskTypes, label: "任务类型")
+        async let crontabResult = loadEndpoint(appState, path: APIPath.crontabs, label: "Cron 配置")
+        let values = await (taskResult, resultResult, typeResult, crontabResult)
+        if let taskValue = values.0.value {
             tasks = jsonRows(taskValue).map(TaskItem.init)
             if tasks.isEmpty, let root = jsonPayloadDictionary(taskValue) { tasks = root.rows("tasks", "schedules").map(TaskItem.init) }
+        }
+        if let resultValue = values.1.value {
             results = jsonRows(resultValue).map(TaskResultItem.init)
+        }
+        if let typeValue = values.2.value {
             taskTypes = jsonStrings(typeValue)
+        }
+        if let crontabValue = values.3.value {
             crontabs = jsonRows(crontabValue)
-        } catch { appState.presentedError = error.localizedDescription }
+        }
+        let errors = [values.0.errorMessage, values.1.errorMessage, values.2.errorMessage, values.3.errorMessage].compactMap { $0 }
+        if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
+    }
+
+    private func loadEndpoint(
+        _ appState: AppState,
+        path: String,
+        label: String
+    ) async -> (value: Any?, errorMessage: String?) {
+        do { return (try await appState.api(path), nil) }
+        catch { return (nil, "\(label)：\(error.localizedDescription)") }
     }
 
     func run(_ appState: AppState, task: TaskItem) async {
@@ -152,6 +200,8 @@ struct TasksView: View {
     @State private var editingTask: TaskItem?
     @State private var selectedResult: TaskResultItem?
     @State private var confirmClearResults = false
+    @State private var deletingTask: TaskItem?
+    @State private var deletingResult: TaskResultItem?
 
     var body: some View {
         Group {
@@ -179,7 +229,7 @@ struct TasksView: View {
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                     Button { editingTask = task } label: { Label("编辑", systemImage: "pencil") }.tint(HarvestTheme.blue)
-                                    Button(role: .destructive) { Task { await model.remove(appState, task: task) } } label: { Label("删除", systemImage: "trash") }
+                                    Button(role: .destructive) { deletingTask = task } label: { Label("删除", systemImage: "trash") }
                                 }
                             }
                         }
@@ -198,7 +248,9 @@ struct TasksView: View {
                                         }
                                     }
                                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                        Button(role: .destructive) { Task { await model.removeResult(appState, result: result) } } label: { Label("删除", systemImage: "trash") }
+                                        if result.isCompleted {
+                                            Button(role: .destructive) { deletingResult = result } label: { Label("删除", systemImage: "trash") }
+                                        }
                                     }
                             }
                         }
@@ -217,6 +269,7 @@ struct TasksView: View {
             }
         }
         .task { if model.isLoading { await model.load(appState) } }
+        .onChange(of: appState.refreshGeneration) { _, _ in Task { await model.load(appState) } }
         .sheet(isPresented: $showEditor) { TaskEditorSheet(taskTypes: model.taskTypes, crontabs: model.crontabs) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $editingTask) { task in TaskEditorSheet(task: task, taskTypes: model.taskTypes, crontabs: model.crontabs) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $selectedResult) { result in
@@ -225,9 +278,34 @@ struct TasksView: View {
                 onTerminate: { await model.terminate(appState, result: result) },
                 onDelete: { await model.removeResult(appState, result: result) }
             )
+            .environmentObject(appState)
         }
         .confirmationDialog("确定清空全部执行记录？", isPresented: $confirmClearResults, titleVisibility: .visible) {
             Button("清空执行记录", role: .destructive) { Task { await model.clearResults(appState) } }
+        }
+        .confirmationDialog(
+            "确定删除任务「\(deletingTask?.name ?? "")」？",
+            isPresented: Binding(get: { deletingTask != nil }, set: { if !$0 { deletingTask = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("删除任务", role: .destructive) {
+                guard let task = deletingTask else { return }
+                deletingTask = nil
+                Task { await model.remove(appState, task: task) }
+            }
+            Button("取消", role: .cancel) { deletingTask = nil }
+        }
+        .confirmationDialog(
+            "确定删除这条执行记录？",
+            isPresented: Binding(get: { deletingResult != nil }, set: { if !$0 { deletingResult = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("删除记录", role: .destructive) {
+                guard let result = deletingResult else { return }
+                deletingResult = nil
+                Task { await model.removeResult(appState, result: result) }
+            }
+            Button("取消", role: .cancel) { deletingResult = nil }
         }
     }
 }
@@ -249,11 +327,11 @@ struct ResultRow: View {
     let result: TaskResultItem
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: result.isActive ? "clock.arrow.circlepath" : result.status.lowercased().contains("success") ? "checkmark.circle.fill" : "exclamationmark.circle")
-                .foregroundStyle(result.isActive ? HarvestTheme.amber : result.status.lowercased().contains("success") ? HarvestTheme.green : HarvestTheme.coral)
+            Image(systemName: result.isRunning ? "clock.arrow.circlepath" : result.isWaiting ? "clock" : result.isSuccess ? "checkmark.circle.fill" : result.isFailure ? "exclamationmark.circle" : "questionmark.circle")
+                .foregroundStyle(result.isRunning ? HarvestTheme.blue : result.isWaiting ? HarvestTheme.amber : result.isSuccess ? HarvestTheme.green : result.isFailure ? HarvestTheme.coral : Color.secondary)
             VStack(alignment: .leading, spacing: 5) {
                 Text(result.name).font(.subheadline.weight(.semibold))
-                Text(result.status).font(.caption).foregroundStyle(.secondary)
+                Text(result.statusLabel).font(.caption).foregroundStyle(.secondary)
                 Text(result.createdAt).font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
@@ -282,6 +360,13 @@ struct TaskEditorSheet: View {
     @State private var kwargs: String
     @State private var enabled: Bool
     @State private var validationError: String?
+    @State private var downloaders: [DownloaderItem] = []
+    @State private var sourceDownloaderID: Int
+    @State private var targetDownloaderID: Int
+    @State private var folderMap: String
+    @State private var skipChecking: Bool
+    @State private var removeSourceTorrents: Bool
+    @State private var loadingDownloaders = false
 
     init(task: TaskItem? = nil, taskTypes: [String], crontabs: [[String: Any]], onSaved: @escaping () async -> Void) {
         self.task = task
@@ -305,6 +390,20 @@ struct TaskEditorSheet: View {
         _args = State(initialValue: task?.args ?? "[]")
         _kwargs = State(initialValue: task?.kwargs ?? "{}")
         _enabled = State(initialValue: task?.enabled ?? true)
+        let kwargsObject: [String: Any]
+        if let data = (task?.kwargs ?? "{}").data(using: .utf8),
+           let decoded = try? JSONSerialization.jsonObject(with: data),
+           let value = decoded as? [String: Any] {
+            kwargsObject = value
+        } else {
+            kwargsObject = [:]
+        }
+        _sourceDownloaderID = State(initialValue: kwargsObject.int("source_downloader_id") ?? 0)
+        _targetDownloaderID = State(initialValue: kwargsObject.int("dist_downloader_id") ?? 0)
+        let mappings = (kwargsObject["folder_map"] as? [Any])?.map { String(describing: $0) } ?? []
+        _folderMap = State(initialValue: mappings.joined(separator: "\n"))
+        _skipChecking = State(initialValue: kwargsObject.bool("skip_checking") ?? false)
+        _removeSourceTorrents = State(initialValue: kwargsObject.bool("remove_source_torrents") ?? false)
     }
 
     var body: some View {
@@ -331,20 +430,62 @@ struct TaskEditorSheet: View {
                     TextField("星期", text: $dayOfWeek).textInputAutocapitalization(.never)
                     Text("Cron 顺序：分钟、小时、日期、月份、星期").font(.caption).foregroundStyle(.secondary)
                 }
-                Section("参数 JSON") {
-                    TextField("位置参数，例如 []", text: $args, axis: .vertical).font(.system(.caption, design: .monospaced))
-                    TextField("关键字参数，例如 {}", text: $kwargs, axis: .vertical).font(.system(.caption, design: .monospaced))
-                    if let validationError { Label(validationError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(HarvestTheme.coral) }
+                if isTorrentMoveTask {
+                    Section("迁移下载器") {
+                        if loadingDownloaders { ProgressView().frame(maxWidth: .infinity) }
+                        Picker("源下载器", selection: $sourceDownloaderID) {
+                            Text("请选择").tag(0)
+                            ForEach(downloaders) { Text($0.name).tag($0.id) }
+                        }
+                        .onChange(of: sourceDownloaderID) { _, _ in
+                            if !targetOptions.contains(where: { $0.id == targetDownloaderID }) { targetDownloaderID = targetOptions.first?.id ?? 0 }
+                            Task { await fillFolderMap(updateSource: true, updateTarget: true) }
+                        }
+                        Picker("目标下载器", selection: $targetDownloaderID) {
+                            Text("请选择").tag(0)
+                            ForEach(targetOptions) { Text($0.name).tag($0.id) }
+                        }
+                        .onChange(of: targetDownloaderID) { _, _ in Task { await fillFolderMap(updateSource: false, updateTarget: true) } }
+                        TextField("目录映射，每行 源目录->目标目录", text: $folderMap, axis: .vertical)
+                            .lineLimit(3...8).textInputAutocapitalization(.never).font(.system(.caption, design: .monospaced))
+                        Button { Task { await fillFolderMap(updateSource: true, updateTarget: true) } } label: { Label("读取下载器默认路径", systemImage: "folder.badge.gearshape") }
+                        Toggle("跳过文件校验", isOn: $skipChecking)
+                        Toggle("迁移后删除源种子", isOn: $removeSourceTorrents)
+                    }
+                } else {
+                    Section("参数 JSON") {
+                        TextField("位置参数，例如 []", text: $args, axis: .vertical).font(.system(.caption, design: .monospaced))
+                        TextField("关键字参数，例如 {}", text: $kwargs, axis: .vertical).font(.system(.caption, design: .monospaced))
+                    }
                 }
+                if let validationError { Section { Label(validationError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(HarvestTheme.coral) } }
             }
             .navigationTitle(task == nil ? "新建任务" : "编辑任务").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("保存") { Task { await save() } }.disabled(name.isEmpty || type.isEmpty || minute.isEmpty || hour.isEmpty) } }
             .onAppear { if type.isEmpty { type = taskTypes.first ?? "" } }
+            .task(id: type) { if isTorrentMoveTask { await loadDownloaders() } }
         }
     }
 
     private func save() async {
-        guard validJSON(args, expected: [Any].self), validJSON(kwargs, expected: [String: Any].self) else {
+        var resolvedKwargs = kwargs
+        if isTorrentMoveTask {
+            guard sourceDownloaderID > 0, targetDownloaderID > 0, sourceDownloaderID != targetDownloaderID else {
+                validationError = "请选择不同的源下载器和目标下载器"
+                return
+            }
+            let mappings = folderMap.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            var object = decodedJSONObject(kwargs) ?? [:]
+            object["source_downloader_id"] = sourceDownloaderID
+            object["dist_downloader_id"] = targetDownloaderID
+            object["folder_map"] = mappings
+            object["remove_source_torrents"] = removeSourceTorrents
+            object["skip_checking"] = skipChecking
+            if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) {
+                resolvedKwargs = text
+            }
+        }
+        guard validJSON(args, expected: [Any].self), validJSON(resolvedKwargs, expected: [String: Any].self) else {
             validationError = "位置参数必须是数组，关键字参数必须是对象"
             return
         }
@@ -366,7 +507,7 @@ struct TaskEditorSheet: View {
             "crontab_id": NSNull(),
             "crontab": crontab,
             "args": args,
-            "kwargs": kwargs,
+            "kwargs": resolvedKwargs,
             "enabled": enabled
         ]
         let method: HTTPMethod = task == nil ? .post : .put
@@ -374,6 +515,72 @@ struct TaskEditorSheet: View {
             await onSaved()
             dismiss()
         }
+    }
+
+    private var isTorrentMoveTask: Bool {
+        type == "种子迁移任务" || type.lowercased().contains("torrent move") || type.lowercased().contains("torrent_move")
+    }
+
+    private var targetOptions: [DownloaderItem] {
+        guard let source = downloaders.first(where: { $0.id == sourceDownloaderID }) else { return downloaders.filter { $0.id != sourceDownloaderID } }
+        return downloaders.filter { $0.id != source.id && $0.host == source.host }
+    }
+
+    @MainActor private func loadDownloaders() async {
+        guard downloaders.isEmpty else { return }
+        loadingDownloaders = true
+        defer { loadingDownloaders = false }
+        do {
+            downloaders = jsonRows(try await appState.api(APIPath.downloaders))
+                .map { DownloaderItem($0) }
+                .filter { $0.enabled }
+            if sourceDownloaderID == 0 { sourceDownloaderID = downloaders.first?.id ?? 0 }
+            if targetDownloaderID == 0 { targetDownloaderID = targetOptions.first?.id ?? 0 }
+            await fillFolderMap(updateSource: true, updateTarget: true, onlyWhenEmpty: true)
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func fillFolderMap(
+        updateSource: Bool,
+        updateTarget: Bool,
+        onlyWhenEmpty: Bool = false
+    ) async {
+        guard !onlyWhenEmpty || folderMap.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let source = downloaders.first(where: { $0.id == sourceDownloaderID })
+        let target = downloaders.first(where: { $0.id == targetDownloaderID })
+        guard source != nil || target != nil else { return }
+
+        var resolvedSource = ""
+        var resolvedTarget = ""
+        if updateSource, let source { resolvedSource = await downloaderDefaultPath(source) }
+        if updateTarget, let target { resolvedTarget = await downloaderDefaultPath(target) }
+
+        var lines = folderMap.components(separatedBy: .newlines)
+        if lines.isEmpty { lines = [""] }
+        let first = lines[0]
+        let parts = first.components(separatedBy: "->")
+        let currentSource = parts.first ?? ""
+        let currentTarget = parts.count > 1 ? parts.dropFirst().joined(separator: "->") : ""
+        let nextSource = updateSource ? resolvedSource : currentSource
+        let nextTarget = updateTarget ? resolvedTarget : currentTarget
+        lines[0] = "\(nextSource)->\(nextTarget)"
+        folderMap = lines.joined(separator: "\n")
+    }
+
+    @MainActor private func downloaderDefaultPath(_ downloader: DownloaderItem) async -> String {
+        if let value = nestedDownloadPath(downloader.raw), !value.isEmpty { return value }
+        do {
+            let raw = try await appState.api(APIPath.downloaderPreferences + "\(downloader.id)", query: ["with_status": true])
+            return nestedDownloadPath(jsonPayloadDictionary(raw) ?? [:]) ?? ""
+        } catch { return "" }
+    }
+
+    private func nestedDownloadPath(_ dictionary: [String: Any]) -> String? {
+        if let value = dictionary.string("save_path", "savePath", "download-dir", "download_dir", "downloadDir"), !value.isEmpty { return value }
+        for key in ["preferences", "prefs", "data", "status"] {
+            if let nested = dictionary[key] as? [String: Any], let value = nestedDownloadPath(nested), !value.isEmpty { return value }
+        }
+        return nil
     }
 
     private func applyCrontab(_ id: Int) {
@@ -390,41 +597,71 @@ struct TaskEditorSheet: View {
               let value = try? JSONSerialization.jsonObject(with: data) else { return false }
         return value is T
     }
+
+    private func decodedJSONObject(_ text: String) -> [String: Any]? {
+        guard let data = text.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data),
+              let value = decoded as? [String: Any] else { return nil }
+        return value
+    }
 }
 
 struct TaskResultDetailSheet: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let result: TaskResultItem
     let onTerminate: () async -> Void
     let onDelete: () async -> Void
     @State private var confirmDelete = false
+    @State private var loadedResult: TaskResultItem?
+    @State private var isLoading = true
+
+    private var current: TaskResultItem { loadedResult ?? result }
 
     var body: some View {
         NavigationStack {
             List {
                 Section("执行状态") {
-                    LabeledContent("任务", value: result.name)
-                    LabeledContent("状态", value: result.status)
-                    LabeledContent("任务 ID", value: result.taskID)
-                    if !result.createdAt.isEmpty { LabeledContent("开始", value: result.createdAt) }
-                    if !result.finishedAt.isEmpty { LabeledContent("结束", value: result.finishedAt) }
+                    LabeledContent("任务", value: current.name)
+                    LabeledContent("状态", value: current.statusLabel)
+                    LabeledContent("任务 ID", value: current.taskID)
+                    if !current.createdAt.isEmpty { LabeledContent("开始", value: current.createdAt) }
+                    if !current.finishedAt.isEmpty { LabeledContent("结束", value: current.finishedAt) }
+                    if isLoading { ProgressView().frame(maxWidth: .infinity) }
                 }
-                if !result.summary.isEmpty {
-                    Section("结果") { Text(result.summary).font(.callout.monospaced()).textSelection(.enabled) }
+                if !current.summary.isEmpty {
+                    Section("结果") { Text(markdownAttributedString(current.summary)).font(.callout).textSelection(.enabled) }
                 }
-                Section("原始记录") { Text(prettyJSON(result.raw)).font(.caption.monospaced()).textSelection(.enabled) }
+                Section("原始记录") { Text(prettyJSON(current.raw)).font(.caption.monospaced()).textSelection(.enabled) }
                 Section {
-                    if result.isActive {
+                    if current.isActive {
                         Button { Task { await onTerminate(); dismiss() } } label: { Label("终止任务", systemImage: "stop.fill") }.tint(HarvestTheme.amber)
                     }
-                    Button(role: .destructive) { confirmDelete = true } label: { Label("删除记录", systemImage: "trash") }
+                    if current.isCompleted {
+                        Button(role: .destructive) { confirmDelete = true } label: { Label("删除记录", systemImage: "trash") }
+                    }
                 }
             }
             .navigationTitle("执行详情").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .task { await loadDetail() }
             .confirmationDialog("确定删除这条执行记录？", isPresented: $confirmDelete, titleVisibility: .visible) {
                 Button("删除记录", role: .destructive) { Task { await onDelete(); dismiss() } }
             }
+        }
+    }
+
+    @MainActor private func loadDetail() async {
+        defer { isLoading = false }
+        guard !result.taskID.isEmpty else { return }
+        do {
+            let raw = try await appState.api(APIPath.taskResults + urlPathSegment(result.taskID))
+            guard let value = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return }
+            var merged = result.raw
+            for (key, item) in value { merged[key] = item }
+            loadedResult = TaskResultItem(merged)
+        } catch {
+            // The list response remains a usable fallback, matching the Flutter detail flow.
         }
     }
 }
@@ -444,14 +681,18 @@ struct MediaItem: Identifiable {
 
     init(_ json: [String: Any], source: String, mediaType: String = "") {
         let content = json.dict("target") ?? json
-        remoteID = content.string("id", "subject_id", "tmdb_id") ?? json.string("target_id", "targetId") ?? UUID().uuidString
+        remoteID = content.string("id", "subject_id", "tmdb_id", "douban_url", "url")
+            ?? json.string("target_id", "targetId")
+            ?? UUID().uuidString
         let resolvedType = mediaType.isEmpty ? (json.string("media_type", "target_type", "targetType") ?? content.string("media_type") ?? "") : mediaType
         id = "\(source):\(resolvedType):\(remoteID)"
         title = content.string("title", "name", "original_title") ?? "未命名"
         subtitle = content.string("original_title", "original_name", "card_subtitle") ?? ""
-        overview = content.string("overview", "abstract", "summary") ?? ""
+        overview = content.string("overview", "abstract", "summary", "intro", "quote", "episodes_info") ?? ""
         poster = mediaPosterURL(content.string("poster_path", "profile_path", "poster", "cover_url", "cover") ?? "", source: source)
-        score = content.double("vote_average", "score") ?? content.dict("rating")?.double("value", "star_count") ?? 0
+        score = content.double("vote_average", "score", "rate", "rating_num")
+            ?? content.dict("rating")?.double("value", "star_count")
+            ?? 0
         year = content.string("release_date", "first_air_date", "year")?.prefix(4).description ?? ""
         self.source = source
         self.mediaType = resolvedType
@@ -467,6 +708,17 @@ private func mediaPosterURL(_ value: String, source: String) -> String {
     return value
 }
 
+enum ResourceSearchSortField: String, CaseIterable, Identifiable {
+    case title = "标题"
+    case subtitle = "副标题"
+    case size = "大小"
+    case seeders = "做种"
+    case published = "发布时间"
+
+    var id: String { rawValue }
+    var defaultAscending: Bool { self == .title || self == .subtitle }
+}
+
 @MainActor
 final class SearchViewModel: ObservableObject {
     @Published var query = ""
@@ -474,38 +726,478 @@ final class SearchViewModel: ObservableObject {
     @Published var media: [MediaItem] = []
     @Published var resources: [[String: Any]] = []
     @Published var isLoading = false
+    @Published var statusMessage = ""
+    @Published var sites: [SiteItem] = []
+    @Published var history: [String]
+    @Published var maxCount: Int
+    @Published var sitesEnabled: Bool
+    @Published var selectedSiteIDs: Set<Int>
+    @Published var resourceSortField: ResourceSearchSortField = .seeders
+    @Published var resourceSortAscending = false
+    @Published var resourceFilterSites: Set<String> = []
+    @Published var resourceFilterSales: Set<String> = []
+    @Published var resourceFilterCategories: Set<String> = []
+    @Published var resourceFilterResolutions: Set<String> = []
+    @Published var resourceFilterTags: Set<String> = []
+    @Published var resourceFilterSeasons: Set<String> = []
+    @Published var resourceFilterEpisodes: Set<String> = []
+    @Published var resourceFilterExcludeHR = false
+    @Published var resourceFilterSizeEnabled = false
+    @Published var resourceFilterMinSizeGB = 0.0
+    @Published var resourceFilterMaxSizeGB = 100.0
+    private var searchGeneration = 0
+
+    init() {
+        let defaults = UserDefaults.standard
+        history = defaults.stringArray(forKey: "search.history") ?? []
+        maxCount = defaults.object(forKey: "search.maxCount") == nil ? 5 : defaults.integer(forKey: "search.maxCount")
+        sitesEnabled = defaults.object(forKey: "search.sitesEnabled") == nil ? true : defaults.bool(forKey: "search.sitesEnabled")
+        selectedSiteIDs = Set((defaults.stringArray(forKey: "search.siteIDs") ?? []).compactMap(Int.init))
+    }
+
+    var displayedResources: [[String: Any]] {
+        resources.filter(matchesResourceFilters).sorted(by: resourceComesBefore)
+    }
+
+    var resourceSites: [String] {
+        uniqueResourceValues { resourceSiteValue($0) }
+    }
+
+    var resourceSales: [String] {
+        uniqueResourceValues { resourceSaleValue($0) }
+    }
+
+    var resourceCategories: [String] {
+        uniqueResourceValues { resourceCategory($0) }
+    }
+
+    var resourceResolutions: [String] {
+        let available = Set(resources.flatMap(resourceResolutionValues))
+        return ["720P", "1080P", "2160P", "4K", "8K"].filter(available.contains)
+    }
+
+    var resourceTags: [String] {
+        Array(Set(resources.flatMap(resourceTagValues))).sorted()
+    }
+
+    var resourceSeasons: [String] {
+        Array(Set(resources.flatMap(resourceSeasonValues))).sorted(by: numberedLabelComesBefore)
+    }
+
+    var resourceEpisodes: [String] {
+        Array(Set(resources.flatMap(resourceEpisodeValues))).sorted(by: numberedLabelComesBefore)
+    }
+
+    var resourceFilterCount: Int {
+        resourceFilterSites.count
+            + resourceFilterSales.count
+            + resourceFilterCategories.count
+            + resourceFilterResolutions.count
+            + resourceFilterTags.count
+            + resourceFilterSeasons.count
+            + resourceFilterEpisodes.count
+            + (resourceFilterExcludeHR ? 1 : 0)
+            + (resourceFilterSizeEnabled ? 1 : 0)
+    }
 
     func search(_ appState: AppState) async {
         let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !term.isEmpty else { return }
+        searchGeneration &+= 1
+        let generation = searchGeneration
+        let searchMode = mode
+        addHistory(term)
+        statusMessage = searchMode == "资源" ? "开始搜索「\(term)」" : "正在搜索影视信息"
         isLoading = true
-        defer { isLoading = false }
+        if searchMode == "影视" {
+            media = []
+        } else {
+            resources = []
+            resetResourceFilters()
+        }
+        defer {
+            if searchGeneration == generation { isLoading = false }
+        }
         do {
-            if mode == "影视" {
-                async let tmdb = appState.api("\(APIPath.tmdbSearch)/\(urlPathSegment(term))")
-                async let douban = appState.api(APIPath.doubanSearch, method: .get, query: ["q": term, "query": term])
-                let (tmdbRaw, doubanRaw) = try await (tmdb, douban)
-                media = jsonRows(tmdbRaw).map { MediaItem($0, source: "TMDB") } + jsonRows(doubanRaw).map { MediaItem($0, source: "豆瓣") }
+            if searchMode == "影视" {
+                async let tmdbResult = fetchMedia(
+                    appState,
+                    path: "\(APIPath.tmdbSearch)/\(urlPathSegment(term))",
+                    source: "TMDB"
+                )
+                async let doubanResult = fetchMedia(
+                    appState,
+                    path: APIPath.doubanSearch,
+                    source: "豆瓣",
+                    query: ["q": term, "query": term]
+                )
+                let (tmdb, douban) = await (tmdbResult, doubanResult)
+                guard searchGeneration == generation else { return }
+                media = uniqueMediaItems(tmdb.items + douban.items)
+                statusMessage = "找到 \(media.count) 条影视信息"
+                if tmdb.errorMessage != nil, douban.errorMessage != nil {
+                    appState.presentedError = [tmdb.errorMessage, douban.errorMessage]
+                        .compactMap { $0 }
+                        .joined(separator: "\n")
+                }
             } else {
-                resources = []
                 for try await event in APIClient.shared.streamSSE(
                     baseURL: appState.baseURL,
                     path: APIPath.siteSearch,
                     token: appState.accessToken,
-                    body: ["key": term, "max_count": 5, "sites": []]
+                    body: [
+                        "key": term,
+                        "max_count": maxCount,
+                        "sites": sitesEnabled ? selectedSiteIDs.sorted().map { String($0) } : []
+                    ]
                 ) {
+                    guard searchGeneration == generation else { return }
+                    if let message = jsonMessage(event), !message.isEmpty {
+                        statusMessage = message
+                    }
                     guard (event.bool("succeed") ?? (event.int("code") == 0)) else {
                         if let message = jsonMessage(event), !message.isEmpty { appState.presentedError = message }
                         continue
                     }
                     if let data = event["data"] {
                         let rows = jsonRows(data)
-                        if rows.isEmpty, let row = jsonDictionary(data) { resources.append(row) }
-                        else { resources.append(contentsOf: rows) }
+                        if rows.isEmpty, let row = jsonDictionary(data) { appendResourceRows([row]) }
+                        else { appendResourceRows(rows) }
                     }
                 }
             }
-        } catch { appState.presentedError = error.localizedDescription }
+        } catch is CancellationError {
+            return
+        } catch {
+            if searchGeneration == generation { appState.presentedError = error.localizedDescription }
+        }
+    }
+
+    func cancelSearch(clearResults: Bool = false) {
+        let wasLoading = isLoading
+        searchGeneration &+= 1
+        isLoading = false
+        if clearResults {
+            media = []
+            resources = []
+            statusMessage = ""
+            resetResourceFilters()
+        } else if wasLoading {
+            statusMessage = "搜索已停止"
+        }
+    }
+
+    private func fetchMedia(
+        _ appState: AppState,
+        path: String,
+        source: String,
+        query: [String: Any] = [:]
+    ) async -> (items: [MediaItem], errorMessage: String?) {
+        do {
+            let raw = try await appState.api(path, query: query)
+            return (jsonRows(raw).map { MediaItem($0, source: source) }, nil)
+        } catch {
+            return ([], "\(source)：\(error.localizedDescription)")
+        }
+    }
+
+    func loadSites(_ appState: AppState) async {
+        do {
+            sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init).filter { $0.enabled && $0.searchTorrents }
+            let available = Set(sites.map(\.id))
+            selectedSiteIDs = selectedSiteIDs.intersection(available)
+        } catch {
+            sites = []
+        }
+    }
+
+    func saveSettings() {
+        let defaults = UserDefaults.standard
+        defaults.set(maxCount, forKey: "search.maxCount")
+        defaults.set(sitesEnabled, forKey: "search.sitesEnabled")
+        defaults.set(selectedSiteIDs.sorted().map { String($0) }, forKey: "search.siteIDs")
+    }
+
+    func resetLocalSettings() {
+        query = ""
+        mode = "影视"
+        history = []
+        maxCount = 5
+        sitesEnabled = true
+        selectedSiteIDs = []
+        resourceSortField = .seeders
+        resourceSortAscending = false
+        resetResourceFilters()
+    }
+
+    func addHistory(_ keyword: String) {
+        let value = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        history.removeAll { $0 == value }
+        history.insert(value, at: 0)
+        if history.count > 20 { history = Array(history.prefix(20)) }
+        UserDefaults.standard.set(history, forKey: "search.history")
+    }
+
+    func removeHistory(_ keyword: String) {
+        history.removeAll { $0 == keyword }
+        UserDefaults.standard.set(history, forKey: "search.history")
+    }
+
+    func clearHistory() {
+        history = []
+        UserDefaults.standard.set(history, forKey: "search.history")
+    }
+
+    func selectResourceSort(_ field: ResourceSearchSortField) {
+        if resourceSortField == field {
+            resourceSortAscending.toggle()
+        } else {
+            resourceSortField = field
+            resourceSortAscending = field.defaultAscending
+        }
+    }
+
+    func resetResourceFilters() {
+        resourceFilterSites = []
+        resourceFilterSales = []
+        resourceFilterCategories = []
+        resourceFilterResolutions = []
+        resourceFilterTags = []
+        resourceFilterSeasons = []
+        resourceFilterEpisodes = []
+        resourceFilterExcludeHR = false
+        resourceFilterSizeEnabled = false
+        resourceFilterMinSizeGB = 0
+        resourceFilterMaxSizeGB = 100
+    }
+
+    func siteLabel(_ value: String) -> String {
+        sites.first {
+            String($0.id) == value || $0.siteKey == value || $0.name == value
+        }?.name ?? value
+    }
+
+    func resourceSiteValue(_ item: [String: Any]) -> String {
+        item.string("site_id", "siteId", "site", "site_name", "siteName") ?? ""
+    }
+
+    func resourceTitle(_ item: [String: Any]) -> String {
+        item.string("title", "name") ?? ""
+    }
+
+    func resourceSubtitle(_ item: [String: Any]) -> String {
+        item.string("subtitle", "sub_title", "description") ?? ""
+    }
+
+    func resourceSaleValue(_ item: [String: Any]) -> String {
+        let value = item.string("sale_status", "saleStatus", "promotion", "discount")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "无优惠" : value
+    }
+
+    func resourceCategory(_ item: [String: Any]) -> String {
+        item.string("category", "category_name", "categoryName")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    func resourceTagValues(_ item: [String: Any]) -> [String] {
+        let direct = item.strings("tags")
+        if !direct.isEmpty {
+            return direct.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        }
+        guard let text = item.string("tags"), !text.isEmpty else { return [] }
+        return text.components(separatedBy: CharacterSet(charactersIn: ",，#"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    func resourceIsHRSafe(_ item: [String: Any]) -> Bool {
+        item.bool("hr") ?? false
+    }
+
+    func resourceSeeders(_ item: [String: Any]) -> Int {
+        item.int("seeders", "seed", "seeder") ?? Int(item.string("seeders", "seed", "seeder") ?? "") ?? 0
+    }
+
+    func resourceLeechers(_ item: [String: Any]) -> Int {
+        item.int("leechers", "leecher", "leech") ?? Int(item.string("leechers", "leecher", "leech") ?? "") ?? 0
+    }
+
+    func resourceCompleters(_ item: [String: Any]) -> Int {
+        item.int("completers", "completed", "snatched") ?? Int(item.string("completers", "completed", "snatched") ?? "") ?? 0
+    }
+
+    func resourceSize(_ item: [String: Any]) -> Double {
+        if let value = item.double("size", "length", "size_bytes", "sizeBytes") { return value }
+        let text = item.string("size", "length")?.uppercased() ?? ""
+        let number = Double(text.components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted).joined()) ?? 0
+        if text.contains("T") { return number * 1_099_511_627_776 }
+        if text.contains("G") { return number * 1_073_741_824 }
+        if text.contains("M") { return number * 1_048_576 }
+        if text.contains("K") { return number * 1024 }
+        return number
+    }
+
+    func resourcePublished(_ item: [String: Any]) -> String {
+        item.string("published", "pubdate", "created_at", "date") ?? ""
+    }
+
+    func resourceResolutionValues(_ item: [String: Any]) -> [String] {
+        let text = "\(resourceTitle(item)) \(resourceSubtitle(item))".uppercased()
+        return ["720P", "1080P", "2160P", "4K", "8K"].filter(text.contains)
+    }
+
+    func resourceSeasonValues(_ item: [String: Any]) -> [String] {
+        let text = "\(resourceTitle(item)) \(resourceSubtitle(item))".uppercased()
+        return Set(regexCaptureValues(#"(^|[^A-Z0-9])S(\d{1,2})(?=[^0-9]|$)"#, text: text, group: 2).compactMap {
+            guard let number = Int($0), number >= 0 else { return nil }
+            return String(format: "S%02d", number)
+        }).sorted(by: numberedLabelComesBefore)
+    }
+
+    func resourceEpisodeValues(_ item: [String: Any]) -> [String] {
+        let text = "\(resourceTitle(item)) \(resourceSubtitle(item))".uppercased()
+        var values = Set<String>()
+        let rangePattern = #"(^|[^A-Z0-9])(?:S\d{1,2})?E(?:P)?(\d{1,3})\s*[-~－–—]\s*(?:(?:S\d{1,2})?E(?:P)?)?(\d{1,3}|\*\*)(?=[^A-Z0-9]|$)"#
+        for captures in regexCaptureRows(rangePattern, text: text, groups: [2, 3]) {
+            guard captures.count == 2, let start = Int(captures[0]), start > 0 else { continue }
+            guard let end = Int(captures[1]), end >= start, end - start <= 80 else {
+                values.insert(String(format: "E%02d", start))
+                continue
+            }
+            for number in start...end { values.insert(String(format: "E%02d", number)) }
+        }
+        let singlePattern = #"(^|[^A-Z0-9])(?:S\d{1,2})?E(?:P)?(\d{1,3})(?=[^0-9]|$)"#
+        for raw in regexCaptureValues(singlePattern, text: text, group: 2) {
+            if let number = Int(raw), number > 0 { values.insert(String(format: "E%02d", number)) }
+        }
+        return values.sorted(by: numberedLabelComesBefore)
+    }
+
+    private func matchesResourceFilters(_ item: [String: Any]) -> Bool {
+        if !resourceFilterSites.isEmpty && !resourceFilterSites.contains(resourceSiteValue(item)) { return false }
+        if !resourceFilterSales.isEmpty && !resourceFilterSales.contains(resourceSaleValue(item)) { return false }
+        if !resourceFilterCategories.isEmpty && !resourceFilterCategories.contains(resourceCategory(item)) { return false }
+        if !resourceFilterResolutions.isEmpty && Set(resourceResolutionValues(item)).isDisjoint(with: resourceFilterResolutions) { return false }
+        if !resourceFilterTags.isEmpty && Set(resourceTagValues(item)).isDisjoint(with: resourceFilterTags) { return false }
+        if !resourceFilterSeasons.isEmpty && Set(resourceSeasonValues(item)).isDisjoint(with: resourceFilterSeasons) { return false }
+        if !resourceFilterEpisodes.isEmpty && Set(resourceEpisodeValues(item)).isDisjoint(with: resourceFilterEpisodes) { return false }
+        if resourceFilterExcludeHR && !resourceIsHRSafe(item) { return false }
+        if resourceFilterSizeEnabled {
+            let bytes = resourceSize(item)
+            guard bytes > 0 else { return false }
+            let gigabytes = bytes / 1_073_741_824
+            if gigabytes < resourceFilterMinSizeGB || gigabytes > resourceFilterMaxSizeGB { return false }
+        }
+        return true
+    }
+
+    private func resourceComesBefore(_ left: [String: Any], _ right: [String: Any]) -> Bool {
+        let primary: Int
+        switch resourceSortField {
+        case .title: primary = compareText(resourceTitle(left), resourceTitle(right))
+        case .subtitle: primary = compareText(resourceSubtitle(left), resourceSubtitle(right))
+        case .size: primary = compareNumber(resourceSize(left), resourceSize(right))
+        case .seeders: primary = compareNumber(Double(resourceSeeders(left)), Double(resourceSeeders(right)))
+        case .published: primary = comparePublished(resourcePublished(left), resourcePublished(right))
+        }
+        if primary != 0 { return primary < 0 }
+        let published = comparePublished(resourcePublished(left), resourcePublished(right))
+        if published != 0 { return published < 0 }
+        return compareText(resourceTitle(left), resourceTitle(right)) < 0
+    }
+
+    private func compareText(_ left: String, _ right: String) -> Int {
+        let lhs = left.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let rhs = right.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lhs.isEmpty != rhs.isEmpty { return lhs.isEmpty ? 1 : -1 }
+        let comparison = lhs.localizedCompare(rhs)
+        let result = comparison == .orderedAscending ? -1 : (comparison == .orderedDescending ? 1 : 0)
+        return resourceSortAscending ? result : -result
+    }
+
+    private func compareNumber(_ left: Double, _ right: Double) -> Int {
+        if (left == 0) != (right == 0) { return left == 0 ? 1 : -1 }
+        let result = left == right ? 0 : (left < right ? -1 : 1)
+        return resourceSortAscending ? result : -result
+    }
+
+    private func comparePublished(_ left: String, _ right: String) -> Int {
+        let lhs = resourceDateValue(left)
+        let rhs = resourceDateValue(right)
+        if (lhs == nil) != (rhs == nil) { return lhs == nil ? 1 : -1 }
+        guard let lhs, let rhs else { return 0 }
+        let result = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1)
+        return resourceSortAscending ? result : -result
+    }
+
+    private func resourceDateValue(_ value: String) -> TimeInterval? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let number = Double(text) {
+            return number > 10_000_000_000 ? number / 1000 : number
+        }
+        return parseDate(text)?.timeIntervalSince1970
+    }
+
+    private func uniqueResourceValues(_ pick: ([String: Any]) -> String) -> [String] {
+        Array(Set(resources.map(pick).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+    }
+
+    private func uniqueMediaItems(_ items: [MediaItem]) -> [MediaItem] {
+        var identifiers = Set<String>()
+        return items.filter { identifiers.insert($0.id).inserted }
+    }
+
+    private func appendResourceRows(_ rows: [[String: Any]]) {
+        var identifiers = Set(resources.map(resourceIdentifier))
+        for row in rows {
+            if identifiers.insert(resourceIdentifier(row)).inserted {
+                resources.append(row)
+            }
+        }
+    }
+
+    private func resourceIdentifier(_ item: [String: Any]) -> String {
+        let parts = [
+            resourceSiteValue(item),
+            item.string("id", "torrent_id", "torrentId", "tid", "hash", "info_hash", "infoHash") ?? "",
+            item.string("download_url", "downloadUrl", "details_url", "detail_url", "url", "link") ?? "",
+            resourceTitle(item),
+            resourceSubtitle(item),
+            item.string("size", "length", "size_bytes", "sizeBytes") ?? "",
+            resourcePublished(item)
+        ]
+        let identifier = parts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .joined(separator: "|")
+        if identifier.replacingOccurrences(of: "|", with: "").isEmpty,
+           JSONSerialization.isValidJSONObject(item),
+           let data = try? JSONSerialization.data(withJSONObject: item, options: [.sortedKeys]),
+           let fallback = String(data: data, encoding: .utf8) {
+            return fallback
+        }
+        return identifier
+    }
+
+    private func numberedLabelComesBefore(_ left: String, _ right: String) -> Bool {
+        let lhs = Int(left.filter(\.isNumber)) ?? 0
+        let rhs = Int(right.filter(\.isNumber)) ?? 0
+        return lhs == rhs ? left < right : lhs < rhs
+    }
+
+    private func regexCaptureValues(_ pattern: String, text: String, group: Int) -> [String] {
+        regexCaptureRows(pattern, text: text, groups: [group]).compactMap(\.first)
+    }
+
+    private func regexCaptureRows(_ pattern: String, text: String, groups: [Int]) -> [[String]] {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.matches(in: text, range: range).map { match in
+            groups.map { group in
+                guard match.numberOfRanges > group,
+                      let captureRange = Range(match.range(at: group), in: text) else { return "" }
+                return String(text[captureRange])
+            }
+        }
     }
 }
 
@@ -519,11 +1211,68 @@ struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @State private var selectedMedia: MediaItem?
     @State private var selectedResource: ResourceSelection?
+    @State private var showSettings = false
+    @State private var showResourceFilters = false
+    @State private var activeSearchTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("搜索类型", selection: $model.mode) { Text("影视").tag("影视"); Text("资源").tag("资源") }.pickerStyle(.segmented).padding(.horizontal, 16).padding(.top, 12)
-            if model.isLoading { LoadingState() }
+            Picker(
+                "搜索类型",
+                selection: Binding(
+                    get: { model.mode },
+                    set: { value in
+                        stopSearch()
+                        model.mode = value
+                    }
+                )
+            ) {
+                Text("影视").tag("影视")
+                Text("资源").tag("资源")
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            if model.mode == "资源" && !model.resources.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        if model.isLoading {
+                            ProgressView().controlSize(.small)
+                            Text(model.statusMessage.isEmpty ? "搜索中" : model.statusMessage)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Menu {
+                            ForEach(ResourceSearchSortField.allCases) { field in
+                                Button {
+                                    model.selectResourceSort(field)
+                                } label: {
+                                    Label(field.rawValue, systemImage: model.resourceSortField == field ? "checkmark" : "arrow.up.arrow.down")
+                                }
+                            }
+                        } label: {
+                            Label(model.resourceSortField.rawValue, systemImage: "arrow.up.arrow.down")
+                        }
+                        Button {
+                            model.resourceSortAscending.toggle()
+                        } label: {
+                            Image(systemName: model.resourceSortAscending ? "arrow.up" : "arrow.down")
+                        }
+                        .accessibilityLabel(model.resourceSortAscending ? "升序" : "降序")
+                        Button { showResourceFilters = true } label: {
+                            Label(model.resourceFilterCount == 0 ? "筛选" : "筛选 \(model.resourceFilterCount)", systemImage: "line.3.horizontal.decrease.circle")
+                        }
+                        Text("\(model.displayedResources.count) 条")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .contentMargins(.horizontal, 16, for: .scrollContent)
+                .padding(.top, 10)
+            }
+            if model.isLoading && (model.mode == "影视" || model.resources.isEmpty) { LoadingState() }
             else if model.mode == "影视" && model.media.isEmpty { EmptyState(icon: "magnifyingglass", title: "搜索影视信息", detail: "同时搜索 TMDB 与豆瓣，查看评分和简介") }
             else if model.mode == "资源" && model.resources.isEmpty { EmptyState(icon: "rectangle.stack", title: "搜索站点资源", detail: "输入关键词获取可推送的种子资源") }
             else {
@@ -534,8 +1283,10 @@ struct SearchView: View {
                                 .buttonStyle(.plain)
                         }
                     } else {
-                        ForEach(Array(model.resources.enumerated()), id: \.offset) { _, item in
-                            Button { selectedResource = ResourceSelection(value: item) } label: { ResourceRowItem(item: item) }
+                        ForEach(Array(model.displayedResources.enumerated()), id: \.offset) { _, item in
+                            Button { selectedResource = ResourceSelection(value: item) } label: {
+                                ResourceRowItem(item: item, siteLabel: model.siteLabel(model.resourceSiteValue(item)))
+                            }
                                 .buttonStyle(.plain)
                         }
                     }
@@ -544,10 +1295,216 @@ struct SearchView: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .searchable(text: $model.query, prompt: model.mode == "影视" ? "电影、剧集、演员" : "片名、发布组、站点")
-        .onSubmit(of: .search) { Task { await model.search(appState) } }
+        .searchSuggestions {
+            if !model.query.isEmpty {
+                ForEach(model.history.filter { $0.localizedCaseInsensitiveContains(model.query) }.prefix(8), id: \.self) { keyword in
+                    Button {
+                        model.query = keyword
+                        startSearch()
+                    } label: { Label(keyword, systemImage: "clock.arrow.circlepath") }
+                }
+            } else {
+                ForEach(model.history.prefix(12), id: \.self) { keyword in
+                    Button {
+                        model.query = keyword
+                        startSearch()
+                    } label: { Label(keyword, systemImage: "clock") }
+                }
+            }
+        }
+        .onSubmit(of: .search) { startSearch() }
         .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if model.isLoading {
+                    Button { stopSearch() } label: { Image(systemName: "stop.circle") }
+                        .accessibilityLabel("停止搜索")
+                }
+                Menu {
+                    Button { showSettings = true } label: { Label("搜索设置", systemImage: "slider.horizontal.3") }
+                    if !model.history.isEmpty { Button(role: .destructive) { model.clearHistory() } label: { Label("清空搜索历史", systemImage: "trash") } }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
+        }
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedResource) { selection in ResourcePushSheet(item: selection.value).environmentObject(appState) }
+        .sheet(isPresented: $showSettings) { SearchSettingsSheet(model: model) }
+        .sheet(isPresented: $showResourceFilters) {
+            ResourceFilterSheet(model: model)
+                .presentationDetents([.medium, .large])
+        }
+        .task { await model.loadSites(appState); consumePendingResourceSearch() }
+        .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
+        .onChange(of: model.query) { _, value in
+            if value.isEmpty { stopSearch(clearResults: true) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .harvestLocalUIReset)) { _ in
+            stopSearch(clearResults: true)
+            model.resetLocalSettings()
+        }
+        .onDisappear { stopSearch() }
+    }
+
+    private func consumePendingResourceSearch() {
+        guard let query = appState.pendingResourceSearch else { return }
+        stopSearch()
+        model.mode = "资源"
+        model.query = query
+        appState.pendingResourceSearch = nil
+        startSearch()
+    }
+
+    private func startSearch() {
+        activeSearchTask?.cancel()
+        model.cancelSearch()
+        activeSearchTask = Task { await model.search(appState) }
+    }
+
+    private func stopSearch(clearResults: Bool = false) {
+        activeSearchTask?.cancel()
+        activeSearchTask = nil
+        model.cancelSearch(clearResults: clearResults)
+    }
+}
+
+struct ResourceFilterSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: SearchViewModel
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("限制") {
+                    Toggle("不看 HR", isOn: $model.resourceFilterExcludeHR)
+                    Toggle("限制大小", isOn: $model.resourceFilterSizeEnabled)
+                    if model.resourceFilterSizeEnabled {
+                        VStack(alignment: .leading, spacing: 8) {
+                            LabeledContent("大小范围", value: sizeRangeLabel)
+                            Slider(value: $model.resourceFilterMinSizeGB, in: 0...100, step: 1)
+                                .accessibilityLabel("最小大小")
+                            Slider(value: $model.resourceFilterMaxSizeGB, in: 0...100, step: 1)
+                                .accessibilityLabel("最大大小")
+                        }
+                        .onChange(of: model.resourceFilterMinSizeGB) { _, value in
+                            if value > model.resourceFilterMaxSizeGB { model.resourceFilterMaxSizeGB = value }
+                        }
+                        .onChange(of: model.resourceFilterMaxSizeGB) { _, value in
+                            if value < model.resourceFilterMinSizeGB { model.resourceFilterMinSizeGB = value }
+                        }
+                    }
+                }
+                ResourceFilterValuesSection(title: "站点", values: model.resourceSites, selected: $model.resourceFilterSites, label: model.siteLabel)
+                ResourceFilterValuesSection(title: "优惠", values: model.resourceSales, selected: $model.resourceFilterSales)
+                ResourceFilterValuesSection(title: "分类", values: model.resourceCategories, selected: $model.resourceFilterCategories)
+                ResourceFilterValuesSection(title: "分辨率", values: model.resourceResolutions, selected: $model.resourceFilterResolutions)
+                ResourceFilterValuesSection(title: "季", values: model.resourceSeasons, selected: $model.resourceFilterSeasons)
+                ResourceFilterValuesSection(title: "集", values: model.resourceEpisodes, selected: $model.resourceFilterEpisodes)
+                ResourceFilterValuesSection(title: "标签", values: model.resourceTags, selected: $model.resourceFilterTags) { "#\($0)" }
+            }
+            .navigationTitle("筛选资源")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("清除") { model.resetResourceFilters() }
+                        .disabled(model.resourceFilterCount == 0)
+                }
+                ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+            }
+        }
+    }
+
+    private var sizeRangeLabel: String {
+        String(format: "%.0f - %.0f GB", model.resourceFilterMinSizeGB, model.resourceFilterMaxSizeGB)
+    }
+}
+
+private struct ResourceFilterValuesSection: View {
+    let title: String
+    let values: [String]
+    @Binding var selected: Set<String>
+    var label: (String) -> String = { $0 }
+
+    var body: some View {
+        if !values.isEmpty {
+            Section(title) {
+                ForEach(values, id: \.self) { value in
+                    Button {
+                        if selected.contains(value) { selected.remove(value) }
+                        else { selected.insert(value) }
+                    } label: {
+                        HStack {
+                            Text(label(value)).foregroundStyle(.primary)
+                            Spacer()
+                            if selected.contains(value) {
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(HarvestTheme.green)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct SearchSettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: SearchViewModel
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("搜索范围") {
+                    Stepper(value: $model.maxCount, in: 0...50) {
+                        LabeledContent("最大站点数", value: model.maxCount == 0 ? "全部" : "\(model.maxCount)")
+                    }
+                    Toggle("指定搜索站点", isOn: $model.sitesEnabled)
+                }
+                if model.sitesEnabled {
+                    Section("站点") {
+                        HStack {
+                            Button("全选") { model.selectedSiteIDs = Set(model.sites.map(\.id)) }
+                            Spacer()
+                            Button("随机选择") {
+                                let count = model.maxCount == 0 ? model.sites.count : min(model.maxCount, model.sites.count)
+                                model.selectedSiteIDs = Set(model.sites.shuffled().prefix(count).map(\.id))
+                            }
+                            Spacer()
+                            Button("清空") { model.selectedSiteIDs = [] }
+                        }
+                        ForEach(model.sites) { site in
+                            Button {
+                                if model.selectedSiteIDs.contains(site.id) { model.selectedSiteIDs.remove(site.id) }
+                                else { model.selectedSiteIDs.insert(site.id) }
+                            } label: {
+                                HStack {
+                                    Text(site.name).foregroundStyle(.primary)
+                                    Spacer()
+                                    if model.selectedSiteIDs.contains(site.id) { Image(systemName: "checkmark.circle.fill").foregroundStyle(HarvestTheme.green) }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !model.history.isEmpty {
+                    Section("搜索历史") {
+                        ForEach(model.history, id: \.self) { keyword in
+                            HStack {
+                                Text(keyword)
+                                Spacer()
+                                Button(role: .destructive) { model.removeHistory(keyword) } label: { Image(systemName: "xmark.circle") }.buttonStyle(.plain)
+                            }
+                        }
+                        Button("清空历史", role: .destructive) { model.clearHistory() }
+                    }
+                }
+            }
+            .navigationTitle("搜索设置")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("保存") { model.saveSettings(); dismiss() } }
+            }
+        }
     }
 }
 
@@ -565,23 +1522,57 @@ struct MediaRow: View {
 
 struct ResourceRowItem: View {
     let item: [String: Any]
+    let siteLabel: String
+
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 7) {
-                Text(item.string("title", "name") ?? "未命名资源").font(.subheadline.weight(.semibold)).lineLimit(2)
+                Text(item.string("title", "name") ?? "未命名资源")
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                if let subtitle = item.string("subtitle", "sub_title"), !subtitle.isEmpty {
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
                 HStack {
-                    Text(item.string("site", "site_name") ?? "未知站点")
-                    Spacer()
-                    Text(item.string("size", "length") ?? "")
-                    Text(item.string("seeders", "seed", "seeder") ?? "").foregroundStyle(HarvestTheme.green)
+                    Text(sizeLabel).fontWeight(.semibold)
+                    Label("\(seeders)", systemImage: "arrow.up.circle.fill").foregroundStyle(HarvestTheme.green)
+                    Label("\(leechers)", systemImage: "arrow.down.circle.fill").foregroundStyle(HarvestTheme.coral)
+                    Label("\(completers)", systemImage: "checkmark.circle.fill")
+                    Spacer(minLength: 6)
+                    Text(siteLabel.isEmpty ? "未知站点" : siteLabel).lineLimit(1)
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                if let tags = item.string("tags", "description") { Text(tags).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
+                if !detailLabels.isEmpty {
+                    Text(detailLabels.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
             }
             Image(systemName: "arrow.down.circle").foregroundStyle(HarvestTheme.green)
         }
         .padding(.vertical, 5)
+    }
+
+    private var sizeLabel: String {
+        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
+            return item.string("size", "length") ?? "未知大小"
+        }
+        return formatBytes(bytes)
+    }
+
+    private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
+    private var leechers: Int { item.int("leechers", "leecher", "leech") ?? 0 }
+    private var completers: Int { item.int("completers", "completed", "snatched") ?? 0 }
+    private var detailLabels: [String] {
+        var values: [String] = []
+        if let category = item.string("category", "category_name"), !category.isEmpty, category != "无分类" { values.append(category) }
+        let sale = item.string("sale_status", "saleStatus", "promotion") ?? ""
+        if !sale.isEmpty, sale != "无优惠" { values.append(sale) }
+        if !(item.bool("hr") ?? false) { values.append("HR") }
+        if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty { values.append(published) }
+        return values
     }
 }
 
@@ -608,8 +1599,16 @@ struct MediaDetailSheet: View {
                         VStack(alignment: .leading, spacing: 8) {
                             Text(title).font(.title3.weight(.semibold))
                             if !subtitle.isEmpty { Text(subtitle).font(.caption).foregroundStyle(.secondary) }
-                            HStack(spacing: 10) {
-                                if score > 0 { Label(String(format: "%.1f", score), systemImage: "star.fill").foregroundStyle(HarvestTheme.amber) }
+                            HStack(spacing: 8) {
+                                if score > 0 {
+                                    Label(String(format: "%.1f", score), systemImage: "star.fill")
+                                        .foregroundStyle(HarvestTheme.amber)
+                                    if ratingCount > 0 {
+                                        Text("(\(ratingCount) 票)").foregroundStyle(.secondary)
+                                    }
+                                } else if !ratingUnavailableReason.isEmpty {
+                                    Text(ratingUnavailableReason).foregroundStyle(.secondary)
+                                }
                                 if !year.isEmpty { Text(year) }
                                 Text(item.source).foregroundStyle(HarvestTheme.green)
                             }
@@ -625,14 +1624,94 @@ struct MediaDetailSheet: View {
                 if !overview.isEmpty {
                     Section("简介") { Text(overview).textSelection(.enabled) }
                 }
+                if !honors.isEmpty {
+                    Section("实时热度") {
+                        ForEach(Array(honors.enumerated()), id: \.offset) { _, honor in
+                            HStack {
+                                Label(honor.string("title") ?? "榜单", systemImage: "flame.fill")
+                                Spacer()
+                                if let rank = honor.int("rank"), rank > 0 {
+                                    Text("#\(rank)").foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                if !directors.isEmpty || !actors.isEmpty || !creators.isEmpty {
+                    Section("演职员") {
+                        if !directors.isEmpty { LabeledContent("导演", value: directors.joined(separator: "、")) }
+                        if !creators.isEmpty { LabeledContent("主创", value: creators.joined(separator: "、")) }
+                        if !actors.isEmpty { LabeledContent("主演", value: actors.prefix(12).joined(separator: "、")) }
+                    }
+                }
                 Section("信息") {
-                    if let status = resolved.string("status", "type"), !status.isEmpty { LabeledContent("状态", value: status) }
-                    if let language = resolved.string("original_language", "language"), !language.isEmpty { LabeledContent("语言", value: language) }
-                    if let runtime = resolved.int("runtime", "number_of_episodes"), runtime > 0 { LabeledContent(item.mediaType == "tv" ? "集数" : "片长", value: item.mediaType == "tv" ? "\(runtime)" : "\(runtime) 分钟") }
+                    if let status = resolved.string("status"), !status.isEmpty { LabeledContent("状态", value: status) }
+                    if !countries.isEmpty { LabeledContent("国家", value: countries.joined(separator: " / ")) }
+                    if !languages.isEmpty { LabeledContent("语言", value: languages.joined(separator: " / ")) }
+                    if !durations.isEmpty {
+                        LabeledContent("时长", value: durations.joined(separator: " / "))
+                    } else if let runtime = resolved.int("runtime"), runtime > 0 {
+                        LabeledContent("片长", value: "\(runtime) 分钟")
+                    }
+                    if !releaseDates.isEmpty { LabeledContent("上映", value: releaseDates.joined(separator: " / ")) }
+                    if !aliases.isEmpty { LabeledContent("别名", value: aliases.joined(separator: " / ")) }
+                    if isTV {
+                        if let seasons = resolved.int("number_of_seasons"), seasons > 0 { LabeledContent("季数", value: "\(seasons)") }
+                        if let episodes = resolved.int("number_of_episodes", "episodes_count"), episodes > 0 { LabeledContent("集数", value: "\(episodes)") }
+                        if let progress = resolved.string("episodes_info"), !progress.isEmpty { LabeledContent("进度", value: progress) }
+                    }
+                    if let budget = resolved.int("budget"), budget > 0 { LabeledContent("预算", value: currency(budget)) }
+                    if let revenue = resolved.int("revenue"), revenue > 0 { LabeledContent("票房", value: currency(revenue)) }
+                    if !networks.isEmpty { LabeledContent("网络", value: networks.prefix(6).joined(separator: "、")) }
+                    if !companies.isEmpty { LabeledContent("制作", value: companies.prefix(6).joined(separator: "、")) }
                     LabeledContent("条目 ID", value: item.remoteID)
                 }
-                if let homepage = resolved.string("homepage", "url"), let url = URL(string: homepage) {
-                    Section { Link(destination: url) { Label("打开官方页面", systemImage: "safari") } }
+                if !vendors.isEmpty {
+                    Section("播放源") {
+                        ForEach(Array(vendors.enumerated()), id: \.offset) { _, vendor in
+                            mediaLink(destination: vendor.string("url")) {
+                                MediaVendorRow(vendor: vendor)
+                            }
+                        }
+                    }
+                }
+                if !trailers.isEmpty {
+                    Section("预告片") {
+                        ForEach(Array(trailers.enumerated()), id: \.offset) { _, trailer in
+                            mediaLink(destination: trailer.string("video_url", "url")) {
+                                MediaTrailerCard(trailer: trailer)
+                            }
+                        }
+                    }
+                }
+                if commentCount > 0 || reviewCount > 0 || discussionCount > 0 {
+                    Section("互动") {
+                        HStack(spacing: 16) {
+                            if commentCount > 0 { Label("\(commentCount) 短评", systemImage: "text.bubble") }
+                            if reviewCount > 0 { Label("\(reviewCount) 影评", systemImage: "doc.text") }
+                            if discussionCount > 0 { Label("\(discussionCount) 讨论", systemImage: "bubble.left.and.bubble.right") }
+                        }
+                        .font(.caption)
+                    }
+                }
+                if !externalLinks.isEmpty {
+                    Section {
+                        ForEach(Array(externalLinks.enumerated()), id: \.offset) { index, link in
+                            Link(destination: link.url) {
+                                Label(index == 0 ? "打开官方页面" : "打开分享页面", systemImage: "safari")
+                            }
+                        }
+                    }
+                }
+                if item.mediaType.lowercased() != "person" {
+                    Section {
+                        Button {
+                            appState.openResourceSearch(searchQuery)
+                            dismiss()
+                        } label: {
+                            Label("搜索资源", systemImage: "magnifyingglass")
+                        }
+                    }
                 }
             }
             .navigationTitle("影视详情").navigationBarTitleDisplayMode(.inline)
@@ -647,10 +1726,90 @@ struct MediaDetailSheet: View {
     private var overview: String { resolved.string("overview", "summary", "abstract", "intro", "biography") ?? item.overview }
     private var poster: String { mediaPosterURL(resolved.string("poster_path", "profile_path", "cover_url", "cover") ?? item.poster, source: item.source) }
     private var score: Double { resolved.double("vote_average", "score") ?? resolved.dict("rating")?.double("value") ?? item.score }
+    private var ratingCount: Int { resolved.int("vote_count") ?? resolved.dict("rating")?.int("count") ?? 0 }
+    private var ratingUnavailableReason: String { resolved.string("null_rating_reason") ?? "" }
     private var year: String { (resolved.string("release_date", "first_air_date", "year") ?? item.year).prefix(4).description }
     private var genres: String {
         guard let value = resolved["genres"] else { return "" }
+        if let values = value as? [String] { return values.joined(separator: " / ") }
         return jsonRows(value).compactMap { $0.string("name") }.joined(separator: " / ")
+    }
+    private var directors: [String] { personNames("directors", "director") }
+    private var actors: [String] {
+        let direct = personNames("actors", "casts", "cast")
+        if !direct.isEmpty { return direct }
+        return resolved.dict("credits")?.rows("cast").compactMap { $0.string("name") } ?? []
+    }
+    private var creators: [String] { personNames("created_by", "creators", "writers") }
+    private var companies: [String] { personNames("production_companies") }
+    private var networks: [String] { personNames("networks") }
+    private var countries: [String] { stringValues("countries", "origin_country") }
+    private var languages: [String] {
+        let values = stringValues("languages")
+        if !values.isEmpty { return values }
+        return resolved.string("original_language", "language").map { [$0] } ?? []
+    }
+    private var durations: [String] { stringValues("durations") }
+    private var releaseDates: [String] { stringValues("pubdate") }
+    private var aliases: [String] { stringValues("aka") }
+    private var honors: [[String: Any]] { resolved.rows("realtime_hot_honor_infos") }
+    private var vendors: [[String: Any]] { resolved.rows("vendors") }
+    private var trailers: [[String: Any]] { resolved.rows("trailers") }
+    private var commentCount: Int { resolved.int("comment_count") ?? 0 }
+    private var reviewCount: Int { resolved.int("review_count") ?? 0 }
+    private var discussionCount: Int { resolved.int("forum_topic_count") ?? 0 }
+    private var isTV: Bool { resolved.bool("is_tv") ?? (item.mediaType.lowercased() == "tv") }
+    private var externalLinks: [(url: URL, value: String)] {
+        var result: [(url: URL, value: String)] = []
+        for key in ["homepage", "url", "sharing_url"] {
+            guard let value = resolved.string(key), let url = externalURL(value) else { continue }
+            if !result.contains(where: { $0.0.absoluteString == url.absoluteString }) { result.append((url, value)) }
+        }
+        return result
+    }
+    private var searchQuery: String {
+        let externalID = resolved.string("imdb_id", "imdbId") ?? ""
+        return externalID.isEmpty ? title : "\(externalID)||\(title)"
+    }
+
+    private func personNames(_ keys: String...) -> [String] {
+        for key in keys {
+            guard let value = resolved[key] else { continue }
+            if let values = value as? [String], !values.isEmpty { return values }
+            let names = jsonRows(value).compactMap { $0.string("name", "title") }
+            if !names.isEmpty { return names }
+        }
+        return []
+    }
+
+    private func stringValues(_ keys: String...) -> [String] {
+        for key in keys {
+            let values = resolved.strings(key)
+            if !values.isEmpty { return values }
+        }
+        return []
+    }
+
+    private func currency(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.currencyCode = "USD"
+        formatter.maximumFractionDigits = 0
+        return formatter.string(from: NSNumber(value: value)) ?? "$\(value)"
+    }
+
+    private func externalURL(_ value: String) -> URL? {
+        guard let url = URL(string: value), let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else { return nil }
+        return url
+    }
+
+    @ViewBuilder
+    private func mediaLink<Content: View>(destination: String?, @ViewBuilder content: () -> Content) -> some View {
+        if let destination, let url = externalURL(destination) {
+            Link(destination: url) { content() }
+        } else {
+            content()
+        }
     }
 
     private func load() async {
@@ -670,6 +1829,73 @@ struct MediaDetailSheet: View {
     }
 }
 
+private struct MediaVendorRow: View {
+    let vendor: [String: Any]
+
+    var body: some View {
+        HStack(spacing: 12) {
+            AsyncImage(url: URL(string: vendor.string("icon", "grey_icon") ?? "")) { phase in
+                switch phase {
+                case .success(let image): image.resizable().scaledToFit()
+                default: Image(systemName: "play.tv").foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(vendor.string("title", "name") ?? "播放源").font(.subheadline.weight(.medium))
+                let detail = [vendor.string("payment_desc"), vendor.string("episodes_info")]
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " · ")
+                if !detail.isEmpty { Text(detail).font(.caption).foregroundStyle(.secondary) }
+            }
+            Spacer()
+            if vendor.string("url") != nil { Image(systemName: "arrow.up.right").font(.caption).foregroundStyle(.tertiary) }
+        }
+        .foregroundStyle(.primary)
+    }
+}
+
+private struct MediaTrailerCard: View {
+    let trailer: [String: Any]
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            AsyncImage(url: URL(string: trailer.string("cover_url", "cover") ?? "")) { phase in
+                switch phase {
+                case .success(let image): image.resizable().scaledToFill()
+                default: Color.secondary.opacity(0.12)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 160)
+            .clipped()
+
+            LinearGradient(colors: [.clear, .black.opacity(0.78)], startPoint: .center, endPoint: .bottom)
+
+            HStack(spacing: 10) {
+                Image(systemName: "play.fill")
+                    .frame(width: 36, height: 36)
+                    .background(.ultraThinMaterial, in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(trailer.string("title") ?? "预告片").font(.subheadline.weight(.semibold))
+                    let metadata = [trailer.string("type_name"), trailer.string("runtime")]
+                        .compactMap { $0 }
+                        .filter { !$0.isEmpty }
+                        .joined(separator: " · ")
+                    if !metadata.isEmpty { Text(metadata).font(.caption) }
+                }
+                Spacer()
+                if trailer.string("video_url", "url") != nil { Image(systemName: "arrow.up.right").font(.caption) }
+            }
+            .foregroundStyle(.white)
+            .padding(14)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+        .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+    }
+}
+
 struct ResourcePushSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -679,16 +1905,41 @@ struct ResourcePushSheet: View {
     @State private var url: String
     @State private var savePath = ""
     @State private var suggestedPaths: [String] = []
+    @State private var sites: [SiteItem] = []
+    @State private var siteIdentifier: String
+    @State private var cookie: String
+    @State private var generateTorrentURL: Bool
     @State private var category = ""
     @State private var tags: String
     @State private var paused = false
     @State private var skipChecking = false
+    @State private var showAdvanced = false
+    @State private var rename = ""
+    @State private var uploadLimit = ""
+    @State private var downloadLimit = ""
+    @State private var ratioLimit = ""
+    @State private var seedingTimeLimit = ""
+    @State private var autoManagement = false
+    @State private var createSubfolder = false
+    @State private var sequentialDownload = false
+    @State private var firstLastPiecePriority = false
+    @State private var addToTop = false
+    @State private var forced = false
+    @State private var contentLayout = "Original"
+    @State private var stopCondition = ""
+    @State private var shareLimitAction = ""
     @State private var isLoading = true
     @State private var isSaving = false
 
     init(item: [String: Any]) {
         self.item = item
-        _url = State(initialValue: item.string("magnet_url", "magnetUrl", "detail_url", "detailUrl", "download_url", "url") ?? "")
+        let initialURL = item.string("magnet_url", "magnetUrl", "detail_url", "detailUrl", "download_url", "url") ?? ""
+        let initialSite = item.string("site_id", "siteId", "site") ?? ""
+        _url = State(initialValue: initialURL)
+        _siteIdentifier = State(initialValue: initialSite)
+        _cookie = State(initialValue: item.string("cookie") ?? "")
+        let lowercasedURL = initialURL.lowercased()
+        _generateTorrentURL = State(initialValue: !initialSite.isEmpty && !lowercasedURL.contains("passkey") && !lowercasedURL.contains("sign"))
         let values = item.strings("tags")
         _tags = State(initialValue: values.isEmpty ? (item.string("tags") ?? "") : values.joined(separator: ", "))
     }
@@ -709,9 +1960,70 @@ struct ResourcePushSheet: View {
                     TextField("分类（可选）", text: $category)
                     TextField("标签，使用逗号分隔", text: $tags)
                 }
+                Section("下载链接") {
+                    Toggle(
+                        "自动生成下载链接",
+                        isOn: Binding(
+                            get: { effectiveGenerateTorrentURL },
+                            set: { if !mustGenerateTorrentURL { generateTorrentURL = $0 } }
+                        )
+                    )
+                    .disabled(mustGenerateTorrentURL)
+                    TextField("站点标识", text: $siteIdentifier).textInputAutocapitalization(.never)
+                    if !sites.isEmpty {
+                        Menu("从站点选择") {
+                            ForEach(sites) { site in
+                                Button(site.name) {
+                                    siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
+                                    if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        cookie = site.cookie
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TextField("Cookie（可选）", text: $cookie, axis: .vertical)
+                        .lineLimit(2...5)
+                        .textInputAutocapitalization(.never)
+                }
                 Section("选项") {
                     Toggle("添加后暂停", isOn: $paused)
                     Toggle("跳过文件校验", isOn: $skipChecking)
+                    Toggle("高级设置", isOn: $showAdvanced)
+                }
+                if showAdvanced {
+                    Section("高级推送") {
+                        TextField("任务名称（可选）", text: $rename)
+                        TextField("上传限制（KB/s）", text: $uploadLimit).keyboardType(.numberPad)
+                        TextField("下载限制（KB/s）", text: $downloadLimit).keyboardType(.numberPad)
+                        TextField("分享率限制", text: $ratioLimit).keyboardType(.decimalPad)
+                        if isQBittorrent {
+                            TextField("做种时间限制（分钟）", text: $seedingTimeLimit).keyboardType(.numberPad)
+                            Picker("内容布局", selection: $contentLayout) {
+                                Text("原始").tag("Original")
+                                Text("不创建子文件夹").tag("NoSubfolder")
+                                Text("创建子文件夹").tag("Subfolder")
+                            }
+                            Picker("停止条件", selection: $stopCondition) {
+                                Text("不自动停止").tag("")
+                                Text("收到元数据后停止").tag("MetadataReceived")
+                                Text("文件校验后停止").tag("FilesChecked")
+                            }
+                            Picker("分享限制动作", selection: $shareLimitAction) {
+                                Text("使用默认").tag("")
+                                Text("停止做种").tag("Stop")
+                                Text("移除任务").tag("Remove")
+                                Text("移除并删除内容").tag("RemoveWithContent")
+                                Text("启用超级做种").tag("EnableSuperSeeding")
+                            }
+                            Toggle("自动种子管理", isOn: $autoManagement)
+                            Toggle("创建根目录", isOn: $createSubfolder)
+                            Toggle("顺序下载", isOn: $sequentialDownload)
+                            Toggle("优先首尾块", isOn: $firstLastPiecePriority)
+                            Toggle("添加到队列顶部", isOn: $addToTop)
+                            Toggle("强制启动", isOn: $forced)
+                        }
+                    }
                 }
             }
             .navigationTitle("推送资源").navigationBarTitleDisplayMode(.inline)
@@ -723,6 +2035,35 @@ struct ResourcePushSheet: View {
         }
     }
 
+    private var selectedDownloader: DownloaderItem? {
+        downloaders.first { $0.id == downloaderID }
+    }
+
+    private var isQBittorrent: Bool {
+        guard let selectedDownloader else { return false }
+        let value = selectedDownloader.category.lowercased()
+        return !value.contains("tr") && !value.contains("transmission")
+    }
+
+    private var mustGenerateTorrentURL: Bool {
+        if isMTeamSiteIdentifier(siteIdentifier) { return true }
+        let raw = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let site = sites.first(where: {
+            String($0.id) == raw
+                || $0.siteKey.caseInsensitiveCompare(raw) == .orderedSame
+                || $0.name.caseInsensitiveCompare(raw) == .orderedSame
+        }) else { return false }
+        return isMTeamSiteIdentifier(site.siteKey) || isMTeamSiteIdentifier(site.name)
+    }
+
+    private var effectiveGenerateTorrentURL: Bool {
+        generateTorrentURL || mustGenerateTorrentURL
+    }
+
+    private func isMTeamSiteIdentifier(_ value: String) -> Bool {
+        value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
+    }
+
     private func load() async {
         defer { isLoading = false }
         do {
@@ -732,6 +2073,22 @@ struct ResourcePushSheet: View {
                 suggestedPaths = jsonPathStrings(try await appState.api(APIPath.downloaderPaths))
             } catch {
                 suggestedPaths = []
+            }
+            do {
+                sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+                let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let site = sites.first(where: {
+                    String($0.id) == rawSite
+                        || $0.siteKey.caseInsensitiveCompare(rawSite) == .orderedSame
+                        || $0.name.caseInsensitiveCompare(rawSite) == .orderedSame
+                }) {
+                    siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
+                    if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        cookie = site.cookie
+                    }
+                }
+            } catch {
+                sites = []
             }
             downloaderID = downloaders.first?.id ?? 0
         } catch { appState.presentedError = error.localizedDescription }
@@ -746,27 +2103,65 @@ struct ResourcePushSheet: View {
             "is_skip_checking": skipChecking
         ]
         if let tid = item.string("tid", "torrent_id", "id"), !tid.isEmpty { body["tid"] = tid; body["ids"] = tid }
-        if let siteID = item.string("site_id", "siteId"), !siteID.isEmpty { body["site_id"] = siteID }
-        if let cookie = item.string("cookie"), !cookie.isEmpty { body["cookie"] = cookie }
+        let trimmedSiteIdentifier = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        if effectiveGenerateTorrentURL && !trimmedSiteIdentifier.isEmpty { body["site_id"] = trimmedSiteIdentifier }
+        if !trimmedCookie.isEmpty { body["cookie"] = trimmedCookie }
         if !savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["save_path"] = savePath.trimmingCharacters(in: .whitespacesAndNewlines) }
         if !category.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["category"] = category.trimmingCharacters(in: .whitespacesAndNewlines) }
         let tagValues = tags.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         if !tagValues.isEmpty { body["tags"] = tagValues }
+        if !rename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["rename"] = rename.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if let value = Int(uploadLimit), value > 0 { body["upload_limit"] = value }
+        if let value = Int(downloadLimit), value > 0 { body["download_limit"] = value }
+        if let value = Double(ratioLimit) { body["ratio_limit"] = value }
+        if let value = Int(seedingTimeLimit) { body["seeding_time_limit"] = value }
+        if isQBittorrent {
+            body["use_auto_torrent_management"] = autoManagement
+            body["is_root_folder"] = createSubfolder
+            body["is_sequential_download"] = sequentialDownload
+            body["is_first_last_piece_priority"] = firstLastPiecePriority
+            body["add_to_top_of_queue"] = addToTop
+            body["content_layout"] = contentLayout
+            body["forced"] = forced
+            if !stopCondition.isEmpty { body["stop_condition"] = stopCondition }
+            if !shareLimitAction.isEmpty { body["share_limit_action"] = shareLimitAction }
+        }
         if await appState.perform("\(APIPath.pushTorrent)/\(downloaderID)", method: .post, body: body) { dismiss() }
     }
 }
 
 private struct MediaCollection: Identifiable {
-    let id = UUID()
+    let cacheKey: String
     let title: String
     let items: [MediaItem]
+    var id: String { cacheKey }
+}
+
+private struct MediaCatalogDefinition {
+    let title: String
+    let path: String
+    let source: String
+    let mediaType: String
+    var query: [String: Any] = [:]
+
+    var cacheKey: String {
+        let queryValue = query.keys.sorted().map { key in
+            "\(key)=\(query[key].map { String(describing: $0) } ?? "")"
+        }.joined(separator: "&")
+        return "news.catalog|\(source)|\(mediaType)|\(path)|\(queryValue)"
+    }
 }
 
 struct NewsView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var movies: [MediaItem] = []
-    @State private var tvs: [MediaItem] = []
+    @State private var collections: [MediaCollection] = []
+    @State private var doubanTags = ["热门"]
+    @State private var selectedDoubanTag = "热门"
     @State private var isLoading = true
+    @State private var usingCachedData = false
+    @State private var cachedAt: Date?
+    @State private var catalogSignature = ""
     @State private var selectedMedia: MediaItem?
     @State private var selectedCollection: MediaCollection?
     @State private var showNotices = false
@@ -776,18 +2171,17 @@ struct NewsView: View {
             if isLoading { LoadingState() }
             else {
                 LazyVStack(alignment: .leading, spacing: 20) {
-                    MediaCarousel(
-                        title: "热门电影",
-                        items: movies,
-                        onSelect: { selectedMedia = $0 },
-                        onShowAll: { selectedCollection = MediaCollection(title: "热门电影", items: movies) }
-                    )
-                    MediaCarousel(
-                        title: "热门剧集",
-                        items: tvs,
-                        onSelect: { selectedMedia = $0 },
-                        onShowAll: { selectedCollection = MediaCollection(title: "热门剧集", items: tvs) }
-                    )
+                    if usingCachedData {
+                        SessionCacheBanner(cachedAt: cachedAt)
+                    }
+                    ForEach(collections) { collection in
+                        MediaCarousel(
+                            title: collection.title,
+                            items: collection.items,
+                            onSelect: { selectedMedia = $0 },
+                            onShowAll: { selectedCollection = collection }
+                        )
+                    }
                     Button { showNotices = true } label: {
                         NewsLinkRow(title: "消息动态", subtitle: "查看站点公告、任务结果和系统提醒", icon: "antenna.radiowaves.left.and.right", color: HarvestTheme.green)
                     }
@@ -799,20 +2193,132 @@ struct NewsView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .refreshable { await load() }
         .navigationTitle("资讯").navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if appState.mediaDoubanEnabled && doubanTags.count > 1 {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Picker("豆瓣标签", selection: $selectedDoubanTag) {
+                            ForEach(doubanTags, id: \.self) { Text($0).tag($0) }
+                        }
+                    } label: {
+                        Image(systemName: "tag")
+                    }
+                    .accessibilityLabel("豆瓣标签")
+                }
+            }
+        }
         .task { if isLoading { await load() } }
+        .onChange(of: appState.refreshGeneration) { _, _ in Task { await load() } }
+        .onChange(of: selectedDoubanTag) { _, _ in Task { await load() } }
+        .onChange(of: appState.mediaTMDBEnabled) { _, _ in Task { await load() } }
+        .onChange(of: appState.mediaDoubanEnabled) { _, _ in Task { await load() } }
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedCollection) { collection in MediaCollectionSheet(collection: collection).environmentObject(appState) }
         .sheet(isPresented: $showNotices) { NoticeView().environmentObject(appState).presentationDetents([.medium, .large]) }
     }
 
     private func load() async {
+        if appState.mediaDoubanEnabled && doubanTags.count == 1 {
+            do {
+                let raw = try await appState.api(APIPath.doubanTags, query: ["category": "movie"])
+                let values = jsonStrings(raw)
+                if !values.isEmpty {
+                    doubanTags = Array(Set(["热门"] + values)).sorted()
+                }
+            } catch {
+                // Catalog loading below remains available when the tag endpoint is disabled.
+            }
+        }
+
+        let tag = selectedDoubanTag
+        var definitions: [MediaCatalogDefinition] = []
+        if appState.mediaTMDBEnabled {
+            definitions.append(contentsOf: [
+                MediaCatalogDefinition(title: "正在上映", path: APIPath.tmdbPlayingMovies, source: "TMDB", mediaType: "movie"),
+                MediaCatalogDefinition(title: "即将上映", path: APIPath.tmdbUpcomingMovies, source: "TMDB", mediaType: "movie"),
+                MediaCatalogDefinition(title: "TMDB 热门电影", path: APIPath.tmdbPopularMovies, source: "TMDB", mediaType: "movie"),
+                MediaCatalogDefinition(title: "TMDB 高分电影", path: APIPath.tmdbTopMovies, source: "TMDB", mediaType: "movie"),
+                MediaCatalogDefinition(title: "今日播出", path: APIPath.tmdbAiringTodayTV, source: "TMDB", mediaType: "tv"),
+                MediaCatalogDefinition(title: "正在播出", path: APIPath.tmdbOnTheAirTV, source: "TMDB", mediaType: "tv"),
+                MediaCatalogDefinition(title: "TMDB 热门剧集", path: APIPath.tmdbPopularTV, source: "TMDB", mediaType: "tv"),
+                MediaCatalogDefinition(title: "TMDB 高分剧集", path: APIPath.tmdbTopTV, source: "TMDB", mediaType: "tv")
+            ])
+        }
+        if appState.mediaDoubanEnabled {
+            definitions.append(contentsOf: [
+                MediaCatalogDefinition(title: "豆瓣热门电影 · \(tag)", path: APIPath.doubanHot, source: "豆瓣", mediaType: "movie", query: ["category": "movie", "tag": tag, "page_start": 0, "page_limit": 20]),
+                MediaCatalogDefinition(title: "豆瓣热门剧集 · \(tag)", path: APIPath.doubanHot, source: "豆瓣", mediaType: "tv", query: ["category": "tv", "tag": tag, "page_start": 0, "page_limit": 20]),
+                MediaCatalogDefinition(title: "豆瓣 Top250", path: APIPath.doubanTop250, source: "豆瓣", mediaType: "movie"),
+                MediaCatalogDefinition(title: "豆瓣电影榜", path: APIPath.doubanRank, source: "豆瓣", mediaType: "movie", query: ["type_id": 1, "start": 0, "limit": 100]),
+                MediaCatalogDefinition(title: "豆瓣剧集榜", path: APIPath.doubanRank, source: "豆瓣", mediaType: "tv", query: ["type_id": 2, "start": 0, "limit": 100])
+            ])
+        }
+
+        let nextSignature = definitions.map(\.cacheKey).joined(separator: "\n")
+        if catalogSignature != nextSignature {
+            catalogSignature = nextSignature
+            var restored: [MediaCollection] = []
+            var newestCacheDate: Date?
+            for definition in definitions {
+                guard let cached = await cachedCollection(definition) else { continue }
+                if !cached.collection.items.isEmpty { restored.append(cached.collection) }
+                if cached.cachedAt > (newestCacheDate ?? .distantPast) {
+                    newestCacheDate = cached.cachedAt
+                }
+            }
+            collections = restored
+            cachedAt = newestCacheDate
+            usingCachedData = !restored.isEmpty
+        }
+
+        isLoading = collections.isEmpty && !definitions.isEmpty
         defer { isLoading = false }
+        let previous = Dictionary(uniqueKeysWithValues: collections.map { ($0.cacheKey, $0) })
+        var loaded: [MediaCollection] = []
+        var usedCachedFallback = false
+        for definition in definitions {
+            if let result = await fetchCollection(definition) {
+                await appState.writeSessionCache(result.raw, name: definition.cacheKey)
+                if !result.collection.items.isEmpty { loaded.append(result.collection) }
+            } else if let fallback = previous[definition.cacheKey] {
+                loaded.append(fallback)
+                usedCachedFallback = true
+            }
+        }
+        collections = loaded
+        usingCachedData = usedCachedFallback
+        if !usedCachedFallback { cachedAt = nil }
+        if loaded.isEmpty && !definitions.isEmpty { appState.presentedError = "影视资讯暂时不可用，请检查 TMDB/豆瓣配置" }
+    }
+
+    private func cachedCollection(
+        _ definition: MediaCatalogDefinition
+    ) async -> (collection: MediaCollection, cachedAt: Date)? {
+        guard let cached = await appState.readSessionCache(definition.cacheKey) else { return nil }
+        let items = jsonRows(cached.value).map {
+            MediaItem($0, source: definition.source, mediaType: definition.mediaType)
+        }
+        return (
+            MediaCollection(cacheKey: definition.cacheKey, title: definition.title, items: items),
+            cached.cachedAt
+        )
+    }
+
+    private func fetchCollection(
+        _ definition: MediaCatalogDefinition
+    ) async -> (collection: MediaCollection, raw: Any)? {
         do {
-            async let movieRaw = appState.api(APIPath.tmdbPopularMovies)
-            async let tvRaw = appState.api(APIPath.tmdbPopularTV)
-            movies = jsonRows(try await movieRaw).map { MediaItem($0, source: "TMDB", mediaType: "movie") }
-            tvs = jsonRows(try await tvRaw).map { MediaItem($0, source: "TMDB", mediaType: "tv") }
-        } catch { appState.presentedError = error.localizedDescription }
+            let raw = try await appState.api(definition.path, query: definition.query)
+            let items = jsonRows(raw).map {
+                MediaItem($0, source: definition.source, mediaType: definition.mediaType)
+            }
+            return (
+                MediaCollection(cacheKey: definition.cacheKey, title: definition.title, items: items),
+                raw
+            )
+        } catch {
+            return nil
+        }
     }
 }
 

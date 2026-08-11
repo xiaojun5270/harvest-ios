@@ -1,9 +1,12 @@
 import Foundation
 import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
 import WebKit
 
 struct NoticeItem: Identifiable, Hashable {
-    let id: Int
+    let id = UUID()
+    let serverID: Int
     var title: String
     var content: String
     var category: String
@@ -12,11 +15,11 @@ struct NoticeItem: Identifiable, Hashable {
     var read: Bool
 
     init(_ json: [String: Any]) {
-        id = json.int("id") ?? abs((json.string("title") ?? UUID().uuidString).hashValue)
+        serverID = json.int("id") ?? 0
         title = json.string("title", "subject", "name") ?? "系统消息"
         content = json.string("content", "message", "text", "body") ?? ""
         category = json.string("category", "type", "level") ?? "通知"
-        createdAt = json.string("created_at", "create_time", "created", "time", "date") ?? ""
+        createdAt = json.string("created_at", "create_time", "created", "updated_at", "update_time", "updated", "time", "date") ?? ""
         url = json.string("url", "link") ?? ""
         read = json.bool("is_read", "isRead", "read", "readed", "has_read") ?? (json.string("read_at", "readAt", "read_time", "readTime") != nil)
     }
@@ -67,6 +70,8 @@ struct NoticeView: View {
                                                 item.read = true
                                                 return item
                                             }
+                                            appState.clearDeliveredNotices()
+                                            await syncUnreadCount()
                                         }
                                     }
                                 } label: { Label("全部已读", systemImage: "checkmark.circle") }
@@ -93,36 +98,57 @@ struct NoticeView: View {
 
     private func load() async {
         defer { isLoading = false }
-        do { notices = jsonRows(try await appState.api(APIPath.notices)).map(NoticeItem.init) }
+        do {
+            notices = jsonRows(try await appState.api(APIPath.notices)).map(NoticeItem.init)
+            await syncUnreadCount()
+        }
         catch { appState.presentedError = error.localizedDescription }
     }
 
-    private func markRead(_ notice: NoticeItem) async {
-        if await appState.perform("\(APIPath.notices)/\(notice.id)/read", method: .put) {
-            if let index = notices.firstIndex(where: { $0.id == notice.id }) { notices[index].read = true }
+    private func markRead(_ notice: NoticeItem) async -> Bool {
+        guard notice.serverID > 0 else { return false }
+        if await appState.perform("\(APIPath.notices)/\(notice.serverID)/read", method: .put) {
+            if let index = notices.firstIndex(where: { $0.serverID == notice.serverID }) { notices[index].read = true }
+            appState.clearDeliveredNotice(id: notice.serverID)
+            await syncUnreadCount()
+            return true
         }
+        return false
     }
 
-    private func delete(_ notice: NoticeItem) async {
-        if await appState.perform("\(APIPath.notices)/\(notice.id)", method: .delete) {
-            notices.removeAll { $0.id == notice.id }
+    private func delete(_ notice: NoticeItem) async -> Bool {
+        guard notice.serverID > 0 else { return false }
+        if await appState.perform("\(APIPath.notices)/\(notice.serverID)", method: .delete) {
+            notices.removeAll { $0.serverID == notice.serverID }
+            appState.clearDeliveredNotice(id: notice.serverID)
+            await syncUnreadCount()
+            return true
         }
+        return false
     }
 
     private func deleteAll() async {
-        if await appState.perform(APIPath.notices, method: .delete) { notices = [] }
+        if await appState.perform(APIPath.notices, method: .delete) {
+            notices = []
+            appState.clearDeliveredNotices()
+            await syncUnreadCount()
+        }
+    }
+
+    private func syncUnreadCount() async {
+        await appState.updateUnreadNoticeCount(notices.lazy.filter { !$0.read }.count)
     }
 }
 
 struct NoticeDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     let notice: NoticeItem
-    let onRead: () async -> Void
-    let onDelete: () async -> Void
+    let onRead: () async -> Bool
+    let onDelete: () async -> Bool
     @State private var isRead: Bool
     @State private var confirmDelete = false
 
-    init(notice: NoticeItem, onRead: @escaping () async -> Void, onDelete: @escaping () async -> Void) {
+    init(notice: NoticeItem, onRead: @escaping () async -> Bool, onDelete: @escaping () async -> Bool) {
         self.notice = notice
         self.onRead = onRead
         self.onDelete = onDelete
@@ -143,7 +169,7 @@ struct NoticeDetailSheet: View {
                     .foregroundStyle(.secondary)
                 }
                 Section("内容") {
-                    Text(notice.content.isEmpty ? "暂无内容" : notice.content)
+                    Text(markdownAttributedString(notice.content.isEmpty ? "暂无内容" : notice.content))
                         .textSelection(.enabled)
                 }
                 if let url = URL(string: notice.url), !notice.url.isEmpty {
@@ -161,8 +187,7 @@ struct NoticeDetailSheet: View {
                     if !isRead {
                         Button {
                             Task {
-                                await onRead()
-                                isRead = true
+                                if await onRead() { isRead = true }
                             }
                         } label: { Label("标记已读", systemImage: "checkmark.circle") }
                     }
@@ -172,7 +197,7 @@ struct NoticeDetailSheet: View {
             .navigationTitle("消息详情").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .confirmationDialog("确定删除这条消息？", isPresented: $confirmDelete, titleVisibility: .visible) {
-                Button("删除消息", role: .destructive) { Task { await onDelete(); dismiss() } }
+                Button("删除消息", role: .destructive) { Task { if await onDelete() { dismiss() } } }
             }
         }
     }
@@ -183,7 +208,7 @@ struct NoticeRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Circle().fill(item.read ? Color.secondary.opacity(0.10) : HarvestTheme.coral.opacity(0.14)).frame(width: 38, height: 38).overlay(Image(systemName: item.read ? "bell" : "bell.fill").foregroundStyle(item.read ? .secondary : HarvestTheme.coral))
-            VStack(alignment: .leading, spacing: 5) { HStack { Text(item.title).font(.subheadline.weight(item.read ? .regular : .semibold)); Spacer(); Text(item.category).font(.caption2).foregroundStyle(.secondary) }; Text(item.content).font(.caption).foregroundStyle(.secondary).lineLimit(3); Text(item.createdAt).font(.caption2).foregroundStyle(.tertiary) }
+            VStack(alignment: .leading, spacing: 5) { HStack { Text(item.title).font(.subheadline.weight(item.read ? .regular : .semibold)); Spacer(); Text(item.category).font(.caption2).foregroundStyle(.secondary) }; Text(markdownAttributedString(item.content, inlineOnly: true)).font(.caption).foregroundStyle(.secondary).lineLimit(3); Text(item.createdAt).font(.caption2).foregroundStyle(.tertiary) }
         }.padding(.vertical, 5)
     }
 }
@@ -193,6 +218,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingLogout = false
     @State private var confirmingRestart = false
+    @State private var showingInvite = false
 
     var body: some View {
         NavigationStack {
@@ -206,13 +232,67 @@ struct SettingsView: View {
 
                 Section("外观与隐私") {
                     Picker("显示模式", selection: Binding(get: { appState.appearance }, set: appState.setAppearance)) { ForEach(AppAppearance.allCases) { Text($0.rawValue).tag($0) } }
+                    Picker("强调色", selection: Binding(get: { appState.accent }, set: appState.setAccent)) {
+                        ForEach(AppAccent.allCases) { accent in
+                            Label {
+                                Text(accent.title)
+                            } icon: {
+                                Circle().fill(accent.color).frame(width: 12, height: 12)
+                            }
+                            .tag(accent)
+                        }
+                    }
+                    Picker("界面密度", selection: Binding(get: { appState.interfaceDensity }, set: appState.setInterfaceDensity)) {
+                        ForEach(AppInterfaceDensity.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Picker("界面字号", selection: Binding(get: { appState.interfaceScale }, set: appState.setInterfaceScale)) {
+                        ForEach(AppInterfaceScale.allCases) { Text($0.rawValue).tag($0) }
+                    }
                     Toggle(isOn: Binding(get: { appState.privacyMode }, set: appState.setPrivacyMode)) { Label("隐藏敏感数据", systemImage: "eye.slash") }
+                    Button { appState.resetAppearanceSettings() } label: {
+                        Label("恢复默认外观", systemImage: "arrow.counterclockwise")
+                    }
+                }
+
+                Section("账号") {
+                    NavigationLink {
+                        AccountSwitcherView().environmentObject(appState)
+                    } label: {
+                        Label("切换账号", systemImage: "person.2.circle")
+                    }
+                    if appState.profile?.isSuperuser == true {
+                        Button { showingInvite = true } label: {
+                            Label("邀请用户", systemImage: "envelope.badge.person.crop")
+                        }
+                    }
+                }
+
+                Section("影视资讯") {
+                    Toggle("TMDB", isOn: Binding(get: { appState.mediaTMDBEnabled }, set: appState.setMediaTMDBEnabled))
+                    Toggle("豆瓣", isOn: Binding(get: { appState.mediaDoubanEnabled }, set: appState.setMediaDoubanEnabled))
+                }
+
+                Section("自动刷新") {
+                    Stepper(
+                        value: Binding(get: { appState.autoRefreshMinutes }, set: appState.setAutoRefreshMinutes),
+                        in: 1...1_440
+                    ) {
+                        LabeledContent("刷新间隔", value: "\(appState.autoRefreshMinutes) 分钟")
+                    }
+                    Menu("常用间隔") {
+                        ForEach([5, 10, 15, 30, 60], id: \.self) { minutes in
+                            Button("\(minutes) 分钟") { appState.setAutoRefreshMinutes(minutes) }
+                        }
+                    }
                 }
 
                 Section("管理") {
                     NavigationLink { BackendOptionsView().environmentObject(appState) } label: { Label("后端配置", systemImage: "slider.horizontal.3") }
+                    NavigationLink { NotificationToolsView().environmentObject(appState) } label: { Label("通知与机器人", systemImage: "bell.and.waves.left.and.right") }
                     NavigationLink { UserManagementView().environmentObject(appState) } label: { Label("用户中心", systemImage: "person.2") }
-                    if appState.profile?.isSuperuser == true { NavigationLink { AdminView().environmentObject(appState) } label: { Label("授权管理", systemImage: "person.badge.key") } }
+                    if appState.profile?.isSuperuser == true && appState.canOpenAdminUsers {
+                        NavigationLink { AdminView().environmentObject(appState) } label: { Label("授权管理", systemImage: "person.badge.key") }
+                    }
                     NavigationLink { LogView().environmentObject(appState) } label: { Label("日志中心", systemImage: "doc.text.magnifyingglass") }
                     NavigationLink {
                         NativeBrowserView(urlString: appState.baseURL, title: "服务页面")
@@ -222,6 +302,8 @@ struct SettingsView: View {
                 }
 
                 Section("维护") {
+                    NavigationLink { DataMaintenanceView().environmentObject(appState) } label: { Label("备份与迁移", systemImage: "externaldrive.badge.timemachine") }
+                    NavigationLink { UpdateMaintenanceView().environmentObject(appState) } label: { Label("更新与网络", systemImage: "arrow.triangle.2.circlepath") }
                     Button { Task { _ = await appState.perform(APIPath.cacheClear, method: .get); } } label: { Label("清理站点缓存", systemImage: "trash.slash") }
                     Button { Task { _ = await appState.perform(APIPath.notifyTest, method: .get, query: ["title": "Harvest", "content": "原生客户端通知测试", "push_type": ""]); } } label: { Label("发送测试通知", systemImage: "bell.badge") }
                     if appState.profile?.isSuperuser == true { Button(role: .destructive) { confirmingRestart = true } label: { Label("重启服务", systemImage: "arrow.clockwise.circle") } }
@@ -237,6 +319,10 @@ struct SettingsView: View {
             }
             .navigationTitle("设置").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+            .sheet(isPresented: $showingInvite) {
+                InviteSheet(notify: true) { }
+                    .environmentObject(appState)
+            }
             .confirmationDialog("确定退出当前账号？", isPresented: $confirmingLogout, titleVisibility: .visible) { Button("退出登录", role: .destructive) { dismiss(); appState.logout() } }
             .confirmationDialog("确定重启 Harvest 服务？", isPresented: $confirmingRestart, titleVisibility: .visible) { Button("重启服务", role: .destructive) { Task { _ = await appState.perform(APIPath.serverRestart, method: .get) } } }
         }
@@ -250,17 +336,1933 @@ struct SettingsView: View {
     }
 }
 
+private struct NoticeChannel: Identifiable {
+    let value: String
+    let label: String
+    var id: String { value }
+}
+
+struct NotificationToolsView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var title = "Harvest"
+    @State private var content = "原生客户端通知测试"
+    @State private var channel = ""
+    @State private var telegramHost = ""
+    @State private var qrURL = ""
+    @State private var qrStatus = ""
+    @State private var tokenSiteURL = "https://www.invites.fun"
+    @State private var tokenUsername = ""
+    @State private var tokenPassword = ""
+    @State private var fetchedToken = ""
+    @State private var fetchedUID = ""
+    @State private var tokenStatus = ""
+    @State private var confirmTokenUpdate = false
+    @State private var isWorking = false
+    @State private var pollingTask: Task<Void, Never>?
+
+    private let channels = [
+        NoticeChannel(value: "", label: "默认通道"),
+        NoticeChannel(value: "wechat_work_push", label: "企业微信"),
+        NoticeChannel(value: "wechat_bot_push", label: "微信机器人"),
+        NoticeChannel(value: "wxpusher_push", label: "WxPusher"),
+        NoticeChannel(value: "pushdeer_push", label: "PushDeer"),
+        NoticeChannel(value: "server_chan_push", label: "Server 酱"),
+        NoticeChannel(value: "bark_push", label: "Bark"),
+        NoticeChannel(value: "iyuu_push", label: "爱语飞飞"),
+        NoticeChannel(value: "telegram_push", label: "Telegram"),
+        NoticeChannel(value: "qqbot_push", label: "QQ 机器人"),
+        NoticeChannel(value: "pushplus_push", label: "PushPlus"),
+        NoticeChannel(value: "meow_push", label: "喵呜通知")
+    ]
+
+    var body: some View {
+        Form {
+            Section("通知测试") {
+                Picker("通知通道", selection: $channel) { ForEach(channels) { Text($0.label).tag($0.value) } }
+                TextField("标题", text: $title)
+                TextField("内容", text: $content, axis: .vertical).lineLimit(2...5)
+                Button { Task { await sendTest() } } label: { Label("发送测试通知", systemImage: "paperplane") }
+                    .disabled(title.isEmpty || content.isEmpty || isWorking)
+            }
+            Section("Telegram Webhook") {
+                TextField("外网回调地址", text: $telegramHost).textInputAutocapitalization(.never).keyboardType(.URL)
+                Button { Task { await saveWebhook() } } label: { Label("设置 Webhook", systemImage: "link.badge.plus") }
+                    .disabled(telegramHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isWorking)
+            }
+            Section("药丸 / 蜂巢 Token") {
+                Picker("站点", selection: $tokenSiteURL) {
+                    Text("药丸").tag("https://www.invites.fun")
+                    Text("蜂巢").tag("https://pting.club")
+                }
+                TextField("站点用户名", text: $tokenUsername).textInputAutocapitalization(.never)
+                SecureField("站点密码", text: $tokenPassword)
+                Button { Task { await fetchInviteToken() } } label: {
+                    Label("获取 Token", systemImage: "key.horizontal")
+                }
+                .disabled(tokenUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || tokenPassword.isEmpty || isWorking)
+                if !fetchedToken.isEmpty {
+                    tokenValueRow("Token", value: fetchedToken)
+                    Button { confirmTokenUpdate = true } label: {
+                        Label("写入匹配站点", systemImage: "square.and.arrow.down")
+                    }
+                }
+                if !fetchedUID.isEmpty { tokenValueRow("UID", value: fetchedUID) }
+                if !tokenStatus.isEmpty { Text(tokenStatus).font(.caption).foregroundStyle(.secondary) }
+            }
+            Section("微信机器人登录") {
+                if !qrURL.isEmpty, ["wait", "scaned"].contains(qrStatus) {
+                    NativeBrowserView(urlString: qrURL, title: "微信机器人登录")
+                        .frame(height: 300)
+                        .clipShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+                }
+                if !qrStatus.isEmpty {
+                    Label(qrStatusText, systemImage: qrStatus == "confirmed" ? "checkmark.circle.fill" : qrStatus == "expired" ? "clock" : "qrcode.viewfinder")
+                        .foregroundStyle(qrStatus == "confirmed" ? HarvestTheme.green : qrStatus == "expired" ? HarvestTheme.amber : .secondary)
+                }
+                Button { Task { await fetchQRCode() } } label: { Label(qrURL.isEmpty ? "获取二维码" : "刷新二维码", systemImage: "qrcode") }
+                    .disabled(isWorking)
+            }
+        }
+        .overlay { if isWorking { ProgressView().controlSize(.large) } }
+        .navigationTitle("通知与机器人")
+        .navigationBarTitleDisplayMode(.inline)
+        .onDisappear { pollingTask?.cancel() }
+        .confirmationDialog("将 Token 写入匹配的站点配置？", isPresented: $confirmTokenUpdate, titleVisibility: .visible) {
+            Button("更新站点") { Task { await updateMatchingSites() } }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("将更新 authkey\(fetchedUID.isEmpty ? "" : " 和 UID")。")
+        }
+    }
+
+    @ViewBuilder private func tokenValueRow(_ label: String, value: String) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                Text(value).font(.caption.monospaced()).lineLimit(2).textSelection(.enabled)
+            }
+            Spacer()
+            Button {
+                UIPasteboard.general.string = value
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("复制 \(label)")
+        }
+    }
+
+    private var qrStatusText: String {
+        switch qrStatus {
+        case "wait": "等待扫码"
+        case "scaned": "已扫码，请在手机上确认"
+        case "confirmed": "登录成功"
+        case "expired": "二维码已过期"
+        default: qrStatus
+        }
+    }
+
+    @MainActor private func sendTest() async {
+        isWorking = true
+        defer { isWorking = false }
+        _ = await appState.perform(APIPath.notifyTest, method: .get, query: ["title": title, "content": content, "push_type": channel])
+    }
+
+    @MainActor private func saveWebhook() async {
+        isWorking = true
+        defer { isWorking = false }
+        _ = await appState.perform(APIPath.telegramWebhook, body: ["host": telegramHost.trimmingCharacters(in: .whitespacesAndNewlines)])
+    }
+
+    @MainActor private func fetchInviteToken() async {
+        isWorking = true
+        fetchedToken = ""
+        fetchedUID = ""
+        tokenStatus = ""
+        defer { isWorking = false }
+        do {
+            let raw = try await APIClient.shared.request(
+                baseURL: tokenSiteURL,
+                path: "/api/token",
+                method: .post,
+                body: [
+                    "identification": tokenUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+                    "password": tokenPassword,
+                    "remember": 1
+                ]
+            )
+            fetchedToken = nestedString(raw, keys: ["token", "access_token", "api_token"]) ?? ""
+            fetchedUID = nestedString(raw, keys: ["uid", "userid", "user_id", "id"]) ?? ""
+            guard !fetchedToken.isEmpty || !fetchedUID.isEmpty else {
+                throw APIError(statusCode: 0, message: "请求成功，但未识别到 Token 或 UID")
+            }
+            tokenStatus = "Token 获取成功"
+            if !fetchedToken.isEmpty { confirmTokenUpdate = true }
+        } catch {
+            appState.presentedError = error.localizedDescription
+        }
+    }
+
+    @MainActor private func updateMatchingSites() async {
+        guard !fetchedToken.isEmpty,
+              let rawHost = URL(string: tokenSiteURL)?.host?.lowercased() else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+            let host = rawHost.hasPrefix("www.") ? String(rawHost.dropFirst(4)) : rawHost
+            let matches = sites.filter { site in
+                let values = [site.siteKey, site.url, site.torrentsURL, site.rss].map { $0.lowercased() }
+                return values.contains { $0.contains(rawHost) || $0.contains(host) }
+            }
+            guard !matches.isEmpty else {
+                tokenStatus = "未找到匹配站点，Token 已保留供复制"
+                return
+            }
+            var updated = 0
+            for site in matches {
+                var body = site.raw
+                body["authkey"] = fetchedToken
+                if !fetchedUID.isEmpty { body["user_id"] = fetchedUID }
+                if await appState.perform("\(APIPath.sites)/\(site.id)", method: .put, body: body) { updated += 1 }
+            }
+            tokenStatus = "已更新 \(updated) 个站点"
+        } catch {
+            appState.presentedError = error.localizedDescription
+        }
+    }
+
+    private func nestedString(_ value: Any, keys: Set<String>) -> String? {
+        if let dictionary = value as? [String: Any] {
+            for (key, nested) in dictionary where keys.contains(key.lowercased()) {
+                if let text = nested as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return text }
+                if let number = nested as? NSNumber { return number.stringValue }
+            }
+            for nested in dictionary.values {
+                if let found = nestedString(nested, keys: keys) { return found }
+            }
+        } else if let values = value as? [Any] {
+            for nested in values {
+                if let found = nestedString(nested, keys: keys) { return found }
+            }
+        }
+        return nil
+    }
+
+    @MainActor private func fetchQRCode() async {
+        pollingTask?.cancel()
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let raw = try await appState.api(APIPath.wechatQRCode)
+            guard let url = (jsonPayloadDictionary(raw) ?? [:]).string("qrcode_url", "qrcodeUrl", "url"), !url.isEmpty else {
+                throw APIError(statusCode: 0, message: "二维码响应缺少地址")
+            }
+            qrURL = url
+            qrStatus = "wait"
+            pollingTask = Task { await pollQRCodeStatus() }
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func pollQRCodeStatus() async {
+        for _ in 0..<40 where !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            do {
+                let status = jsonPayloadDictionary(try await appState.api(APIPath.wechatQRCodeStatus)) ?? [:]
+                qrStatus = status.string("status") ?? qrStatus
+                if ["confirmed", "expired"].contains(qrStatus) { return }
+            } catch { }
+        }
+        if !Task.isCancelled { qrStatus = "expired" }
+    }
+}
+
+private struct BackupDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.zip, .archive, .data] }
+    var data: Data
+
+    init(data: Data = Data()) { self.data = data }
+    init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
+}
+
+private enum MaintenanceImport: String {
+    case backup
+    case sqlite
+}
+
+private struct PendingMaintenanceImport: Identifiable {
+    let id = UUID()
+    let kind: MaintenanceImport
+    let fileName: String
+    let data: Data
+}
+
+struct DataMaintenanceView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var exportDocument: BackupDocument?
+    @State private var exportFileName = "harvest_backup.zip"
+    @State private var showExporter = false
+    @State private var showImporter = false
+    @State private var importKind: MaintenanceImport = .backup
+    @State private var legacyURL = ""
+    @State private var legacyToken = ""
+    @State private var isWorking = false
+    @State private var confirmClean = false
+    @State private var pendingImport: PendingMaintenanceImport?
+    @State private var statusMessage = ""
+
+    var body: some View {
+        Form {
+            Section("完整备份") {
+                Button { Task { await exportBackup() } } label: { Label("导出完整备份", systemImage: "square.and.arrow.up") }
+                    .disabled(isWorking)
+                Button { importKind = .backup; showImporter = true } label: { Label("恢复完整备份", systemImage: "square.and.arrow.down") }
+                    .disabled(isWorking)
+            }
+            Section("旧版 Harvest") {
+                TextField("旧服务器地址", text: $legacyURL).textInputAutocapitalization(.never).keyboardType(.URL)
+                SecureField("旧版令牌", text: $legacyToken)
+                Button { Task { await importLegacyServer() } } label: { Label("从旧服务导入", systemImage: "server.rack") }
+                    .disabled(legacyURL.isEmpty || legacyToken.isEmpty || isWorking)
+            }
+            Section("旧版 SQLite") {
+                Button { importKind = .sqlite; showImporter = true } label: { Label("选择数据库文件", systemImage: "cylinder.split.1x2") }
+                    .disabled(isWorking)
+            }
+            Section("本机数据") {
+                Button(role: .destructive) { confirmClean = true } label: { Label("清理网页缓存和 Cookie", systemImage: "trash") }
+            }
+            if !statusMessage.isEmpty {
+                Section("结果") { Text(statusMessage).font(.caption).textSelection(.enabled) }
+            }
+        }
+        .overlay { if isWorking { ProgressView().controlSize(.large) } }
+        .navigationTitle("备份与迁移")
+        .navigationBarTitleDisplayMode(.inline)
+        .fileExporter(
+            isPresented: $showExporter,
+            document: exportDocument,
+            contentType: .zip,
+            defaultFilename: exportFileName
+        ) { result in
+            if case .failure(let error) = result { appState.presentedError = error.localizedDescription }
+            exportDocument = nil
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: importKind == .backup ? [.zip] : [UTType(filenameExtension: "sqlite3") ?? .data], allowsMultipleSelection: false) { result in
+            Task { await importFile(result) }
+        }
+        .confirmationDialog("确定清理内置浏览器缓存和 Cookie？", isPresented: $confirmClean, titleVisibility: .visible) {
+            Button("清理", role: .destructive) { Task { await cleanWebData() } }
+        }
+        .confirmationDialog(
+            "确定导入旧版数据库「\(pendingImport?.fileName ?? "")」？",
+            isPresented: Binding(
+                get: { pendingImport != nil },
+                set: { if !$0 { pendingImport = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("确认导入") {
+                guard let file = pendingImport else { return }
+                pendingImport = nil
+                Task { await submitImport(file) }
+            }
+            Button("取消", role: .cancel) { pendingImport = nil }
+        }
+    }
+
+    @MainActor private func exportBackup() async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let result = try await appState.download(APIPath.setupBackup)
+            exportDocument = BackupDocument(data: result.data)
+            exportFileName = normalizedBackupName(result.fileName)
+            showExporter = true
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func importFile(_ result: Result<[URL], Error>) async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            guard let url = try result.get().first else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
+            let extensionName = url.pathExtension.lowercased()
+            if importKind == .backup, extensionName != "zip" {
+                throw APIError(statusCode: 0, message: "请选择 .zip 完整备份文件")
+            }
+            if importKind == .sqlite, extensionName != "sqlite3" {
+                throw APIError(statusCode: 0, message: "请选择 .sqlite3 旧版数据库文件")
+            }
+            let file = PendingMaintenanceImport(kind: importKind, fileName: url.lastPathComponent, data: data)
+            if importKind == .sqlite {
+                pendingImport = file
+            } else {
+                await submitImport(file)
+            }
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func submitImport(_ file: PendingMaintenanceImport) async {
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let path = file.kind == .backup ? APIPath.setupBackup : APIPath.setupSQLite
+            let raw = try await appState.upload(
+                path,
+                parts: [MultipartPart(fieldName: "file", fileName: file.fileName, mimeType: "application/octet-stream", data: file.data)]
+            )
+            statusMessage = jsonMessage(raw) ?? (file.kind == .backup ? "数据备份导入任务已提交" : "旧版数据库导入任务已提交")
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func importLegacyServer() async {
+        isWorking = true
+        defer { isWorking = false }
+        _ = await appState.perform(APIPath.setupImport, body: ["base_url": legacyURL.trimmingCharacters(in: .whitespacesAndNewlines), "legacy_token": legacyToken])
+    }
+
+    @MainActor private func cleanWebData() async {
+        URLCache.shared.removeAllCachedResponses()
+        let store = WKWebsiteDataStore.default()
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            store.removeData(ofTypes: types, modifiedSince: .distantPast) { continuation.resume() }
+        }
+        statusMessage = "内置浏览器缓存和 Cookie 已清理"
+    }
+
+    private func normalizedBackupName(_ value: String?) -> String {
+        let name = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.lowercased().hasSuffix(".zip") { return name }
+        if name.lowercased().hasSuffix(".gz") { return String(name.dropLast(3)) + ".zip" }
+        if !name.isEmpty { return name + ".zip" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        return "harvest_backup_\(formatter.string(from: Date())).zip"
+    }
+}
+
+struct IOSDownloadLink: Identifiable, Hashable {
+    let label: String
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+private let appUpdateServiceURL = "https://repeat.ptools.fun"
+private let appUpdateDownloadPageURL = URL(string: appUpdateServiceURL)!
+private let appUpdateTestFlightURL = URL(string: "https://testflight.apple.com/join/kwLil5xf")!
+private let appUpdateIgnoredVersionKey = "app_upgrade_ignore_version"
+private let appUpdateUseGithubProxyKey = "app_upgrade_use_github_proxy"
+private let appUpdateGithubProxyKey = "app_upgrade_github_proxy"
+private let appUpdateGithubProxyResultsKey = "app_upgrade_github_proxy_results"
+private let appUpdateGithubProxyCandidates = [
+    "https://gh-proxy.net/",
+    "https://github.cnxiaobai.com/",
+    "https://hub.gitmirror.com/",
+    "https://www.5555.cab/",
+    "https://ghproxy.xiaopa.cc/",
+    "https://ghproxy.cfd/",
+    "https://ghproxy.cc/",
+    "https://ghproxy.monkeyray.net/",
+    "https://cf.ghproxy.cc/",
+    "https://gitproxy.mrhjx.cn/",
+    "https://ghproxy.1888866.xyz/",
+    "https://github.mlmle.cn/",
+    "https://fastgit.cc/",
+    "https://gh.1k.ink/",
+    "https://ghproxy.net/",
+    "https://github.boringhex.top/",
+    "https://ghfast.top/",
+    "https://ghproxy.imciel.com/",
+    "https://gh.monlor.com/",
+    "https://gh.con.sh/"
+]
+
+struct GithubProxyResult: Codable, Identifiable, Hashable {
+    let url: String
+    let milliseconds: Int
+    let statusCode: Int
+    var id: String { url }
+    var isAvailable: Bool { (200..<500).contains(statusCode) }
+}
+
+struct DownloadedAppPackage: Identifiable {
+    let url: URL
+    var id: String { url.path }
+}
+
+private final class AppUpdateDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    private let destination: URL
+    private let progress: (Int64, Int64) -> Void
+    private let completion: (Result<URL, Error>) -> Void
+    private var result: Result<URL, Error>?
+
+    init(
+        destination: URL,
+        progress: @escaping (Int64, Int64) -> Void,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        self.destination = destination
+        self.progress = progress
+        self.completion = completion
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        progress(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        if let response = downloadTask.response as? HTTPURLResponse,
+           !(200..<300).contains(response.statusCode) {
+            result = .failure(APIError(statusCode: response.statusCode, message: "下载安装包失败（\(response.statusCode)）"))
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: location, to: destination)
+            result = .success(destination)
+        } catch {
+            result = .failure(error)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let finalResult: Result<URL, Error>
+        if let error {
+            finalResult = .failure(error)
+        } else {
+            finalResult = result ?? .failure(APIError(statusCode: 0, message: "下载安装包失败"))
+        }
+        DispatchQueue.main.async { [completion] in completion(finalResult) }
+    }
+}
+
+@MainActor
+final class AppUpdateViewModel: ObservableObject {
+    @Published var latest: [String: Any] = [:]
+    @Published var versions: [[String: Any]] = []
+    @Published var isLoading = false
+    @Published var isTestingProxy = false
+    @Published var isDownloading = false
+    @Published var downloadProgress = 0.0
+    @Published var downloadedBytes: Int64 = 0
+    @Published var expectedDownloadBytes: Int64 = 0
+    @Published var completedPackage: DownloadedAppPackage?
+    @Published var statusMessage = ""
+    @Published var errorMessage = ""
+    @Published var proxyResults: [GithubProxyResult]
+    @Published var useGithubProxy: Bool {
+        didSet { UserDefaults.standard.set(useGithubProxy, forKey: appUpdateUseGithubProxyKey) }
+    }
+    @Published var selectedProxy: String {
+        didSet { UserDefaults.standard.set(selectedProxy, forKey: appUpdateGithubProxyKey) }
+    }
+
+    private var downloadSession: URLSession?
+    private var downloadTask: URLSessionDownloadTask?
+    private var downloadDelegate: AppUpdateDownloadDelegate?
+    private var cancelRequested = false
+
+    init() {
+        let defaults = UserDefaults.standard
+        useGithubProxy = defaults.bool(forKey: appUpdateUseGithubProxyKey)
+        selectedProxy = defaults.string(forKey: appUpdateGithubProxyKey) ?? ""
+        if let data = defaults.data(forKey: appUpdateGithubProxyResultsKey),
+           let stored = try? JSONDecoder().decode([GithubProxyResult].self, from: data) {
+            proxyResults = stored.filter(\.isAvailable)
+        } else {
+            proxyResults = []
+        }
+    }
+
+    var currentVersion: String { appUpdateCurrentVersion() }
+    var latestVersion: String { latest.string("version", "tag", "version_name", "name") ?? "" }
+    var latestLinks: [IOSDownloadLink] { iosDownloadLinks(latest) }
+    var hasNewVersion: Bool {
+        !latestVersion.isEmpty && hasIOSAppPackage(latest) && compareAppVersions(latestVersion, currentVersion) > 0
+    }
+    var isLatestIgnored: Bool {
+        isAppUpdateVersionIgnored(latestVersion)
+    }
+
+    func load(_ appState: AppState, includeHistory: Bool = true) async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = ""
+        defer { isLoading = false }
+        do {
+            latest = jsonPayloadDictionary(try await appUpdateRequest(APIPath.appVersionLatest, appState: appState)) ?? [:]
+        } catch {
+            errorMessage = "获取 APP 最新版本失败：\(error.localizedDescription)"
+        }
+        guard includeHistory else { return }
+        do {
+            versions = jsonRows(try await appUpdateRequest(APIPath.appVersionList, appState: appState))
+        } catch {
+            let message = "获取 APP 版本历史失败：\(error.localizedDescription)"
+            errorMessage = errorMessage.isEmpty ? message : errorMessage + "\n" + message
+        }
+    }
+
+    func setLatestIgnored(_ ignored: Bool) {
+        guard !latestVersion.isEmpty else { return }
+        setAppUpdateVersionIgnored(latestVersion, ignored: ignored)
+        objectWillChange.send()
+    }
+
+    func testGithubProxies() async {
+        guard !isTestingProxy else { return }
+        isTestingProxy = true
+        errorMessage = ""
+        statusMessage = "正在测试 GitHub 加速地址"
+        defer { isTestingProxy = false }
+
+        let candidates = Array(appUpdateGithubProxyCandidates.shuffled().prefix(20))
+        let tested = await withTaskGroup(of: GithubProxyResult.self, returning: [GithubProxyResult].self) { group in
+            for proxy in candidates {
+                group.addTask { await Self.probeGithubProxy(proxy) }
+            }
+            var values: [GithubProxyResult] = []
+            for await value in group { values.append(value) }
+            return values
+        }
+        let available = tested.filter(\.isAvailable).sorted { $0.milliseconds < $1.milliseconds }
+        proxyResults = Array(available.prefix(10))
+        if let data = try? JSONEncoder().encode(proxyResults) {
+            UserDefaults.standard.set(data, forKey: appUpdateGithubProxyResultsKey)
+        }
+        if let fastest = proxyResults.first {
+            selectedProxy = fastest.url
+            statusMessage = "已选择最快加速地址，响应 \(fastest.milliseconds) ms"
+        } else {
+            selectedProxy = ""
+            statusMessage = ""
+            errorMessage = "未找到可用的 GitHub 加速地址"
+        }
+    }
+
+    func copyDownloadURL(_ link: IOSDownloadLink) {
+        UIPasteboard.general.string = effectiveURL(for: link.url).absoluteString
+        statusMessage = "下载链接已复制"
+    }
+
+    func download(_ link: IOSDownloadLink, release: [String: Any]) {
+        guard !isDownloading else { return }
+        let sourceURL = effectiveURL(for: link.url)
+        let version = release.string("version", "tag", "version_name", "name") ?? latestVersion
+        let fileName = appUpdateFileName(link: link, version: version)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("harvest_app_upgrade", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            errorMessage = "无法创建安装包临时目录：\(error.localizedDescription)"
+            return
+        }
+        let destination = directory.appendingPathComponent(fileName, isDirectory: false)
+
+        downloadProgress = 0
+        downloadedBytes = 0
+        expectedDownloadBytes = 0
+        completedPackage = nil
+        cancelRequested = false
+        errorMessage = ""
+        statusMessage = "正在下载 \(fileName)"
+        isDownloading = true
+
+        let delegate = AppUpdateDownloadDelegate(
+            destination: destination,
+            progress: { [weak self] received, expected in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.downloadedBytes = received
+                    self.expectedDownloadBytes = max(0, expected)
+                    self.downloadProgress = expected > 0 ? min(max(Double(received) / Double(expected), 0), 1) : 0
+                }
+            },
+            completion: { [weak self] result in self?.finishDownload(result) }
+        )
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60 * 60
+        configuration.waitsForConnectivity = true
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
+        var request = URLRequest(url: sourceURL)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("Harvest-iOS/1.0", forHTTPHeaderField: "User-Agent")
+        let task = session.downloadTask(with: request)
+        downloadDelegate = delegate
+        downloadSession = session
+        downloadTask = task
+        task.resume()
+    }
+
+    func cancelDownload() {
+        guard isDownloading else { return }
+        cancelRequested = true
+        downloadTask?.cancel()
+    }
+
+    private func effectiveURL(for original: URL) -> URL {
+        guard useGithubProxy, !selectedProxy.isEmpty, isGithubDownloadURL(original) else { return original }
+        let normalized = selectedProxy.hasSuffix("/") ? selectedProxy : selectedProxy + "/"
+        return URL(string: normalized + original.absoluteString) ?? original
+    }
+
+    private func finishDownload(_ result: Result<URL, Error>) {
+        downloadSession?.finishTasksAndInvalidate()
+        downloadSession = nil
+        downloadTask = nil
+        downloadDelegate = nil
+        isDownloading = false
+        downloadProgress = 0
+        downloadedBytes = 0
+        expectedDownloadBytes = 0
+
+        switch result {
+        case .success(let url):
+            statusMessage = "安装包已下载，可通过系统分享保存或传输"
+            completedPackage = DownloadedAppPackage(url: url)
+        case .failure(let error):
+            if cancelRequested || (error as NSError).code == NSURLErrorCancelled {
+                statusMessage = "已取消下载"
+            } else {
+                statusMessage = ""
+                errorMessage = "下载安装包失败：\(error.localizedDescription)"
+            }
+        }
+        cancelRequested = false
+    }
+
+    nonisolated private static func probeGithubProxy(_ proxy: String) async -> GithubProxyResult {
+        let normalized = proxy.hasSuffix("/") ? proxy : proxy + "/"
+        guard let url = URL(string: normalized + "https://github.com/favicon.ico") else {
+            return GithubProxyResult(url: normalized, milliseconds: 0, statusCode: 0)
+        }
+        let start = Date()
+        var statusCode = 0
+        do {
+            var request = URLRequest(url: url, timeoutInterval: 1.8)
+            request.httpMethod = "HEAD"
+            let (_, response) = try await URLSession.shared.data(for: request)
+            statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+        } catch {
+            do {
+                var request = URLRequest(url: url, timeoutInterval: 1.8)
+                request.httpMethod = "GET"
+                let (_, response) = try await URLSession.shared.data(for: request)
+                statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            } catch { statusCode = 0 }
+        }
+        let milliseconds = max(1, Int(Date().timeIntervalSince(start) * 1_000))
+        return GithubProxyResult(url: normalized, milliseconds: milliseconds, statusCode: statusCode)
+    }
+}
+
+@MainActor
+func appUpdateRequest(_ path: String, appState: AppState) async throws -> Any {
+    do {
+        return try await APIClient.shared.request(baseURL: appUpdateServiceURL, path: path)
+    } catch {
+        recordAppLog(.warning, "公共 APP 版本服务不可用，回退当前 Harvest 服务：\(error.localizedDescription)")
+        return try await appState.api(path)
+    }
+}
+
+func appUpdateCurrentVersion() -> String {
+    let info = Bundle.main.infoDictionary ?? [:]
+    let version = (info["CFBundleShortVersionString"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let build = (info["CFBundleVersion"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if version.isEmpty { return build.isEmpty ? "-" : build }
+    return build.isEmpty ? version : "\(version)+\(build)"
+}
+
+func compareAppVersions(_ lhs: String, _ rhs: String) -> Int {
+    let left = lhs.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+    let right = rhs.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+    for index in 0..<max(left.count, right.count) {
+        let lvalue = index < left.count ? left[index] : 0
+        let rvalue = index < right.count ? right[index] : 0
+        if lvalue != rvalue { return lvalue < rvalue ? -1 : 1 }
+    }
+    return 0
+}
+
+func isAppUpdateVersionIgnored(_ version: String) -> Bool {
+    guard !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+    return UserDefaults.standard.string(forKey: appUpdateIgnoredVersionKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        == version.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func setAppUpdateVersionIgnored(_ version: String, ignored: Bool) {
+    guard !version.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    if ignored {
+        UserDefaults.standard.set(version, forKey: appUpdateIgnoredVersionKey)
+    } else {
+        UserDefaults.standard.removeObject(forKey: appUpdateIgnoredVersionKey)
+    }
+}
+
+@MainActor
+func availableAppUpdateVersion(_ appState: AppState) async -> String? {
+    do {
+        guard let release = jsonPayloadDictionary(try await appUpdateRequest(APIPath.appVersionLatest, appState: appState)) else { return nil }
+        let version = release.string("version", "tag", "version_name", "name") ?? ""
+        guard !version.isEmpty, hasIOSAppPackage(release),
+              compareAppVersions(version, appUpdateCurrentVersion()) > 0 else { return nil }
+        return version
+    } catch {
+        recordAppLog(.warning, "自动检查 APP 更新失败：\(error.localizedDescription)")
+        return nil
+    }
+}
+
+func iosDownloadLinks(_ version: [String: Any]) -> [IOSDownloadLink] {
+    var links: [IOSDownloadLink] = []
+    var seen = Set<String>()
+    let releaseVersion = version.string("version", "tag", "version_name", "name") ?? ""
+
+    func append(label: String, value: Any?, requireIOSMarker: Bool = true) {
+        let resolvedLabel: String
+        let resolvedValue: Any?
+        if let dictionary = value as? [String: Any] {
+            resolvedLabel = dictionary.string("name", "file", "filename", "label", "platform") ?? label
+            resolvedValue = dictionary["url"] ?? dictionary["download_url"] ?? dictionary["downloadUrl"] ?? dictionary["link"]
+        } else {
+            resolvedLabel = label
+            resolvedValue = value
+        }
+        let raw = (resolvedValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let directURL = URL(string: raw)
+        let url: URL?
+        if let directURL, ["http", "https"].contains(directURL.scheme?.lowercased() ?? "") {
+            url = directURL
+        } else if !releaseVersion.isEmpty {
+            let rawFileName = URL(string: raw)?.lastPathComponent ?? ""
+            let fallbackFileName = rawFileName.isEmpty ? resolvedLabel : rawFileName
+            var components = URLComponents()
+            components.scheme = "https"
+            components.host = "github.com"
+            components.path = "/xiaojun5270/harvest-ios/releases/download/\(releaseVersion)/\(fallbackFileName)"
+            url = components.url
+        } else {
+            url = nil
+        }
+        guard let url else { return }
+        let marker = "\(resolvedLabel) \(raw) \(url.absoluteString)".lowercased()
+        let isIOS = marker.contains("ios") || marker.contains("iphone")
+            || marker.contains("ipad") || marker.contains("ipa") || marker.contains("testflight")
+        guard !requireIOSMarker || isIOS else { return }
+        guard seen.insert(url.absoluteString).inserted else { return }
+        links.append(IOSDownloadLink(label: resolvedLabel.isEmpty ? "iOS 下载" : resolvedLabel, url: url))
+    }
+
+    for key in ["downloadLinks", "download_links", "downloads", "assets"] {
+        if let dictionary = version[key] as? [String: Any] {
+            for (label, value) in dictionary { append(label: label, value: value) }
+        } else if let values = version[key] as? [Any] {
+            for (index, value) in values.enumerated() { append(label: "下载 \(index + 1)", value: value) }
+        }
+    }
+
+    for key in ["url", "download_url", "downloadUrl", "link"] {
+        append(label: "下载地址", value: version[key])
+    }
+    if links.isEmpty {
+        for key in ["url", "download_url", "downloadUrl", "link"] {
+            append(label: "版本下载页面", value: version[key], requireIOSMarker: false)
+        }
+    }
+    return links.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+}
+
+private func hasIOSAppPackage(_ version: [String: Any]) -> Bool {
+    iosDownloadLinks(version).contains { link in
+        let marker = "\(link.label) \(link.url.absoluteString)".lowercased()
+        return marker.contains("ios") || marker.contains("iphone") || marker.contains("ipad")
+            || marker.contains("ipa") || marker.contains("testflight")
+    }
+}
+
+private func isGithubDownloadURL(_ url: URL) -> Bool {
+    let host = url.host?.lowercased() ?? ""
+    return host == "github.com" || host == "raw.githubusercontent.com"
+        || host == "objects.githubusercontent.com" || host.hasSuffix(".githubusercontent.com")
+}
+
+private func appUpdateFileName(link: IOSDownloadLink, version: String) -> String {
+    let candidates = [link.label, link.url.lastPathComponent.removingPercentEncoding ?? link.url.lastPathComponent]
+    for candidate in candidates {
+        let safe = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: CharacterSet(charactersIn: "\\/:*?\"<>|"))
+            .joined(separator: "_")
+        if !safe.isEmpty, !URL(fileURLWithPath: safe).pathExtension.isEmpty { return safe }
+    }
+    let safeVersion = version.components(separatedBy: CharacterSet.alphanumerics.inverted).joined(separator: "_")
+    return "Harvest-\(safeVersion.isEmpty ? "latest" : safeVersion).ipa"
+}
+
+private struct AppUpdateLinkRow: View {
+    @ObservedObject var model: AppUpdateViewModel
+    let release: [String: Any]
+    let link: IOSDownloadLink
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(link.label).font(.subheadline)
+                Text(link.url.lastPathComponent.removingPercentEncoding ?? link.url.host ?? link.url.absoluteString)
+                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Button { model.download(link, release: release) } label: { Image(systemName: "arrow.down.circle") }
+                .disabled(model.isDownloading)
+                .accessibilityLabel("下载并分享 \(link.label)")
+            Menu {
+                Button { model.copyDownloadURL(link) } label: { Label("复制下载链接", systemImage: "doc.on.doc") }
+                Link(destination: link.url) { Label("在浏览器中打开", systemImage: "safari") }
+            } label: { Image(systemName: "ellipsis.circle") }
+                .accessibilityLabel("下载链接操作")
+        }
+    }
+}
+
+private struct AppUpdateLatestSection: View {
+    @ObservedObject var model: AppUpdateViewModel
+
+    var body: some View {
+        Section("APP 最新版本") {
+            LabeledContent("当前版本", value: model.currentVersion)
+            if model.isLoading && model.latest.isEmpty {
+                HStack { ProgressView(); Text("正在检查新版本").foregroundStyle(.secondary) }
+            } else if model.latest.isEmpty {
+                Text("暂未获取到版本信息").font(.caption).foregroundStyle(.secondary)
+            } else {
+                HStack {
+                    LabeledContent("最新版本", value: model.latestVersion.isEmpty ? "未知" : model.latestVersion)
+                    if model.hasNewVersion { Text("可更新").font(.caption2.weight(.semibold)).foregroundStyle(HarvestTheme.coral) }
+                }
+                if let notes = model.latest.string("changelog", "changeLog", "description", "notes", "body"), !notes.isEmpty {
+                    Text(markdownAttributedString(notes)).font(.caption).textSelection(.enabled)
+                }
+                ForEach(model.latestLinks) { link in
+                    AppUpdateLinkRow(model: model, release: model.latest, link: link)
+                }
+                if model.latestLinks.isEmpty {
+                    Text("当前版本未提供可识别的 iOS/IPA 下载地址").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Link(destination: appUpdateDownloadPageURL) { Label("打开下载页", systemImage: "arrow.up.right.square") }
+            Link(destination: appUpdateTestFlightURL) { Label("通过 TestFlight 安装", systemImage: "apple.logo") }
+        }
+    }
+}
+
+private struct AppUpdateOptionsSection: View {
+    @ObservedObject var model: AppUpdateViewModel
+
+    var body: some View {
+        Section("下载选项") {
+            Toggle("不再提醒当前版本", isOn: Binding(
+                get: { model.isLatestIgnored },
+                set: model.setLatestIgnored
+            ))
+            .disabled(model.latestVersion.isEmpty)
+            Toggle("GitHub 下载加速", isOn: $model.useGithubProxy)
+            if model.useGithubProxy {
+                if !model.proxyResults.isEmpty {
+                    Picker("加速地址", selection: $model.selectedProxy) {
+                        Text("使用原始地址").tag("")
+                        ForEach(model.proxyResults) { result in
+                            Text("\(result.url) · \(result.milliseconds) ms").tag(result.url)
+                        }
+                    }
+                }
+                Button { Task { await model.testGithubProxies() } } label: {
+                    if model.isTestingProxy {
+                        HStack { ProgressView(); Text("正在测速") }
+                    } else {
+                        Label("测试并选择最快地址", systemImage: "gauge.with.dots.needle.67percent")
+                    }
+                }
+                .disabled(model.isTestingProxy || model.isDownloading)
+            }
+            if model.isDownloading {
+                if model.expectedDownloadBytes > 0 {
+                    ProgressView(value: model.downloadProgress) {
+                        Text("正在下载安装包")
+                    } currentValueLabel: {
+                        Text(model.downloadProgress.formatted(.percent.precision(.fractionLength(1))))
+                    }
+                } else {
+                    HStack { ProgressView(); Text("正在下载安装包") }
+                }
+                if model.downloadedBytes > 0 {
+                    Text(ByteCountFormatter.string(fromByteCount: model.downloadedBytes, countStyle: .file))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Button(role: .destructive) { model.cancelDownload() } label: { Label("取消下载", systemImage: "xmark.circle") }
+            }
+            if !model.statusMessage.isEmpty { Text(model.statusMessage).font(.caption).foregroundStyle(.secondary) }
+            if !model.errorMessage.isEmpty { Text(model.errorMessage).font(.caption).foregroundStyle(.red).textSelection(.enabled) }
+        }
+    }
+}
+
+private struct AppUpdateHistorySection: View {
+    @ObservedObject var model: AppUpdateViewModel
+
+    var body: some View {
+        if !model.versions.isEmpty {
+            Section("APP 版本历史") {
+                ForEach(Array(model.versions.enumerated()), id: \.offset) { _, version in
+                    VStack(alignment: .leading, spacing: 7) {
+                        HStack {
+                            Text(version.string("version", "tag", "version_name", "name") ?? "未知版本")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            if let created = version.string("created_at", "published_at", "date"), !created.isEmpty {
+                                Text(created).font(.caption2).foregroundStyle(.secondary)
+                            }
+                        }
+                        if let notes = version.string("changelog", "changeLog", "description", "notes", "body"), !notes.isEmpty {
+                            Text(markdownAttributedString(notes)).font(.caption).foregroundStyle(.secondary).lineLimit(6)
+                        }
+                        ForEach(iosDownloadLinks(version)) { link in
+                            AppUpdateLinkRow(model: model, release: version, link: link)
+                        }
+                    }
+                    .padding(.vertical, 3)
+                }
+            }
+        }
+    }
+}
+
+struct AppUpdatePromptView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var model = AppUpdateViewModel()
+    @State private var selectedTab = 0
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("版本视图", selection: $selectedTab) {
+                        Text("最新版本").tag(0)
+                        Text("历史版本").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                }
+                if selectedTab == 0 {
+                    AppUpdateLatestSection(model: model)
+                    AppUpdateOptionsSection(model: model)
+                } else {
+                    AppUpdateHistorySection(model: model)
+                    if !model.isLoading && model.versions.isEmpty {
+                        Section { Text("暂无 APP 版本历史").foregroundStyle(.secondary) }
+                    }
+                }
+            }
+            .navigationTitle(model.hasNewVersion ? "发现新版本" : "APP 更新")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { Task { await model.load(appState) } } label: { Image(systemName: "arrow.clockwise") }
+                        .disabled(model.isLoading)
+                        .accessibilityLabel("检查更新")
+                }
+            }
+        }
+        .task { await model.load(appState) }
+        .onDisappear { model.cancelDownload() }
+        .sheet(item: $model.completedPackage) { package in ActivityShareSheet(items: [package.url]) }
+    }
+}
+
+private enum ServerUpdateTarget: String, CaseIterable, Identifiable {
+    case backend
+    case sites
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .backend: "后端代码"
+        case .sites: "站点配置"
+        }
+    }
+
+    var endpoint: String {
+        switch self {
+        case .backend: APIPath.updateLog
+        case .sites: APIPath.updateSites
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .backend: "shippingbox"
+        case .sites: "doc.text"
+        }
+    }
+
+    var action: ServerUpgradeAction {
+        switch self {
+        case .backend: .backend
+        case .sites: .sites
+        }
+    }
+}
+
+private enum ServerUpgradeAction: String, Identifiable {
+    case backend = "upgrade_django"
+    case sites = "upgrade_sites"
+    case webUI = "upgrade_webui"
+    case all = "upgrade_all"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .backend: "更新后端代码"
+        case .sites: "更新站点配置"
+        case .webUI: "更新 WEBUI"
+        case .all: "更新所有"
+        }
+    }
+}
+
+private struct ServerUpdateCommit {
+    var hash: String?
+    var message: String
+    var author: String?
+    var date: String?
+    var raw: String
+
+    init(_ json: [String: Any]) {
+        hash = serverUpdateFirstString(json, keys: ["hash", "hex", "commit", "commit_id", "sha", "id", "revision"])
+        let rawValue = serverUpdateFirstString(json, keys: ["raw", "text", "line", "data"]) ?? prettyJSON(json)
+        let parsedMessage = serverUpdateFirstString(json, keys: ["message", "msg", "subject", "title", "summary", "name", "data"])
+        message = parsedMessage?.isEmpty == false ? parsedMessage! : rawValue
+        author = serverUpdateFirstString(json, keys: ["author", "committer", "user", "username"])
+        date = serverUpdateFirstString(json, keys: ["date", "time", "datetime", "created_at", "commit_time", "timestamp"])
+        raw = rawValue
+    }
+
+    init(text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        hash = serverUpdateFirstMatch(in: trimmed, pattern: #"\b[0-9a-f]{7,40}\b"#)
+        var parsedMessage = trimmed
+        if let hash, let range = parsedMessage.range(of: hash, options: .caseInsensitive) {
+            parsedMessage.removeSubrange(range)
+            parsedMessage = parsedMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if parsedMessage.hasPrefix("-") {
+                parsedMessage.removeFirst()
+                parsedMessage = parsedMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        message = parsedMessage.isEmpty ? trimmed : parsedMessage
+        author = nil
+        date = nil
+        raw = trimmed
+    }
+
+    var shortHash: String {
+        guard let hash else { return "" }
+        return hash.count > 8 ? String(hash.prefix(8)) : hash
+    }
+}
+
+private struct ServerUpdateLogInfo {
+    let target: ServerUpdateTarget
+    var hasUpdate: Bool?
+    var behindCount: Int?
+    var branch: String?
+    var localVersion: String?
+    var remoteVersion: String?
+    var message: String?
+    var rawText: String?
+    var localLog: ServerUpdateCommit?
+    var commits: [ServerUpdateCommit]
+    var checkedAt: Date
+
+    init(target: ServerUpdateTarget, response: Any) {
+        self.target = target
+        hasUpdate = nil
+        behindCount = nil
+        branch = nil
+        localVersion = nil
+        remoteVersion = nil
+        message = nil
+        rawText = nil
+        localLog = nil
+        commits = []
+        checkedAt = Date()
+
+        guard let payload = serverUpdatePayload(response) else {
+            message = "暂无返回数据"
+            return
+        }
+        if let values = payload as? [Any] {
+            commits = serverUpdateParseCommitList(values)
+            hasUpdate = !commits.isEmpty
+            return
+        }
+        if let text = payload as? String {
+            commits = serverUpdateParseCommits(text)
+            hasUpdate = serverUpdateInferAvailability(text, commits: commits)
+            rawText = text
+            return
+        }
+        guard let json = payload as? [String: Any] else {
+            let text = String(describing: payload)
+            commits = serverUpdateParseCommits(text)
+            hasUpdate = serverUpdateInferAvailability(text, commits: commits)
+            rawText = text
+            return
+        }
+
+        localLog = serverUpdateParseSingleCommit(serverUpdateFirstValue(json, keys: ["local_logs", "localLog", "local_log"]))
+        rawText = serverUpdateFirstString(json, keys: ["raw", "text", "log_text", "output", "stdout", "result"])
+        let listValue = serverUpdateFirstValue(
+            json,
+            keys: ["update_notes", "updateNotes", "logs", "log", "commits", "commit_logs", "updates", "changes", "items", "results"]
+        )
+        commits = serverUpdateParseCommitValue(listValue)
+        if commits.isEmpty, let rawText { commits = serverUpdateParseCommits(rawText) }
+
+        let explicit = serverUpdateFirstBool(
+            json,
+            keys: ["has_update", "hasUpdate", "need_update", "needUpdate", "can_update", "canUpdate", "update", "updated"]
+        )
+        let behind = serverUpdateFirstInt(json, keys: ["behind", "behind_count", "behindCount", "count", "total"])
+        message = serverUpdateFirstString(json, keys: ["message", "msg", "detail", "summary", "status"])
+        hasUpdate = explicit ?? (behind.map { $0 > 0 } ?? serverUpdateInferAvailability(rawText ?? message, commits: commits))
+        behindCount = behind ?? (commits.isEmpty ? nil : commits.count)
+        branch = serverUpdateFirstString(json, keys: ["branch", "current_branch"])
+        localVersion = serverUpdateFirstString(
+            json,
+            keys: ["local", "local_version", "localVersion", "current", "current_version"]
+        ) ?? localLog?.hash
+        remoteVersion = serverUpdateFirstString(
+            json,
+            keys: ["remote", "remote_version", "remoteVersion", "latest", "latest_version"]
+        )
+    }
+
+    var currentCommitIndex: Int? {
+        guard let version = effectiveLocalVersion else { return nil }
+        return commits.firstIndex { $0.hash?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == version.lowercased() }
+    }
+
+    var pendingUpdateCount: Int {
+        if let currentCommitIndex { return currentCommitIndex }
+        if let behindCount { return max(0, behindCount) }
+        if hasUpdate == false { return 0 }
+        return commits.count
+    }
+
+    var needsUpdate: Bool {
+        if pendingUpdateCount > 0 { return true }
+        return hasUpdate == true && commits.isEmpty && behindCount == nil
+    }
+
+    var statusText: String {
+        if needsUpdate { return pendingUpdateCount > 0 ? "发现 \(pendingUpdateCount) 个更新" : "发现更新" }
+        if hasUpdate == false || currentCommitIndex != nil { return "已是最新" }
+        return "状态未知"
+    }
+
+    var detailText: String {
+        var values: [String] = []
+        if let branch, !branch.isEmpty { values.append(branch) }
+        if let effectiveLocalVersion { values.append("本地 \(effectiveLocalVersion)") }
+        if let remoteVersion, !remoteVersion.isEmpty { values.append("远端 \(remoteVersion)") }
+        if !values.isEmpty { return values.joined(separator: " · ") }
+        if let message, !message.isEmpty { return message }
+        if let rawText, !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, commits.isEmpty { return rawText }
+        return "最近检查 \(checkedAt.formatted(date: .omitted, time: .shortened))"
+    }
+
+    private var effectiveLocalVersion: String? {
+        let local = localVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !local.isEmpty { return local }
+        let fallback = localLog?.hash?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return fallback.isEmpty ? nil : fallback
+    }
+}
+
+private struct ServerUpdateFetchResult {
+    let target: ServerUpdateTarget
+    let info: ServerUpdateLogInfo?
+    let error: String?
+}
+
+@MainActor
+private final class ServerUpdateViewModel: ObservableObject {
+    @Published private(set) var backend: ServerUpdateLogInfo?
+    @Published private(set) var sites: ServerUpdateLogInfo?
+    @Published private(set) var loadingTargets = Set<ServerUpdateTarget>()
+    @Published private(set) var updatingAction: ServerUpgradeAction?
+    @Published var errorMessage = ""
+    @Published var resultMessage = ""
+
+    var isLoading: Bool { !loadingTargets.isEmpty }
+    var hasAnyUpdate: Bool { [backend, sites].compactMap { $0 }.contains(where: \.needsUpdate) }
+    var updateCount: Int { [backend, sites].compactMap { $0 }.reduce(0) { $0 + $1.pendingUpdateCount } }
+    var allLatest: Bool {
+        guard let backend, let sites else { return false }
+        return !backend.needsUpdate && !sites.needsUpdate && backend.hasUpdate == false && sites.hasUpdate == false
+    }
+
+    func info(for target: ServerUpdateTarget) -> ServerUpdateLogInfo? {
+        switch target {
+        case .backend: backend
+        case .sites: sites
+        }
+    }
+
+    func load(_ appState: AppState) async {
+        loadingTargets = Set(ServerUpdateTarget.allCases)
+        errorMessage = ""
+        async let backendResult = fetch(.backend, appState: appState)
+        async let sitesResult = fetch(.sites, appState: appState)
+        let fetched = await (backendResult, sitesResult)
+        let results = [fetched.0, fetched.1]
+        loadingTargets.removeAll()
+        for result in results { apply(result) }
+        errorMessage = results.compactMap(\.error).joined(separator: "\n")
+    }
+
+    func refresh(_ target: ServerUpdateTarget, appState: AppState) async {
+        loadingTargets.insert(target)
+        let result = await fetch(target, appState: appState)
+        loadingTargets.remove(target)
+        apply(result)
+        if let error = result.error { errorMessage = error }
+        else { errorMessage = "" }
+    }
+
+    func run(_ action: ServerUpgradeAction, appState: AppState) async -> Bool {
+        guard updatingAction == nil else { return false }
+        updatingAction = action
+        errorMessage = ""
+        resultMessage = ""
+        defer { updatingAction = nil }
+        do {
+            let raw = try await appState.api(APIPath.programUpdate, query: ["upgrade_tag": action.rawValue])
+            resultMessage = serverUpdateCommandMessage(raw)
+            switch action {
+            case .backend:
+                await refresh(.backend, appState: appState)
+            case .sites:
+                await refresh(.sites, appState: appState)
+            case .webUI, .all:
+                await load(appState)
+            }
+            return true
+        } catch {
+            errorMessage = error.localizedDescription
+            appState.presentedError = error.localizedDescription
+            return false
+        }
+    }
+
+    private func fetch(_ target: ServerUpdateTarget, appState: AppState) async -> ServerUpdateFetchResult {
+        do {
+            let raw = try await appState.api(target.endpoint)
+            return ServerUpdateFetchResult(target: target, info: ServerUpdateLogInfo(target: target, response: raw), error: nil)
+        } catch {
+            recordAppLog(.warning, "读取\(target.title)更新日志失败：\(error.localizedDescription)")
+            return ServerUpdateFetchResult(target: target, info: nil, error: "\(target.title)更新日志获取失败")
+        }
+    }
+
+    private func apply(_ result: ServerUpdateFetchResult) {
+        guard let info = result.info else { return }
+        switch result.target {
+        case .backend: backend = info
+        case .sites: sites = info
+        }
+    }
+}
+
+private struct ServerUpdateTargetRows: View {
+    let target: ServerUpdateTarget
+    let info: ServerUpdateLogInfo?
+    let isLoading: Bool
+    let anyUpdating: Bool
+    let isUpdating: Bool
+    let onRefresh: () -> Void
+    let onUpdate: () -> Void
+
+    var body: some View {
+        if let info {
+            HStack(spacing: 10) {
+                Label(target.title, systemImage: target.icon)
+                Spacer()
+                StatusPill(
+                    label: info.statusText,
+                    color: info.needsUpdate ? HarvestTheme.coral : info.hasUpdate == false ? HarvestTheme.green : .secondary
+                )
+            }
+            Text(info.detailText).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            if !info.commits.isEmpty {
+                let visible = Array(info.commits.prefix(12))
+                ForEach(Array(visible.enumerated()), id: \.offset) { index, commit in
+                    ServerUpdateCommitRow(
+                        commit: commit,
+                        pending: info.currentCommitIndex.map { index < $0 } ?? info.needsUpdate,
+                        current: info.currentCommitIndex == index
+                    )
+                }
+                if info.commits.count > visible.count {
+                    Text("还有 \(info.commits.count - visible.count) 条远端记录")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else if let rawText = info.rawText, !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                DisclosureGroup("原始更新日志") {
+                    Text(rawText).font(.caption.monospaced()).textSelection(.enabled)
+                }
+            } else {
+                Text("暂无更新记录").font(.caption).foregroundStyle(.secondary)
+            }
+        } else if isLoading {
+            HStack { ProgressView(); Text("正在获取\(target.title)更新日志").foregroundStyle(.secondary) }
+        } else {
+            ContentUnavailableView("未获取更新状态", systemImage: target.icon)
+        }
+
+        HStack(spacing: 12) {
+            Button(action: onRefresh) { Label("检查", systemImage: "arrow.clockwise") }
+                .disabled(isLoading || anyUpdating)
+            Spacer()
+            Button(action: onUpdate) {
+                if isUpdating { ProgressView() }
+                else { Label(info?.needsUpdate == true ? "更新" : "重装", systemImage: "arrow.down.circle") }
+            }
+            .disabled(info == nil || isLoading || anyUpdating)
+        }
+    }
+}
+
+private struct ServerUpdateCommitRow: View {
+    let commit: ServerUpdateCommit
+    let pending: Bool
+    let current: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: current ? "checkmark.circle.fill" : pending ? "arrow.down.circle.fill" : "circle.fill")
+                .font(.caption)
+                .foregroundStyle(current ? HarvestTheme.green : pending ? HarvestTheme.coral : Color.secondary.opacity(0.45))
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    if current { Text("当前").font(.caption2.weight(.semibold)).foregroundStyle(HarvestTheme.green) }
+                    if !commit.shortHash.isEmpty { Text(commit.shortHash).font(.caption2.monospaced()).foregroundStyle(.secondary) }
+                    if let date = commit.date, !date.isEmpty { Text(date).font(.caption2).foregroundStyle(.tertiary).lineLimit(1) }
+                }
+                Text(markdownAttributedString(commit.message))
+                    .font(.caption)
+                    .lineLimit(4)
+                    .textSelection(.enabled)
+                if let author = commit.author, !author.isEmpty {
+                    Text(author).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct UpdateMaintenanceView: View {
+    @EnvironmentObject private var appState: AppState
+    @StateObject private var serverUpdater = ServerUpdateViewModel()
+    @StateObject private var appUpdater = AppUpdateViewModel()
+    @State private var selectedUpgrade: ServerUpgradeAction?
+    @State private var networkMessage = ""
+    @State private var isSpeedTesting = false
+
+    var body: some View {
+        Form {
+            Section("程序更新") {
+                HStack {
+                    Label("更新状态", systemImage: serverUpdater.hasAnyUpdate ? "exclamationmark.circle.fill" : "checkmark.circle")
+                    Spacer()
+                    Text(serverUpdateSummary).font(.caption).foregroundStyle(.secondary)
+                }
+                if !serverUpdater.errorMessage.isEmpty {
+                    Label(serverUpdater.errorMessage, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(HarvestTheme.coral)
+                }
+                if !serverUpdater.resultMessage.isEmpty {
+                    Text(markdownAttributedString(serverUpdater.resultMessage)).font(.caption).textSelection(.enabled)
+                }
+            }
+
+            ForEach(ServerUpdateTarget.allCases) { target in
+                Section(target.title) {
+                    ServerUpdateTargetRows(
+                        target: target,
+                        info: serverUpdater.info(for: target),
+                        isLoading: serverUpdater.loadingTargets.contains(target),
+                        anyUpdating: serverUpdater.updatingAction != nil,
+                        isUpdating: serverUpdater.updatingAction == target.action,
+                        onRefresh: { Task { await serverUpdater.refresh(target, appState: appState) } },
+                        onUpdate: { selectedUpgrade = target.action }
+                    )
+                }
+            }
+
+            Section("批量操作") {
+                Button { selectedUpgrade = .webUI } label: { Label("更新 WEBUI", systemImage: "globe") }
+                    .disabled(serverUpdater.updatingAction != nil)
+                Button { selectedUpgrade = .all } label: { Label("更新所有", systemImage: "arrow.triangle.2.circlepath") }
+                    .disabled(serverUpdater.updatingAction != nil)
+            }
+
+            Section("网络") {
+                Button { Task { await speedTest() } } label: {
+                    if isSpeedTesting { HStack { ProgressView(); Text("正在执行网络测速") } }
+                    else { Label("执行网络测速", systemImage: "gauge.with.dots.needle.67percent") }
+                }
+                .disabled(isSpeedTesting || serverUpdater.updatingAction != nil)
+                if !networkMessage.isEmpty { Text(networkMessage).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+            }
+
+            AppUpdateLatestSection(model: appUpdater)
+            AppUpdateOptionsSection(model: appUpdater)
+            AppUpdateHistorySection(model: appUpdater)
+        }
+        .navigationTitle("更新与网络")
+        .navigationBarTitleDisplayMode(.inline)
+        .refreshable { await load() }
+        .task { await load() }
+        .onDisappear { appUpdater.cancelDownload() }
+        .sheet(item: $appUpdater.completedPackage) { package in ActivityShareSheet(items: [package.url]) }
+        .confirmationDialog(
+            selectedUpgrade?.label ?? "执行更新",
+            isPresented: Binding(
+                get: { selectedUpgrade != nil },
+                set: { if !$0 { selectedUpgrade = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("确认执行") {
+                guard let action = selectedUpgrade else { return }
+                selectedUpgrade = nil
+                Task { _ = await serverUpdater.run(action, appState: appState) }
+            }
+            Button("取消", role: .cancel) { selectedUpgrade = nil }
+        } message: {
+            Text("将调用后端升级接口执行 \(selectedUpgrade?.rawValue ?? "")。升级过程中服务可能会短暂不可用。")
+        }
+    }
+
+    private var serverUpdateSummary: String {
+        if serverUpdater.hasAnyUpdate {
+            return serverUpdater.updateCount > 0 ? "\(serverUpdater.updateCount) 条待更新" : "发现可用更新"
+        }
+        if serverUpdater.isLoading { return "正在检查" }
+        if serverUpdater.allLatest { return "全部最新" }
+        return "状态未知"
+    }
+
+    @MainActor private func load() async {
+        async let serverLoad: Void = serverUpdater.load(appState)
+        async let appLoad: Void = appUpdater.load(appState)
+        _ = await (serverLoad, appLoad)
+    }
+
+    @MainActor private func speedTest() async {
+        isSpeedTesting = true
+        defer { isSpeedTesting = false }
+        do {
+            let raw = try await appState.api(APIPath.speedTest)
+            networkMessage = jsonMessage(raw) ?? "测速任务已提交"
+        } catch { appState.presentedError = error.localizedDescription }
+    }
+}
+
+private func serverUpdatePayload(_ value: Any) -> Any? {
+    if value is NSNull { return nil }
+    guard let dictionary = value as? [String: Any] else { return value }
+    let isEnvelope = dictionary["code"] != nil || dictionary["succeed"] != nil || dictionary["success"] != nil
+    guard isEnvelope else { return value }
+    for key in ["data", "result"] {
+        if let nested = dictionary[key], !(nested is NSNull) { return nested }
+    }
+    return value
+}
+
+private func serverUpdateFirstValue(_ json: [String: Any], keys: [String]) -> Any? {
+    for key in keys where json[key] != nil { return json[key] }
+    return nil
+}
+
+private func serverUpdateFirstString(_ json: [String: Any], keys: [String]) -> String? {
+    for key in keys {
+        if let value = json[key] as? String {
+            let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        } else if let value = json[key] as? NSNumber {
+            return value.stringValue
+        }
+    }
+    return nil
+}
+
+private func serverUpdateFirstBool(_ json: [String: Any], keys: [String]) -> Bool? {
+    for key in keys {
+        if let value = json[key] as? Bool { return value }
+        if let value = json[key] as? NSNumber { return value.boolValue }
+        if let value = json[key] as? String {
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes", "y": return true
+            case "false", "0", "no", "n": return false
+            default: continue
+            }
+        }
+    }
+    return nil
+}
+
+private func serverUpdateFirstInt(_ json: [String: Any], keys: [String]) -> Int? {
+    for key in keys {
+        if let value = json[key] as? Int { return value }
+        if let value = json[key] as? NSNumber { return value.intValue }
+        if let value = json[key] as? String, let number = Int(value.trimmingCharacters(in: .whitespacesAndNewlines)) { return number }
+    }
+    return nil
+}
+
+private func serverUpdateParseCommitValue(_ value: Any?) -> [ServerUpdateCommit] {
+    guard let value, !(value is NSNull) else { return [] }
+    if let values = value as? [Any] { return serverUpdateParseCommitList(values) }
+    if let text = value as? String { return serverUpdateParseCommits(text) }
+    if let dictionary = value as? [String: Any] {
+        if serverUpdateIsCommitMap(dictionary) { return [ServerUpdateCommit(dictionary)] }
+        return serverUpdateParseCommitList(Array(dictionary.values))
+    }
+    return [ServerUpdateCommit(text: String(describing: value))]
+}
+
+private func serverUpdateParseSingleCommit(_ value: Any?) -> ServerUpdateCommit? {
+    if let dictionary = value as? [String: Any] { return ServerUpdateCommit(dictionary) }
+    if let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return ServerUpdateCommit(text: text)
+    }
+    return nil
+}
+
+private func serverUpdateIsCommitMap(_ json: [String: Any]) -> Bool {
+    ["hex", "hash", "commit", "sha", "data", "message"].contains { json[$0] != nil }
+}
+
+private func serverUpdateParseCommitList(_ values: [Any]) -> [ServerUpdateCommit] {
+    values.compactMap { value in
+        let commit: ServerUpdateCommit
+        if let dictionary = value as? [String: Any] { commit = ServerUpdateCommit(dictionary) }
+        else { commit = ServerUpdateCommit(text: String(describing: value)) }
+        guard !commit.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !serverUpdateLooksCurrent(commit.message) else { return nil }
+        return commit
+    }
+}
+
+private func serverUpdateParseCommits(_ text: String) -> [ServerUpdateCommit] {
+    let pattern = #"(?ms)^commit\s+([0-9a-f]{7,40})(.*?)(?=^commit\s+[0-9a-f]{7,40}|\z)"#
+    if let expression = try? NSRegularExpression(pattern: pattern),
+       !expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).isEmpty {
+        return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+            guard let fullRange = Range(match.range(at: 0), in: text),
+                  let hashRange = Range(match.range(at: 1), in: text),
+                  let bodyRange = Range(match.range(at: 2), in: text) else { return nil }
+            let raw = String(text[fullRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = String(text[bodyRange])
+            let message = body.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty && !$0.hasPrefix("Author:") && !$0.hasPrefix("Date:") } ?? raw
+            var commit = ServerUpdateCommit(text: message)
+            commit.hash = String(text[hashRange])
+            commit.author = serverUpdateFirstMatch(in: body, pattern: #"(?m)^Author:\s*(.+)$"#, capture: 1)
+            commit.date = serverUpdateFirstMatch(in: body, pattern: #"(?m)^Date:\s*(.+)$"#, capture: 1)
+            commit.raw = raw
+            return commit
+        }
+    }
+    return text.components(separatedBy: .newlines)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty && !serverUpdateLooksCurrent($0) }
+        .map { ServerUpdateCommit(text: $0) }
+}
+
+private func serverUpdateFirstMatch(in text: String, pattern: String, capture: Int = 0) -> String? {
+    guard let expression = try? NSRegularExpression(pattern: pattern),
+          let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+          match.numberOfRanges > capture,
+          let range = Range(match.range(at: capture), in: text) else { return nil }
+    let value = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+    return value.isEmpty ? nil : value
+}
+
+private func serverUpdateInferAvailability(_ text: String?, commits: [ServerUpdateCommit]) -> Bool? {
+    if !commits.isEmpty { return true }
+    guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+    if serverUpdateLooksCurrent(text) { return false }
+    return serverUpdateFirstMatch(in: text, pattern: #"\b[0-9a-f]{7,40}\b"#) == nil ? nil : true
+}
+
+private func serverUpdateLooksCurrent(_ text: String) -> Bool {
+    let lower = text.lowercased()
+    return lower.contains("already up to date") || lower.contains("already up-to-date")
+        || lower.contains("up to date") || lower.contains("no update") || lower.contains("no updates")
+        || text.contains("暂无更新") || text.contains("无更新") || text.contains("已是最新") || text.contains("已经是最新")
+}
+
+private func serverUpdateCommandMessage(_ value: Any) -> String {
+    let payload = serverUpdatePayload(value)
+    if let text = payload as? String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "升级命令已执行" : trimmed
+    }
+    if let dictionary = payload as? [String: Any] {
+        return serverUpdateFirstString(
+            dictionary,
+            keys: ["message", "msg", "detail", "summary", "output", "stdout", "result"]
+        ) ?? "升级命令已执行"
+    }
+    return payload.map { String(describing: $0) } ?? "升级命令已执行"
+}
+
+fileprivate enum BackendOptionFieldKind {
+    case text
+    case multiline
+    case integer
+    case toggle
+}
+
+fileprivate struct BackendOptionFieldDefinition: Identifiable {
+    let key: String
+    let label: String
+    let kind: BackendOptionFieldKind
+    let defaultValue: Any
+    var sensitive = false
+    var readOnly = false
+    var help: String?
+    var id: String { key }
+
+    static func text(
+        _ key: String,
+        _ label: String,
+        defaultValue: String = "",
+        multiline: Bool = false,
+        sensitive: Bool = false,
+        readOnly: Bool = false,
+        help: String? = nil
+    ) -> Self {
+        .init(
+            key: key,
+            label: label,
+            kind: multiline ? .multiline : .text,
+            defaultValue: defaultValue,
+            sensitive: sensitive,
+            readOnly: readOnly,
+            help: help
+        )
+    }
+
+    static func integer(_ key: String, _ label: String, defaultValue: Int, help: String? = nil) -> Self {
+        .init(key: key, label: label, kind: .integer, defaultValue: defaultValue, help: help)
+    }
+
+    static func toggle(_ key: String, _ label: String, defaultValue: Bool) -> Self {
+        .init(key: key, label: label, kind: .toggle, defaultValue: defaultValue)
+    }
+}
+
+fileprivate struct BackendOptionDefinition: Identifiable {
+    let name: String
+    let title: String
+    let icon: String
+    let fields: [BackendOptionFieldDefinition]
+    var additionalDefaults: [String: Any] = [:]
+    var readOnly = false
+    var id: String { name }
+
+    var initialValue: [String: Any] {
+        var result = additionalDefaults
+        for field in fields { result[field.key] = field.defaultValue }
+        return result
+    }
+}
+
+private let backendOptionDefinitions: [BackendOptionDefinition] = [
+    .init(name: "monkey_token", title: "安全 Token", icon: "key", fields: [
+        .text("token", "令牌", sensitive: true)
+    ]),
+    .init(name: "wechat_work_push", title: "企业微信", icon: "message", fields: [
+        .text("corp_id", "企业 ID"),
+        .text("corpsecret", "企业密钥", sensitive: true),
+        .text("agent_id", "应用 ID"),
+        .text("to_uid", "接收 ID"),
+        .text("refresh_token", "EncodingAESKey", sensitive: true),
+        .text("token", "Token", sensitive: true),
+        .text("server", "背景图地址"),
+        .text("proxy", "固定代理")
+    ]),
+    .init(name: "wechat_bot_push", title: "微信机器人", icon: "ellipsis.message", fields: [
+        .text("token", "IM BOT Token", readOnly: true, help: "由微信机器人扫码登录同步"),
+        .text("to_uid", "IM BOT User ID", readOnly: true, help: "由微信机器人扫码登录同步")
+    ], readOnly: true),
+    .init(name: "qqbot_push", title: "QQ 机器人", icon: "message.badge", fields: [
+        .text("app_id", "机器人 App ID"),
+        .text("secret_key", "机器人 Secret", sensitive: true),
+        .text("uids", "接收 UIDs", multiline: true, help: "多个 UID 可用逗号或换行分隔")
+    ]),
+    .init(name: "wxpusher_push", title: "WxPusher", icon: "paperplane", fields: [
+        .text("app_id", "应用 ID"), .text("token", "令牌", sensitive: true), .text("uids", "接收人", multiline: true)
+    ]),
+    .init(name: "pushdeer_push", title: "PushDeer", icon: "paperplane", fields: [
+        .text("key", "Key", sensitive: true), .text("proxy", "服务器")
+    ]),
+    .init(name: "bark_push", title: "Bark", icon: "bell", fields: [
+        .text("device_key", "设备 ID", sensitive: true), .text("server", "服务器")
+    ]),
+    .init(name: "iyuu_push", title: "爱语飞飞", icon: "heart", fields: [
+        .text("token", "令牌", sensitive: true), .toggle("repeat", "辅种开关", defaultValue: false)
+    ]),
+    .init(name: "meow_push", title: "喵呜通知", icon: "bell", fields: [
+        .text("token", "喵呜令牌", sensitive: true),
+        .integer("max_count", "HTML 高度", defaultValue: 200),
+        .text("server", "服务器")
+    ]),
+    .init(name: "server_chan_push", title: "Server 酱", icon: "bell", fields: [
+        .text("token", "SendKey", sensitive: true),
+        .text("app_id", "OpenId"),
+        .text("server", "消息通道"),
+        .integer("count", "隐藏调用 IP", defaultValue: 1)
+    ]),
+    .init(name: "pushplus_push", title: "PushPlus", icon: "paperplane", fields: [
+        .text("token", "令牌", sensitive: true)
+    ], additionalDefaults: ["template": "markdown"]),
+    .init(name: "telegram_push", title: "Telegram 配置", icon: "paperplane", fields: [
+        .text("telegram_chat_id", "ID"),
+        .text("telegram_token", "令牌", sensitive: true),
+        .text("proxy", "代理")
+    ]),
+    .init(name: "aliyun_drive", title: "阿里云盘", icon: "externaldrive", fields: [
+        .text("refresh_token", "保存令牌", multiline: true, sensitive: true),
+        .toggle("welfare", "领取福利", defaultValue: true)
+    ]),
+    .init(name: "baidu_ocr", title: "百度 OCR", icon: "viewfinder", fields: [
+        .text("app_id", "应用 ID"),
+        .text("api_key", "APIKey", sensitive: true),
+        .text("secret_key", "Secret", sensitive: true)
+    ]),
+    .init(name: "ssdforum", title: "SSDForum", icon: "globe", fields: [
+        .text("cookie", "Cookie", multiline: true, sensitive: true),
+        .text("user_agent", "User-Agent", multiline: true),
+        .text("todaysay", "今天想说", multiline: true)
+    ]),
+    .init(name: "cookie_cloud", title: "CookieCloud", icon: "cloud", fields: [
+        .text("server", "服务器"), .text("key", "Key", sensitive: true), .text("password", "密码", sensitive: true)
+    ]),
+    .init(name: "FileList", title: "FileList", icon: "doc", fields: [
+        .text("username", "账号"), .text("password", "密码", sensitive: true)
+    ]),
+    .init(name: "tmdb_api_auth", title: "影视 Token 配置", icon: "film", fields: [
+        .text("api_key", "TMDB 密钥", sensitive: true),
+        .text("secret_key", "豆瓣 Cookie", multiline: true, sensitive: true),
+        .text("proxy", "代理地址")
+    ]),
+    .init(name: "aggregation_search", title: "聚合搜索配置", icon: "magnifyingglass", fields: [
+        .integer("max_count", "站点数量限制", defaultValue: 30, help: "单次搜索的站点数量，0 表示不限制"),
+        .integer("limit", "并发数量限制", defaultValue: 30, help: "并发搜索站点数量，0 表示不限制")
+    ]),
+    .init(name: "notice_category_enable", title: "通知开关", icon: "bell.badge", fields: [
+        .toggle("aliyundrive_notice", "阿里云盘", defaultValue: true),
+        .toggle("site_data", "站点数据", defaultValue: true),
+        .toggle("site_data_success", "成功站点消息", defaultValue: true),
+        .toggle("today_data", "今日数据", defaultValue: true),
+        .toggle("package_torrent", "拆包", defaultValue: true),
+        .toggle("delete_torrent", "删种", defaultValue: true),
+        .toggle("rss_torrent", "RSS", defaultValue: true),
+        .toggle("push_torrent", "种子推送", defaultValue: true),
+        .toggle("program_upgrade", "Docker 升级", defaultValue: true),
+        .toggle("ptpp_import", "PTPP 导入", defaultValue: true),
+        .toggle("announcement", "公告详情", defaultValue: true),
+        .toggle("message", "短消息详情", defaultValue: true),
+        .toggle("sign_in_success", "签到成功消息", defaultValue: true),
+        .toggle("cookie_sync", "CookieCloud 同步", defaultValue: true)
+    ]),
+    .init(name: "notice_content_item", title: "站点详情", icon: "list.bullet.rectangle", fields: [
+        .toggle("level", "等级", defaultValue: true),
+        .toggle("bonus", "魔力", defaultValue: true),
+        .toggle("per_bonus", "时魔", defaultValue: true),
+        .toggle("score", "积分", defaultValue: true),
+        .toggle("ratio", "分享率", defaultValue: true),
+        .toggle("seeding_vol", "做种体积", defaultValue: true),
+        .toggle("uploaded", "上传量", defaultValue: true),
+        .toggle("downloaded", "下载量", defaultValue: true),
+        .toggle("seeding", "做种数量", defaultValue: true),
+        .toggle("leeching", "吸血数量", defaultValue: true),
+        .toggle("invite", "邀请", defaultValue: true),
+        .toggle("hr", "HR", defaultValue: true)
+    ]),
+    .init(name: "auto_import_tags", title: "自动添加标签", icon: "tag", fields: [
+        .toggle("repeat", "自动添加标签", defaultValue: false)
+    ])
+]
+
+private let backendOptionDefinitionsByName = Dictionary(uniqueKeysWithValues: backendOptionDefinitions.map { ($0.name, $0) })
+
 struct BackendOption: Identifiable {
-    let id: Int
+    let serverID: Int?
     var name: String
     var value: [String: Any]
     var active: Bool
+    var id: String { serverID.map { "server-\($0)" } ?? "catalog-\(name)" }
+    fileprivate var definition: BackendOptionDefinition? { backendOptionDefinitionsByName[name] }
+    var displayName: String { definition?.title ?? name }
+    var icon: String { definition?.icon ?? "switch.2" }
+    var isReadOnly: Bool { definition?.readOnly == true }
 
     init(_ json: [String: Any]) {
-        id = json.int("id") ?? abs((json.string("name") ?? UUID().uuidString).hashValue)
+        serverID = json.int("id")
         name = json.string("name") ?? "未命名配置"
-        value = json.dict("value") ?? [:]
+        var mergedValue = backendOptionDefinitionsByName[name]?.initialValue ?? [:]
+        for (key, item) in json.dict("value") ?? [:] { mergedValue[key] = item }
+        value = mergedValue
         active = json.bool("is_active", "active") ?? true
+    }
+
+    fileprivate init(definition: BackendOptionDefinition) {
+        serverID = nil
+        name = definition.name
+        value = definition.initialValue
+        active = true
     }
 }
 
@@ -271,13 +2273,27 @@ final class BackendOptionsViewModel: ObservableObject {
 
     func load(_ appState: AppState) async {
         defer { isLoading = false }
-        do { options = jsonRows(try await appState.api(APIPath.options)).map(BackendOption.init) }
+        do {
+            var loaded = jsonRows(try await appState.api(APIPath.options)).map(BackendOption.init)
+            var merged: [BackendOption] = []
+            for definition in backendOptionDefinitions {
+                if let index = loaded.firstIndex(where: { $0.name == definition.name }) {
+                    merged.append(loaded.remove(at: index))
+                } else {
+                    merged.append(BackendOption(definition: definition))
+                }
+            }
+            merged.append(contentsOf: loaded.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending })
+            options = merged
+        }
         catch { appState.presentedError = error.localizedDescription }
     }
 
     func save(_ appState: AppState, option: BackendOption) async -> Bool {
-        let body: [String: Any] = ["id": option.id, "name": option.name, "value": option.value, "is_active": option.active]
-        let saved = await appState.perform("\(APIPath.options)/\(option.id)", method: .put, body: body)
+        var body: [String: Any] = ["name": option.name, "value": option.value, "is_active": option.active]
+        if let serverID = option.serverID { body["id"] = serverID }
+        let path = option.serverID.map { "\(APIPath.options)/\($0)" } ?? APIPath.options
+        let saved = await appState.perform(path, method: option.serverID == nil ? .post : .put, body: body)
         if saved { await load(appState) }
         return saved
     }
@@ -296,13 +2312,20 @@ struct BackendOptionsView: View {
                 List(model.options) { option in
                     Button { selected = option } label: {
                         HStack(spacing: 12) {
-                            RoundedRectangle(cornerRadius: 8).fill(option.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 40, height: 40).overlay(Image(systemName: "switch.2").foregroundStyle(option.active ? HarvestTheme.green : .secondary))
-                            VStack(alignment: .leading, spacing: 4) { Text(option.name).font(.headline).foregroundStyle(.primary); Text("\(option.value.count) 个参数").font(.caption).foregroundStyle(.secondary) }
+                            RoundedRectangle(cornerRadius: 8).fill(option.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 40, height: 40).overlay(Image(systemName: option.icon).foregroundStyle(option.active ? HarvestTheme.green : .secondary))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(option.displayName).font(.headline).foregroundStyle(.primary)
+                                Text(option.serverID == nil ? "尚未创建" : "\(option.value.count) 个参数").font(.caption).foregroundStyle(.secondary)
+                            }
                             Spacer()
-                            StatusPill(label: option.active ? "启用" : "停用", color: option.active ? HarvestTheme.green : .secondary)
+                            StatusPill(label: option.serverID == nil ? "新增" : option.active ? "启用" : "停用", color: option.serverID == nil ? HarvestTheme.amber : option.active ? HarvestTheme.green : .secondary)
                         }
                     }.buttonStyle(.plain)
-                    .swipeActions(edge: .leading) { Button { Task { var updated = option; updated.active.toggle(); _ = await model.save(appState, option: updated) } } label: { Label(option.active ? "停用" : "启用", systemImage: option.active ? "pause" : "play") }.tint(HarvestTheme.amber) }
+                    .swipeActions(edge: .leading) {
+                        if option.serverID != nil && !option.isReadOnly {
+                            Button { Task { var updated = option; updated.active.toggle(); _ = await model.save(appState, option: updated) } } label: { Label(option.active ? "停用" : "启用", systemImage: option.active ? "pause" : "play") }.tint(HarvestTheme.amber)
+                        }
+                    }
                 }.listStyle(.plain).refreshable { await model.load(appState) }
             }
         }
@@ -316,48 +2339,235 @@ struct OptionEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
     let option: BackendOption
     let save: (BackendOption) async -> Bool
-    @State private var jsonText = ""
+    @State private var editedValue: [String: Any]
     @State private var active: Bool
-    @State private var parseError: String?
     @State private var isSaving = false
+    @State private var showRawEditor = false
 
     init(option: BackendOption, save: @escaping (BackendOption) async -> Bool) {
         self.option = option
         self.save = save
         _active = State(initialValue: option.active)
-        let data = try? JSONSerialization.data(withJSONObject: option.value, options: [.prettyPrinted, .sortedKeys])
-        _jsonText = State(initialValue: data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+        _editedValue = State(initialValue: option.value)
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("状态") { Toggle("启用 \(option.name)", isOn: $active) }
-                Section("配置 JSON") {
-                    TextEditor(text: $jsonText).font(.system(.caption, design: .monospaced)).frame(minHeight: 280).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    if let parseError { Label(parseError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(HarvestTheme.coral) }
+                Section("状态") { Toggle("启用 \(option.displayName)", isOn: $active) }
+                Section("配置") {
+                    ForEach(orderedKeys, id: \.self) { key in
+                        BackendOptionValueField(
+                            definition: option.definition?.fields.first { $0.key == key },
+                            fallbackKey: key,
+                            value: valueBinding(for: key)
+                        )
+                    }
+                    if editedValue.isEmpty {
+                        Text("当前配置没有参数").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if option.name == "monkey_token" {
+                    Section("Token 工具") {
+                        Button { makeRandomToken() } label: { Label("生成随机 Token", systemImage: "dice") }
+                        Button { UIPasteboard.general.string = editedValue["token"] as? String ?? "" } label: { Label("复制 Token", systemImage: "doc.on.doc") }
+                            .disabled((editedValue["token"] as? String ?? "").isEmpty)
+                    }
+                }
+                if !option.isReadOnly {
+                    Section("高级") {
+                        Button { showRawEditor = true } label: { Label("编辑完整 JSON", systemImage: "curlybraces") }
+                        Text("未知字段和嵌套值可在完整 JSON 中编辑，保存时会原样提交。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
-            .navigationTitle(option.name).navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(option.displayName).navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("保存") { Task { await persist() } }.disabled(isSaving) }
+                ToolbarItem(placement: .confirmationAction) {
+                    if option.isReadOnly {
+                        Button("完成") { dismiss() }
+                    } else {
+                        Button("保存") { Task { await persist() } }.disabled(isSaving)
+                    }
+                }
+            }
+            .disabled(isSaving)
+            .overlay { if isSaving { ProgressView().controlSize(.large) } }
+            .sheet(isPresented: $showRawEditor) {
+                BackendOptionJSONEditor(value: editedValue) { editedValue = $0 }
             }
         }
     }
 
+    private var orderedKeys: [String] {
+        let known = option.definition?.fields.map(\.key) ?? []
+        return known + editedValue.keys.filter { !known.contains($0) }.sorted()
+    }
+
+    private func valueBinding(for key: String) -> Binding<Any> {
+        Binding(
+            get: { editedValue[key] ?? NSNull() },
+            set: { editedValue[key] = $0 }
+        )
+    }
+
+    private func makeRandomToken() {
+        let characters = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        editedValue["token"] = String((0..<8).compactMap { _ in characters.randomElement() })
+    }
+
     private func persist() async {
-        guard let data = jsonText.data(using: .utf8) else { return }
+        isSaving = true
+        var updated = option
+        updated.value = editedValue
+        updated.active = active
+        if await save(updated) { dismiss() }
+        isSaving = false
+    }
+}
+
+private struct BackendOptionValueField: View {
+    let definition: BackendOptionFieldDefinition?
+    let fallbackKey: String
+    @Binding var value: Any
+    @State private var revealSensitive = false
+
+    private var label: String { definition?.label ?? fallbackKey }
+    private var readOnly: Bool { definition?.readOnly == true }
+    private var kind: BackendOptionFieldKind? {
+        if let definition { return definition.kind }
+        if value is Bool { return .toggle }
+        if value is Int { return .integer }
+        if value is String { return .text }
+        return nil
+    }
+
+    var body: some View {
+        switch kind {
+        case .toggle:
+            Toggle(label, isOn: Binding(get: { value as? Bool ?? false }, set: { value = $0 }))
+                .disabled(readOnly)
+        case .integer:
+            BackendOptionIntegerField(label: label, value: $value, readOnly: readOnly, help: definition?.help)
+        case .multiline:
+            textField(multiline: true)
+        case .text:
+            textField(multiline: false)
+        case nil:
+            VStack(alignment: .leading, spacing: 4) {
+                Text(label).font(.caption).foregroundStyle(.secondary)
+                Text(prettyJSON(value)).font(.caption.monospaced()).lineLimit(4).textSelection(.enabled)
+            }
+        }
+    }
+
+    @ViewBuilder private func textField(multiline: Bool) -> some View {
+        let text = Binding<String>(get: { value as? String ?? String(describing: value) }, set: { value = $0 })
+        VStack(alignment: .leading, spacing: 5) {
+            if definition?.sensitive == true && !revealSensitive {
+                HStack {
+                    SecureField(label, text: text)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    Button { revealSensitive = true } label: { Image(systemName: "eye") }
+                        .buttonStyle(.plain).accessibilityLabel("显示 \(label)")
+                }
+            } else {
+                HStack(alignment: multiline ? .top : .center) {
+                    TextField(label, text: text, axis: multiline ? .vertical : .horizontal)
+                        .lineLimit(multiline ? 3...8 : 1...1)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    if definition?.sensitive == true {
+                        Button { revealSensitive = false } label: { Image(systemName: "eye.slash") }
+                            .buttonStyle(.plain).accessibilityLabel("隐藏 \(label)")
+                    }
+                }
+            }
+            if let help = definition?.help { Text(help).font(.caption2).foregroundStyle(.secondary) }
+        }
+        .disabled(readOnly)
+    }
+}
+
+private struct BackendOptionIntegerField: View {
+    let label: String
+    @Binding var value: Any
+    let readOnly: Bool
+    let help: String?
+    @State private var text: String
+
+    init(label: String, value: Binding<Any>, readOnly: Bool, help: String?) {
+        self.label = label
+        _value = value
+        self.readOnly = readOnly
+        self.help = help
+        let initial = (value.wrappedValue as? NSNumber)?.stringValue ?? String(describing: value.wrappedValue)
+        _text = State(initialValue: initial)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            TextField(label, text: $text)
+                .keyboardType(.numbersAndPunctuation)
+                .disabled(readOnly)
+                .onChange(of: text) { _, newValue in if let number = Int(newValue) { value = number } }
+            if !text.isEmpty && Int(text) == nil {
+                Text("请输入整数").font(.caption2).foregroundStyle(HarvestTheme.coral)
+            } else if let help {
+                Text(help).font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct BackendOptionJSONEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    let apply: ([String: Any]) -> Void
+    @State private var text: String
+    @State private var errorMessage: String?
+
+    init(value: [String: Any], apply: @escaping ([String: Any]) -> Void) {
+        self.apply = apply
+        let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys])
+        _text = State(initialValue: data.flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("配置 JSON") {
+                    TextEditor(text: $text)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 320)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(HarvestTheme.coral)
+                    }
+                }
+            }
+            .navigationTitle("完整 JSON").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("应用") { applyJSON() } }
+            }
+        }
+    }
+
+    private func applyJSON() {
+        guard let data = text.data(using: .utf8) else { return }
         do {
-            guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { parseError = "配置必须是 JSON 对象"; return }
-            parseError = nil
-            isSaving = true
-            var updated = option
-            updated.value = value
-            updated.active = active
-            if await save(updated) { dismiss() }
-            isSaving = false
-        } catch { parseError = "JSON 格式错误：\(error.localizedDescription)" }
+            guard let value = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                errorMessage = "配置必须是 JSON 对象"
+                return
+            }
+            apply(value)
+            dismiss()
+        } catch {
+            errorMessage = "JSON 格式错误：\(error.localizedDescription)"
+        }
     }
 }
 
@@ -371,10 +2581,10 @@ struct ManagedUser: Identifiable, Hashable {
     var joined: String
 
     init(_ json: [String: Any]) {
-        id = json.int("id", "user_id") ?? abs((json.string("username") ?? UUID().uuidString).hashValue)
-        username = json.string("username", "name") ?? "用户"
+        id = json.int("id", "user_id") ?? 0
+        username = json.string("username", "name") ?? ""
         email = json.string("email") ?? ""
-        active = json.bool("is_active", "active") ?? true
+        active = json.bool("is_active", "active") ?? false
         staff = json.bool("is_staff", "staff") ?? false
         admin = json.bool("is_superuser", "admin") ?? false
         joined = json.string("date_joined", "created_at", "joined") ?? ""
@@ -387,7 +2597,7 @@ final class UsersViewModel: ObservableObject {
     @Published var isLoading = true
     let endpoint: String
     init(endpoint: String) { self.endpoint = endpoint }
-    func load(_ appState: AppState) async { defer { isLoading = false }; do { users = jsonRows(try await appState.api(endpoint)).map(ManagedUser.init) } catch { appState.presentedError = error.localizedDescription } }
+    func load(_ appState: AppState) async { defer { isLoading = false }; do { users = jsonRows(try await appState.api(endpoint)).map(ManagedUser.init).filter { $0.id > 0 || !$0.username.isEmpty } } catch { appState.presentedError = error.localizedDescription } }
     func toggle(_ appState: AppState, user: ManagedUser) async { let body: [String: Any] = ["id": user.id, "username": user.username, "email": user.email, "is_active": !user.active, "is_staff": user.staff, "is_superuser": user.admin]; if await appState.perform("\(endpoint)/\(user.id)", method: .put, body: body) { await load(appState) } }
     func delete(_ appState: AppState, user: ManagedUser) async { if await appState.perform("\(endpoint)/\(user.id)", method: .delete) { users.removeAll { $0.id == user.id } } }
 }
@@ -397,14 +2607,105 @@ struct UserManagementView: View {
     @StateObject private var model = UsersViewModel(endpoint: APIPath.users)
     @State private var showAdd = false
     @State private var editingUser: ManagedUser?
+    @State private var resettingUser: ManagedUser?
+    @State private var deletingUser: ManagedUser?
+    @State private var query = ""
+
+    private var currentUser: ManagedUser? {
+        model.users.first { user in
+            user.id == appState.profile?.id || user.username == appState.profile?.username
+        }
+    }
+
+    private var canManageStatus: Bool {
+        currentUser?.staff == true || currentUser?.admin == true
+            || appState.profile?.isStaff == true || appState.profile?.isSuperuser == true
+    }
+
+    private var filteredUsers: [ManagedUser] {
+        let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return model.users }
+        return model.users.filter {
+            $0.username.localizedCaseInsensitiveContains(value)
+                || $0.email.localizedCaseInsensitiveContains(value)
+                || String($0.id).contains(value)
+        }
+    }
 
     var body: some View {
-        Group { if model.isLoading { LoadingState() } else if model.users.isEmpty { EmptyState(icon: "person.2.slash", title: "没有其他用户") } else { List(model.users) { user in Button { editingUser = user } label: { UserRow(user: user) }.buttonStyle(.plain).swipeActions(edge: .leading, allowsFullSwipe: false) { Button { Task { await model.toggle(appState, user: user) } } label: { Label(user.active ? "停用" : "启用", systemImage: user.active ? "pause" : "play") }.tint(HarvestTheme.amber) }.swipeActions(edge: .trailing, allowsFullSwipe: false) { Button { editingUser = user } label: { Label("修改凭据", systemImage: "pencil") }.tint(HarvestTheme.blue); if appState.profile?.isSuperuser == true { Button(role: .destructive) { Task { await model.delete(appState, user: user) } } label: { Label("删除", systemImage: "trash") } } } }.listStyle(.plain).refreshable { await model.load(appState) } } }
+        Group {
+            if model.isLoading {
+                LoadingState()
+            } else {
+                List {
+                    if filteredUsers.isEmpty {
+                        ContentUnavailableView(
+                            query.isEmpty ? "没有用户" : "没有匹配的用户",
+                            systemImage: "person.2.slash"
+                        )
+                        .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(filteredUsers) { user in
+                            let isCurrent = user.id == appState.profile?.id || user.username == appState.profile?.username
+                            Button { editingUser = user } label: { UserRow(user: user, isCurrent: isCurrent) }
+                                .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button { editingUser = user } label: { Label("编辑用户", systemImage: "pencil") }
+                                    Button { resettingUser = user } label: { Label("重置密码", systemImage: "key") }
+                                    if canManageStatus && !isCurrent {
+                                        Button { Task { await model.toggle(appState, user: user) } } label: {
+                                            Label(user.active ? "停用" : "启用", systemImage: user.active ? "pause" : "play")
+                                        }
+                                    }
+                                    Button(role: .destructive) { deletingUser = user } label: { Label("删除", systemImage: "trash") }
+                                }
+                                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                                    if canManageStatus && !isCurrent {
+                                        Button { Task { await model.toggle(appState, user: user) } } label: {
+                                            Label(user.active ? "停用" : "启用", systemImage: user.active ? "pause" : "play")
+                                        }
+                                        .tint(HarvestTheme.amber)
+                                    }
+                                }
+                                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                                    Button { resettingUser = user } label: { Label("重置密码", systemImage: "key") }.tint(HarvestTheme.amber)
+                                    Button { editingUser = user } label: { Label("编辑", systemImage: "pencil") }.tint(HarvestTheme.blue)
+                                    Button(role: .destructive) { deletingUser = user } label: { Label("删除", systemImage: "trash") }
+                                }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+                .refreshable { await model.load(appState) }
+            }
+        }
         .navigationTitle("用户中心").navigationBarTitleDisplayMode(.inline)
-        .toolbar { if appState.profile?.isSuperuser == true { ToolbarItem(placement: .topBarTrailing) { Button { showAdd = true } label: { Image(systemName: "person.badge.plus") } } } }
+        .searchable(text: $query, prompt: "搜索用户名、邮箱或 ID")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showAdd = true } label: { Image(systemName: "person.badge.plus") }
+                    .accessibilityLabel("添加用户")
+            }
+        }
         .task { if model.isLoading { await model.load(appState) } }
         .sheet(isPresented: $showAdd) { UserEditorSheet(endpoint: APIPath.users) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $editingUser) { user in UserEditorSheet(endpoint: APIPath.users, user: user) { await model.load(appState) }.environmentObject(appState) }
+        .sheet(item: $resettingUser) { user in UserEditorSheet(endpoint: APIPath.users, user: user, resetPassword: true) { await model.load(appState) }.environmentObject(appState) }
+        .confirmationDialog(
+            "确定删除用户「\(deletingUser?.username ?? "")」？",
+            isPresented: Binding(
+                get: { deletingUser != nil },
+                set: { if !$0 { deletingUser = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("删除用户", role: .destructive) {
+                guard let user = deletingUser else { return }
+                deletingUser = nil
+                Task { await model.delete(appState, user: user) }
+            }
+            Button("取消", role: .cancel) { deletingUser = nil }
+        }
     }
 }
 
@@ -434,6 +2735,23 @@ struct AdminUserItem: Identifiable {
         updatedAt = json.string("updated_at", "updatedAt", "update_time") ?? ""
         raw = json
     }
+
+    var expirationDate: Date? {
+        if let date = parseDate(expiresAt) { return date }
+        guard let timestamp = Double(expiresAt.trimmingCharacters(in: .whitespacesAndNewlines)), timestamp > 0 else { return nil }
+        return Date(timeIntervalSince1970: timestamp > 10_000_000_000 ? timestamp / 1_000 : timestamp)
+    }
+
+    var isExpired: Bool {
+        expiresAt.contains("已过期") || expirationDate.map { $0 < Date() } == true
+    }
+
+    var authorizationText: String {
+        guard let expirationDate else { return expire > 0 ? "\(expire) 天" : "-" }
+        guard expirationDate > Date() else { return "已过期" }
+        let seconds = expirationDate.timeIntervalSinceNow
+        return "剩余 \(max(0, Int(ceil(seconds / 86_400)))) 天"
+    }
 }
 
 @MainActor
@@ -443,7 +2761,7 @@ final class AdminUsersViewModel: ObservableObject {
 
     func load(_ appState: AppState) async {
         defer { isLoading = false }
-        do { users = jsonRows(try await appState.api(APIPath.adminUsers)).map(AdminUserItem.init) }
+        do { users = jsonRows(try await appState.api(APIPath.adminUsers)).map(AdminUserItem.init).filter { $0.id > 0 || !$0.email.isEmpty || !$0.username.isEmpty } }
         catch { appState.presentedError = error.localizedDescription }
     }
 
@@ -489,31 +2807,110 @@ struct AdminView: View {
     @State private var showInvite = false
     @State private var editingUser: AdminUserItem?
     @State private var resettingUser: AdminUserItem?
+    @State private var resettingInvitesUser: AdminUserItem?
     @State private var showResetInvites = false
+    @State private var deletingUser: AdminUserItem?
+    @State private var query = ""
+    @State private var page = 1
+    @State private var pageSize = 100
+
+    private let pageSizeOptions = [20, 30, 50, 100, 200, 500, 1_000]
+
+    private var filteredUsers: [AdminUserItem] {
+        let sorted = model.users.sorted { $0.updatedAt > $1.updatedAt }
+        let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return sorted }
+        return sorted.filter {
+            $0.email.localizedCaseInsensitiveContains(value)
+                || $0.username.localizedCaseInsensitiveContains(value)
+                || $0.marked.localizedCaseInsensitiveContains(value)
+                || String($0.pay).contains(value)
+                || String($0.invite).contains(value)
+                || $0.expiresAt.localizedCaseInsensitiveContains(value)
+        }
+    }
+
+    private var activeUsers: [AdminUserItem] { model.users.filter { !$0.isExpired } }
+    private var totalPages: Int { max(1, (filteredUsers.count + pageSize - 1) / pageSize) }
+    private var currentPage: Int { min(max(page, 1), totalPages) }
+    private var pagedUsers: [AdminUserItem] {
+        let start = (currentPage - 1) * pageSize
+        guard start < filteredUsers.count else { return [] }
+        return Array(filteredUsers[start..<min(start + pageSize, filteredUsers.count)])
+    }
+    private var pageRangeText: String {
+        guard !filteredUsers.isEmpty else { return "0 / 0" }
+        let start = (currentPage - 1) * pageSize + 1
+        let end = min(currentPage * pageSize, filteredUsers.count)
+        return "\(start)-\(end) / \(filteredUsers.count)"
+    }
+    private var paidUserCount: Int { activeUsers.filter { $0.pay > 0 }.count }
+    private var recentUserCount: Int {
+        activeUsers.filter {
+            guard let date = parseDate($0.updatedAt) else { return false }
+            return Date().timeIntervalSince(date) <= 7 * 86_400
+        }.count
+    }
 
     var body: some View {
         Group {
-            if model.isLoading { LoadingState() }
+            if !appState.canOpenAdminUsers {
+                ContentUnavailableView("无权访问", systemImage: "lock.shield", description: Text("当前账号不具备授权管理权限"))
+            }
+            else if model.isLoading { LoadingState() }
             else {
                 List {
+                    Section("概览") {
+                        LabeledContent("授权用户", value: "\(model.users.count)")
+                        LabeledContent("有效 / 过期", value: "\(activeUsers.count) / \(model.users.filter(\.isExpired).count)")
+                        LabeledContent("收费 / 免费", value: "\(paidUserCount) / \(activeUsers.count - paidUserCount)")
+                        LabeledContent("7 日内更新", value: "\(recentUserCount)")
+                        LabeledContent("正式 / 试用", value: "\(model.users.filter { !$0.tryUser }.count) / \(model.users.filter(\.tryUser).count)")
+                        LabeledContent("剩余邀请", value: "\(model.users.reduce(0) { $0 + $1.invite })")
+                        LabeledContent("累计金额", value: "\(model.users.reduce(0) { $0 + $1.pay })")
+                    }
                     Section("授权用户") {
-                        if model.users.isEmpty { Text("没有授权记录").foregroundStyle(.secondary) }
-                        ForEach(model.users) { user in
+                        if filteredUsers.isEmpty { Text(query.isEmpty ? "没有授权记录" : "没有匹配的授权用户").foregroundStyle(.secondary) }
+                        ForEach(pagedUsers) { user in
                             Button { editingUser = user } label: { AdminUserRow(user: user) }
                                 .buttonStyle(.plain)
                                 .contextMenu {
                                     Button { editingUser = user } label: { Label("编辑授权", systemImage: "pencil") }
                                     Button { resettingUser = user } label: { Label("重置令牌", systemImage: "key.horizontal") }
+                                    Button { resettingInvitesUser = user } label: { Label("重置邀请", systemImage: "ticket") }
                                     Button { Task { await model.sendToken(appState, user: user) } } label: { Label("发送令牌邮件", systemImage: "envelope") }
-                                    Button(role: .destructive) { Task { await model.remove(appState, user: user) } } label: { Label("删除授权", systemImage: "trash") }
+                                    Button(role: .destructive) { deletingUser = user } label: { Label("删除授权", systemImage: "trash") }
                                 }
                                 .swipeActions(edge: .leading, allowsFullSwipe: false) {
                                     Button { resettingUser = user } label: { Label("重置令牌", systemImage: "key.horizontal") }.tint(HarvestTheme.amber)
                                     Button { Task { await model.sendToken(appState, user: user) } } label: { Label("发送邮件", systemImage: "envelope") }.tint(HarvestTheme.blue)
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button(role: .destructive) { Task { await model.remove(appState, user: user) } } label: { Label("删除", systemImage: "trash") }
+                                    Button(role: .destructive) { deletingUser = user } label: { Label("删除", systemImage: "trash") }
                                 }
+                        }
+                    }
+                    if !filteredUsers.isEmpty {
+                        Section("分页") {
+                            LabeledContent("显示范围", value: pageRangeText)
+                            HStack {
+                                Picker("每页数量", selection: $pageSize) {
+                                    ForEach(pageSizeOptions, id: \.self) { Text("\($0) 条").tag($0) }
+                                }
+                                .pickerStyle(.menu)
+                                Spacer()
+                                Button { page = max(1, currentPage - 1) } label: {
+                                    Image(systemName: "chevron.left")
+                                }
+                                .disabled(currentPage <= 1)
+                                Text("\(currentPage) / \(totalPages)")
+                                    .font(.subheadline.monospacedDigit())
+                                    .frame(minWidth: 58)
+                                Button { page = min(totalPages, currentPage + 1) } label: {
+                                    Image(systemName: "chevron.right")
+                                }
+                                .disabled(currentPage >= totalPages)
+                            }
                         }
                     }
                     Section("系统操作") {
@@ -526,11 +2923,31 @@ struct AdminView: View {
             }
         }
         .navigationTitle("授权管理").navigationBarTitleDisplayMode(.inline)
-        .task { if model.isLoading { await model.load(appState) } }
+        .searchable(text: $query, prompt: "搜索邮箱、用户名、备注或授权信息")
+        .task { if appState.canOpenAdminUsers && model.isLoading { await model.load(appState) } }
+        .onChange(of: query) { _, _ in page = 1 }
+        .onChange(of: pageSize) { _, _ in page = 1 }
+        .onChange(of: filteredUsers.count) { _, _ in page = currentPage }
         .sheet(isPresented: $showInvite) { InviteSheet { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $editingUser) { user in AdminUserEditorSheet(user: user) { values in await model.update(appState, user: user, values: values) } }
         .sheet(item: $resettingUser) { user in AdminTokenResetSheet(user: user) { expire, pay, tryUser in await model.resetToken(appState, user: user, expire: expire, pay: pay, tryUser: tryUser) } }
+        .sheet(item: $resettingInvitesUser) { user in AdminInviteResetSheet(user: user) { count in await model.update(appState, user: user, values: ["email": user.email, "invite": count]) } }
         .sheet(isPresented: $showResetInvites) { ResetInvitesSheet { count in await model.resetInvites(appState, count: count) } }
+        .confirmationDialog(
+            "确定删除授权用户「\(deletingUser?.email ?? "")」？",
+            isPresented: Binding(
+                get: { deletingUser != nil },
+                set: { if !$0 { deletingUser = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("删除授权", role: .destructive) {
+                guard let user = deletingUser else { return }
+                deletingUser = nil
+                Task { await model.remove(appState, user: user) }
+            }
+            Button("取消", role: .cancel) { deletingUser = nil }
+        }
     }
 }
 
@@ -538,17 +2955,17 @@ struct AdminUserRow: View {
     let user: AdminUserItem
     var body: some View {
         HStack(spacing: 12) {
-            Circle().fill(user.tryUser ? HarvestTheme.amber.opacity(0.14) : HarvestTheme.green.opacity(0.14)).frame(width: 42, height: 42)
-                .overlay(Image(systemName: user.tryUser ? "hourglass" : "key.fill").foregroundStyle(user.tryUser ? HarvestTheme.amber : HarvestTheme.green))
+            Circle().fill(user.isExpired ? HarvestTheme.coral.opacity(0.14) : user.tryUser ? HarvestTheme.amber.opacity(0.14) : HarvestTheme.green.opacity(0.14)).frame(width: 42, height: 42)
+                .overlay(Image(systemName: user.isExpired ? "calendar.badge.exclamationmark" : user.tryUser ? "hourglass" : "key.fill").foregroundStyle(user.isExpired ? HarvestTheme.coral : user.tryUser ? HarvestTheme.amber : HarvestTheme.green))
             VStack(alignment: .leading, spacing: 4) {
                 Text(user.username.isEmpty ? user.email : user.username).font(.headline)
                 if !user.username.isEmpty { Text(user.email).font(.caption).foregroundStyle(.secondary) }
-                Text(user.expiresAt.isEmpty ? "有效期 \(user.expire) 天" : "到期 \(user.expiresAt)").font(.caption2).foregroundStyle(.secondary)
+                Text(user.expiresAt.isEmpty ? "有效期 \(user.expire) 天" : "\(user.authorizationText) · \(user.expiresAt)").font(.caption2).foregroundStyle(user.isExpired ? HarvestTheme.coral : .secondary)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
                 Text("\(user.invite) 邀请").font(.caption)
-                Text(user.tryUser ? "试用" : "正式").font(.caption2).foregroundStyle(user.tryUser ? HarvestTheme.amber : HarvestTheme.green)
+                Text(user.isExpired ? "过期" : user.tryUser ? "试用" : user.pay > 0 ? "收费" : "免费").font(.caption2).foregroundStyle(user.isExpired ? HarvestTheme.coral : user.tryUser ? HarvestTheme.amber : HarvestTheme.green)
             }
         }
         .padding(.vertical, 4)
@@ -583,7 +3000,7 @@ struct AdminUserEditorSheet: View {
         NavigationStack {
             Form {
                 Section("账号") { TextField("用户名", text: $username); TextField("邮箱", text: $email).keyboardType(.emailAddress).textInputAutocapitalization(.never); TextField("备注", text: $marked) }
-                Section("授权") { TextField("付费次数", text: $pay).keyboardType(.numberPad); TextField("邀请码数量", text: $invite).keyboardType(.numberPad); TextField("有效天数", text: $expire).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
+                Section("授权") { TextField("支付金额", text: $pay).keyboardType(.numberPad); TextField("邀请码数量", text: $invite).keyboardType(.numberPad); TextField("有效天数", text: $expire).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
             }
             .navigationTitle("编辑授权").navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -607,16 +3024,16 @@ struct AdminTokenResetSheet: View {
     init(user: AdminUserItem, reset: @escaping (Int, Int, Bool) async -> Bool) {
         self.user = user
         self.reset = reset
-        _expire = State(initialValue: String(user.expire))
-        _pay = State(initialValue: String(user.pay))
-        _tryUser = State(initialValue: user.tryUser)
+        _expire = State(initialValue: String(user.expire == 0 ? 36_600 : user.expire))
+        _pay = State(initialValue: String(user.pay == 0 ? 168 : user.pay))
+        _tryUser = State(initialValue: false)
     }
 
     var body: some View {
         NavigationStack {
-            Form { TextField("有效天数", text: $expire).keyboardType(.numberPad); TextField("付费次数", text: $pay).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
+            Form { TextField("有效天数", text: $expire).keyboardType(.numberPad); TextField("支付金额", text: $pay).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
                 .navigationTitle("重置令牌").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(expire) ?? 0, Int(pay) ?? 0, tryUser) { dismiss() } } } } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(expire) ?? 0, Int(pay) ?? 0, tryUser) { dismiss() } } }.disabled((Int(expire) ?? 0) <= 0 || (Int(pay) ?? 0) <= 0) } }
         }
     }
 }
@@ -624,19 +3041,50 @@ struct AdminTokenResetSheet: View {
 struct ResetInvitesSheet: View {
     @Environment(\.dismiss) private var dismiss
     let reset: (Int) async -> Bool
-    @State private var count = "1"
+    @State private var count = "3"
     var body: some View {
         NavigationStack {
             Form { TextField("邀请码数量", text: $count).keyboardType(.numberPad) }
                 .navigationTitle("重置邀请码").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(count) ?? 0) { dismiss() } } }.disabled((Int(count) ?? 0) <= 0) } }
+                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(count) ?? 0) { dismiss() } } }.disabled((Int(count) ?? -1) < 0) } }
+        }
+    }
+}
+
+struct AdminInviteResetSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let user: AdminUserItem
+    let reset: (Int) async -> Bool
+    @State private var count = "3"
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("授权用户") { LabeledContent("邮箱", value: user.email) }
+                Section("邀请数量") {
+                    Picker("数量", selection: $count) {
+                        Text("3 次").tag("3")
+                        Text("4 次").tag("4")
+                        Text("5 次").tag("5")
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+            .navigationTitle("重置邀请").navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("重置") { Task { if await reset(Int(count) ?? 3) { dismiss() } } }
+                }
+            }
         }
     }
 }
 
 struct UserRow: View {
     let user: ManagedUser
-    var body: some View { HStack(spacing: 12) { Circle().fill(user.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 42, height: 42).overlay(Text(String(user.username.prefix(1)).uppercased()).font(.headline).foregroundStyle(user.active ? HarvestTheme.green : .secondary)); VStack(alignment: .leading, spacing: 4) { HStack { Text(user.username).font(.headline); if user.admin { Image(systemName: "checkmark.shield.fill").foregroundStyle(HarvestTheme.coral).font(.caption) } }; Text(user.email.isEmpty ? "未设置邮箱" : user.email).font(.caption).foregroundStyle(.secondary) }; Spacer(); StatusPill(label: user.active ? "启用" : "停用", color: user.active ? HarvestTheme.green : .secondary) }.padding(.vertical, 4) }
+    var isCurrent = false
+    var body: some View { HStack(spacing: 12) { Circle().fill(user.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 42, height: 42).overlay(Text(user.username.isEmpty ? "?" : String(user.username.prefix(1)).uppercased()).font(.headline).foregroundStyle(user.active ? HarvestTheme.green : .secondary)); VStack(alignment: .leading, spacing: 4) { HStack { Text(user.username.isEmpty ? "未命名用户" : user.username).font(.headline); if user.staff { Image(systemName: "person.badge.shield.checkmark").foregroundStyle(HarvestTheme.blue).font(.caption) }; if user.admin { Image(systemName: "checkmark.shield.fill").foregroundStyle(HarvestTheme.coral).font(.caption) }; if isCurrent { Text("当前").font(.caption2).foregroundStyle(HarvestTheme.green) } }; Text(user.email.isEmpty ? "ID \(user.id)" : "\(user.email) · ID \(user.id)").font(.caption).foregroundStyle(.secondary) }; Spacer(); StatusPill(label: user.active ? "启用" : "停用", color: user.active ? HarvestTheme.green : .secondary) }.padding(.vertical, 4) }
 }
 
 struct UserEditorSheet: View {
@@ -644,53 +3092,680 @@ struct UserEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
     let endpoint: String
     let user: ManagedUser?
+    let resetPassword: Bool
     let onSaved: () async -> Void
     @State private var username: String
     @State private var password = ""
+    @State private var confirmation = ""
+    @State private var validationError: String?
+    @State private var isSaving = false
 
-    init(endpoint: String, user: ManagedUser? = nil, onSaved: @escaping () async -> Void) {
+    init(endpoint: String, user: ManagedUser? = nil, resetPassword: Bool = false, onSaved: @escaping () async -> Void) {
         self.endpoint = endpoint
         self.user = user
+        self.resetPassword = resetPassword
         self.onSaved = onSaved
         _username = State(initialValue: user?.username ?? "")
     }
 
-    var body: some View { NavigationStack { Form { TextField("用户名", text: $username); SecureField(user == nil ? "初始密码" : "新密码", text: $password) }.navigationTitle(user == nil ? "添加用户" : "修改凭据").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("保存") { Task { let body: [String: Any] = ["username": username, "password": password]; let path = user.map { "\(endpoint)/\($0.id)" } ?? endpoint; let method: HTTPMethod = user == nil ? .post : .put; if await appState.perform(path, method: method, body: body) { await onSaved(); dismiss() } } }.disabled(username.isEmpty || password.isEmpty) } } } }
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("用户名", text: $username)
+                    .textInputAutocapitalization(.never)
+                    .disabled(resetPassword)
+                SecureField(user == nil ? "初始密码" : "新密码", text: $password)
+                SecureField("确认密码", text: $confirmation)
+                if let validationError {
+                    Label(validationError, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(HarvestTheme.coral)
+                }
+            }
+            .navigationTitle(user == nil ? "添加用户" : resetPassword ? "重置密码" : "编辑用户")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { Task { await save() } }
+                        .disabled(username.isEmpty || password.isEmpty || isSaving)
+                }
+            }
+            .overlay { if isSaving { ProgressView().controlSize(.large) } }
+        }
+    }
+
+    @MainActor private func save() async {
+        let normalizedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUsername.isEmpty else { validationError = "用户名不能为空"; return }
+        guard !password.isEmpty else { validationError = user == nil ? "初始密码不能为空" : "新密码不能为空"; return }
+        guard password == confirmation else { validationError = "两次输入的密码不一致"; return }
+        validationError = nil
+        isSaving = true
+        defer { isSaving = false }
+        let body: [String: Any] = ["username": normalizedUsername, "password": password]
+        let path = user.map { "\(endpoint)/\($0.id)" } ?? endpoint
+        let method: HTTPMethod = user == nil ? .post : .put
+        if await appState.perform(path, method: method, body: body) {
+            await onSaved()
+            dismiss()
+        }
+    }
 }
 
 struct InviteSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
+    let notify: Bool
     let onSaved: () async -> Void
     @State private var email = ""
-    var body: some View { NavigationStack { Form { TextField("邀请邮箱", text: $email).keyboardType(.emailAddress).textInputAutocapitalization(.never) }.navigationTitle("邀请用户").navigationBarTitleDisplayMode(.inline).toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("发送") { Task { if await appState.perform(APIPath.adminUsers, method: .post, query: ["invite_email": email, "notify": false]) { await onSaved(); dismiss() } } }.disabled(email.isEmpty) } } } }
+    @State private var isSending = false
+
+    init(notify: Bool = false, onSaved: @escaping () async -> Void) {
+        self.notify = notify
+        self.onSaved = onSaved
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("邀请邮箱", text: $email)
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            .navigationTitle(notify ? "试用邀请" : "邀请用户")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("发送") { Task { await send() } }
+                        .disabled(email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSending)
+                }
+            }
+            .overlay { if isSending { ProgressView().controlSize(.large) } }
+        }
+    }
+
+    @MainActor private func send() async {
+        let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else { return }
+        isSending = true
+        defer { isSending = false }
+        var query: [String: Any] = ["invite_email": address]
+        if !notify { query["notify"] = false }
+        if await appState.perform(APIPath.adminUsers, method: .post, query: query) {
+            await onSaved()
+            dismiss()
+        }
+    }
+}
+
+private enum LogSource: String, CaseIterable, Identifiable {
+    case app = "APP"
+    case server = "服务端"
+    var id: String { rawValue }
+}
+
+private struct DisplayLogEntry: Identifiable, Hashable {
+    let id: String
+    let timestamp: String
+    let level: String
+    let message: String
 }
 
 struct LogView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var entries: [[String: Any]] = []
+    @AppStorage("logs.fontSize") private var fontSize = 12.0
+    @State private var entries: [DisplayLogEntry] = []
+    @State private var appAllEntries: [DisplayLogEntry] = []
+    @State private var appVisibleStart = 0
+    @State private var serverLoadedCount = 0
+    @State private var serverTotal = 0
+    @State private var isLoadingOlder = false
+    @State private var source: LogSource = .app
     @State private var query = ""
     @State private var isLoading = true
+    @State private var level = "ALL"
+    @State private var connected = false
+    @State private var serverStreamStatus = "快照数据"
+    @State private var streamRestartGeneration = 0
+    @State private var paused = false
+    @State private var following = true
 
-    var filtered: [[String: Any]] {
+    private let levels = ["ALL", "DEBUG", "INFO", "WARN", "ERROR"]
+    private let pageSize = 100
+    private let minimumFontSize = 8.0
+    private let maximumFontSize = 16.0
+
+    private var displayedFontSize: Double {
+        min(maximumFontSize, max(minimumFontSize, fontSize))
+    }
+
+    private var filtered: [DisplayLogEntry] {
         guard !query.isEmpty else { return entries }
         return entries.filter {
-            ($0.string("display", "raw", "message", "text", "detail") ?? "")
-                .localizedCaseInsensitiveContains(query)
+            $0.message.localizedCaseInsensitiveContains(query)
+                || $0.level.localizedCaseInsensitiveContains(query)
+                || $0.timestamp.localizedCaseInsensitiveContains(query)
         }
     }
-    var body: some View {
-        Group { if isLoading { LoadingState() } else if entries.isEmpty { EmptyState(icon: "doc.text", title: "没有日志") } else { List { ForEach(Array(filtered.enumerated()), id: \.offset) { _, entry in VStack(alignment: .leading, spacing: 5) { HStack { Text(entry.string("level", "type") ?? "INFO").font(.caption2.weight(.bold)).foregroundStyle(logColor(entry.string("level", "type"))); Spacer(); Text(entry.string("timestamp", "logged_at", "time", "created_at", "date") ?? "").font(.caption2).foregroundStyle(.tertiary) }; Text(entry.string("display", "raw", "message", "text", "detail") ?? String(describing: entry)).font(.caption.monospaced()).textSelection(.enabled) } } }.listStyle(.plain).refreshable { await load() } } }
-        .searchable(text: $query, prompt: "筛选日志")
-        .navigationTitle("日志中心").navigationBarTitleDisplayMode(.inline)
-        .task { if isLoading { await load() } }
+
+    private var hasOlder: Bool {
+        source == .app ? appVisibleStart > 0 : serverLoadedCount < serverTotal
     }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            VStack(spacing: 0) {
+                VStack(spacing: 10) {
+                    Picker("日志来源", selection: $source) {
+                        ForEach(LogSource.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+
+                    HStack(spacing: 10) {
+                        StatusPill(
+                            label: paused ? "已暂停" : (source == .app ? "本地日志" : (connected ? "实时连接" : serverStreamStatus)),
+                            color: paused ? HarvestTheme.amber : (source == .app || connected ? HarvestTheme.green : HarvestTheme.amber)
+                        )
+                        Button {
+                            following.toggle()
+                            if following { scrollToBottom(proxy) }
+                        } label: {
+                            Label(following ? "跟随最新" : "暂停跟随", systemImage: following ? "arrow.down.to.line" : "hand.raised")
+                        }
+                        .font(.caption)
+                        Spacer()
+                        Picker("级别", selection: $level) {
+                            ForEach(levels, id: \.self) { Text($0).tag($0) }
+                        }
+                        .pickerStyle(.menu)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color(uiColor: .secondarySystemBackground))
+
+                if isLoading {
+                    LoadingState()
+                } else if filtered.isEmpty {
+                    EmptyState(icon: "doc.text", title: query.isEmpty ? "没有日志" : "没有匹配日志")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List {
+                        if hasOlder {
+                            Button { Task { await loadOlder() } } label: {
+                                HStack {
+                                    Spacer()
+                                    if isLoadingOlder { ProgressView().controlSize(.small) }
+                                    Label("加载更早日志", systemImage: "arrow.up.to.line")
+                                    Spacer()
+                                }
+                            }
+                            .disabled(isLoadingOlder)
+                        }
+                        ForEach(filtered) { entry in
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    Text(entry.level)
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(logColor(entry.level))
+                                    Spacer()
+                                    Text(entry.timestamp).font(.caption2).foregroundStyle(.tertiary)
+                                }
+                                Text(entry.message)
+                                    .font(.system(size: displayedFontSize, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                            .id(entry.id)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .refreshable { await reload() }
+                }
+            }
+            .onChange(of: entries.count) { _, _ in
+                if following { scrollToBottom(proxy) }
+            }
+            .toolbar {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button { paused.toggle() } label: {
+                        Image(systemName: paused ? "play.fill" : "pause.fill")
+                    }
+                    .accessibilityLabel(paused ? "继续接收日志" : "暂停接收日志")
+
+                    Menu {
+                        Button { scrollToTop(proxy) } label: { Label("到顶部", systemImage: "arrow.up.to.line") }
+                        Button {
+                            following = true
+                            scrollToBottom(proxy)
+                        } label: { Label("到底部", systemImage: "arrow.down.to.line") }
+                        Divider()
+                        Button { UIPasteboard.general.string = logText } label: { Label("复制当前日志", systemImage: "doc.on.doc") }
+                            .disabled(filtered.isEmpty)
+                        Button { Task { await clearCurrent() } } label: { Label("清空当前视图", systemImage: "trash") }
+                            .disabled(entries.isEmpty)
+                        Button {
+                            if source == .server {
+                                streamRestartGeneration &+= 1
+                            } else {
+                                Task { await reload() }
+                            }
+                        } label: {
+                            Label(source == .server ? "重新连接" : "重载", systemImage: "arrow.clockwise")
+                        }
+                        Divider()
+                        Button { fontSize = max(minimumFontSize, displayedFontSize - 1) } label: { Label("减小字号", systemImage: "minus") }
+                            .disabled(displayedFontSize <= minimumFontSize)
+                        Button { fontSize = min(maximumFontSize, displayedFontSize + 1) } label: { Label("增大字号", systemImage: "plus") }
+                            .disabled(displayedFontSize >= maximumFontSize)
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel("日志工具")
+
+                    ShareLink(item: logText) { Image(systemName: "square.and.arrow.up") }
+                        .accessibilityLabel("分享日志")
+                }
+            }
+        }
+        .searchable(text: $query, prompt: "筛选日志")
+        .navigationTitle("日志中心")
+        .navigationBarTitleDisplayMode(.inline)
+        .task(id: "\(source.rawValue)-\(level)-\(streamRestartGeneration)") {
+            entries = []
+            appAllEntries = []
+            appVisibleStart = 0
+            serverLoadedCount = 0
+            serverTotal = 0
+            isLoading = true
+            connected = false
+            serverStreamStatus = "快照数据"
+            await load()
+            guard !paused else { return }
+            if source == .app { await watchAppLogs() }
+            else { await watchServerLogs() }
+        }
+        .onChange(of: paused) { _, isPaused in
+            if isPaused { serverStreamStatus = "已暂停" }
+            streamRestartGeneration &+= 1
+        }
+    }
+
     private func load() async {
         defer { isLoading = false }
-        do { entries = jsonRows(try await appState.api(APIPath.logs, query: ["limit": 500, "offset": 0])) }
-        catch { appState.presentedError = error.localizedDescription }
+        if source == .app {
+            await loadAppLogs(resetWindow: true)
+            connected = true
+            return
+        }
+        do {
+            let page = try await fetchServerPage(offset: 0)
+            entries = page.entries
+            serverLoadedCount = page.count
+            serverTotal = page.total
+        } catch {
+            appState.presentedError = error.localizedDescription
+        }
     }
-    private func logColor(_ level: String?) -> Color { let text = level?.lowercased() ?? ""; return text.contains("error") ? HarvestTheme.coral : text.contains("warn") ? HarvestTheme.amber : HarvestTheme.green }
+
+    private func reload() async {
+        isLoading = entries.isEmpty
+        await load()
+    }
+
+    private func loadAppLogs(resetWindow: Bool = false) async {
+        let records = await AppLogStore.shared.snapshot()
+        let next = records
+            .filter { selectedLogLevelMatches($0.level.rawValue) }
+            .map {
+                DisplayLogEntry(
+                    id: $0.id.uuidString,
+                    timestamp: $0.timestamp.formatted(date: .numeric, time: .standard),
+                    level: $0.level.rawValue,
+                    message: $0.message
+                )
+            }
+        if resetWindow || appAllEntries.isEmpty {
+            appAllEntries = next
+            appVisibleStart = max(0, next.count - pageSize)
+            entries = Array(next.suffix(pageSize))
+            return
+        }
+
+        let previousCount = appAllEntries.count
+        let samePrefix = next.count >= previousCount
+            && Array(next.prefix(previousCount)) == appAllEntries
+        appAllEntries = next
+        if samePrefix {
+            entries.append(contentsOf: next.dropFirst(previousCount))
+        } else {
+            let visibleCount = min(max(entries.count, pageSize), next.count)
+            appVisibleStart = max(0, next.count - visibleCount)
+            entries = Array(next.suffix(visibleCount))
+        }
+    }
+
+    private func watchAppLogs() async {
+        while !Task.isCancelled {
+            do { try await Task.sleep(for: .seconds(1)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            if !paused { await loadAppLogs() }
+        }
+    }
+
+    private func fetchServerPage(offset: Int) async throws -> (entries: [DisplayLogEntry], count: Int, total: Int) {
+        let raw = try await appState.api(
+            APIPath.logs,
+            query: ["limit": pageSize, "offset": offset, "level": level == "ALL" ? "" : level]
+        )
+        let payload = jsonPayloadDictionary(raw) ?? [:]
+        let rows: [[String: Any]]
+        if let values = payload["items"] as? [[String: Any]] {
+            rows = values
+        } else {
+            rows = jsonRows(raw)
+        }
+        return (
+            displayEntries(Array(rows.reversed())),
+            rows.count,
+            payload.int("total") ?? rows.count
+        )
+    }
+
+    @MainActor private func loadOlder() async {
+        guard hasOlder, !isLoadingOlder else { return }
+        isLoadingOlder = true
+        defer { isLoadingOlder = false }
+
+        if source == .app {
+            let nextStart = max(0, appVisibleStart - pageSize)
+            entries.insert(contentsOf: appAllEntries[nextStart..<appVisibleStart], at: 0)
+            appVisibleStart = nextStart
+            following = false
+            return
+        }
+
+        do {
+            let page = try await fetchServerPage(offset: serverLoadedCount)
+            let known = Set(entries.map(\.id))
+            entries.insert(contentsOf: page.entries.filter { !known.contains($0.id) }, at: 0)
+            serverLoadedCount += page.count
+            serverTotal = page.total
+            following = false
+        } catch {
+            appState.presentedError = error.localizedDescription
+        }
+    }
+
+    private func watchServerLogs() async {
+        let maximumReconnectAttempts = 3
+        var reconnectAttempt = 0
+        while !Task.isCancelled {
+            var receivedFrame = false
+            var disconnectMessage = "日志流已断开"
+            do {
+                let stream = APIClient.shared.streamSSE(
+                    baseURL: appState.baseURL,
+                    path: APIPath.logsStream,
+                    token: appState.accessToken,
+                    method: .get,
+                    query: ["level": level == "ALL" ? "" : level, "limit": pageSize]
+                )
+                for try await event in stream {
+                    guard !Task.isCancelled else { return }
+                    if !receivedFrame {
+                        receivedFrame = true
+                        reconnectAttempt = 0
+                    }
+                    connected = true
+                    serverStreamStatus = "实时连接"
+                    let payload = jsonPayloadDictionary(event) ?? event
+                    let type = payload.string("type")?.lowercased() ?? ""
+                    if type == "heartbeat" || type == "connected" { connected = true; continue }
+                    guard !paused else { continue }
+                    var rows = payload.rows("entries", "logs", "rows")
+                    if rows.isEmpty, payload.string("display", "raw", "message", "text", "detail") != nil {
+                        rows = [payload]
+                    }
+                    guard !rows.isEmpty else { continue }
+                    let next = displayEntries(rows)
+                    let known = Set(entries.map(\.id))
+                    let additions = next.filter { !known.contains($0.id) }
+                    if type == "snapshot" && entries.isEmpty { entries = next }
+                    else { entries.append(contentsOf: additions) }
+                    serverLoadedCount += additions.count
+                    serverTotal = max(serverTotal, serverLoadedCount)
+                }
+            } catch {
+                disconnectMessage = error.localizedDescription
+            }
+            guard !Task.isCancelled else { return }
+            connected = false
+            if receivedFrame { reconnectAttempt = 0 }
+            guard reconnectAttempt < maximumReconnectAttempts else {
+                serverStreamStatus = "重连已停止"
+                await AppLogStore.shared.append(
+                    .warning,
+                    "服务端日志流断开：\(disconnectMessage)，连续重试 \(maximumReconnectAttempts) 次失败，已停止连接"
+                )
+                return
+            }
+            reconnectAttempt += 1
+            serverStreamStatus = "重连 \(reconnectAttempt)/\(maximumReconnectAttempts)"
+            await AppLogStore.shared.append(
+                .warning,
+                "服务端日志流断开：\(disconnectMessage)，3 秒后重连（\(reconnectAttempt)/\(maximumReconnectAttempts)）"
+            )
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+        }
+    }
+
+    private func displayEntries(_ rows: [[String: Any]]) -> [DisplayLogEntry] {
+        rows.map { entry in
+            let timestamp = entry.string("timestamp", "logged_at", "time", "created_at", "date") ?? ""
+            let entryLevel = (entry.string("level", "type") ?? "INFO").uppercased()
+            let message = entry.string("display", "raw", "message", "text", "detail") ?? prettyJSON(entry)
+            return DisplayLogEntry(
+                id: entry.string("id", "uuid") ?? "\(timestamp)|\(entryLevel)|\(message)",
+                timestamp: timestamp,
+                level: entryLevel,
+                message: message
+            )
+        }
+    }
+
+    private func clearCurrent() async {
+        if source == .app {
+            await AppLogStore.shared.clear()
+            appAllEntries = []
+            appVisibleStart = 0
+        } else {
+            serverLoadedCount = 0
+            serverTotal = 0
+        }
+        entries = []
+    }
+
+    private var logText: String {
+        filtered.map { "[\($0.timestamp)] [\($0.level)] \($0.message)" }.joined(separator: "\n")
+    }
+
+    private func scrollToTop(_ proxy: ScrollViewProxy) {
+        guard let id = filtered.first?.id else { return }
+        following = false
+        withAnimation { proxy.scrollTo(id, anchor: .top) }
+    }
+
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        guard let id = filtered.last?.id else { return }
+        withAnimation { proxy.scrollTo(id, anchor: .bottom) }
+    }
+
+    private func logColor(_ level: String) -> Color {
+        let text = level.lowercased()
+        if text.contains("error") || text.contains("fatal") { return HarvestTheme.coral }
+        if text.contains("warn") { return HarvestTheme.amber }
+        if text.contains("debug") { return HarvestTheme.blue }
+        return HarvestTheme.green
+    }
+
+    private func selectedLogLevelMatches(_ candidate: String) -> Bool {
+        guard level != "ALL" else { return true }
+        let normalized = candidate.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if level == "WARN" { return normalized == "WARN" || normalized == "WARNING" }
+        return normalized == level
+    }
+}
+
+struct BrowserStorageSnapshot {
+    let cookie: String
+    let localStorage: String
+}
+
+struct BrowserTorrentRequest: Identifiable, Equatable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+private func browserTorrentRequest(
+    url: URL?,
+    mimeType: String? = nil,
+    contentDisposition: String? = nil,
+    suggestedFileName: String? = nil
+) -> BrowserTorrentRequest? {
+    guard let url else { return nil }
+    let value = url.absoluteString.lowercased()
+    let path = url.path.lowercased()
+    let mime = mimeType?.lowercased() ?? ""
+    let disposition = contentDisposition?.lowercased() ?? ""
+    let fileName = suggestedFileName?.lowercased() ?? ""
+    let isTorrent = url.scheme?.lowercased() == "magnet"
+        || path.hasSuffix(".torrent")
+        || value.contains(".torrent?")
+        || mime.contains("bittorrent")
+        || disposition.contains(".torrent")
+        || fileName.hasSuffix(".torrent")
+    return isTorrent ? BrowserTorrentRequest(url: url) : nil
+}
+
+@MainActor
+final class BrowserSessionModel: ObservableObject {
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
+    @Published private(set) var currentURL: URL?
+    @Published private(set) var isLoading = false
+    @Published var pendingTorrent: BrowserTorrentRequest?
+    weak var webView: WKWebView?
+
+    func attach(_ webView: WKWebView) {
+        self.webView = webView
+        refreshState(webView)
+    }
+
+    func refreshState(_ webView: WKWebView? = nil) {
+        guard let view = webView ?? self.webView else { return }
+        canGoBack = view.canGoBack
+        canGoForward = view.canGoForward
+        currentURL = view.url
+        isLoading = view.isLoading
+    }
+
+    func goBack() { webView?.goBack() }
+    func goForward() { webView?.goForward() }
+    func reload() { webView?.reload() }
+
+    func setUserAgent(_ value: String?) {
+        webView?.customUserAgent = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        webView?.reload()
+    }
+
+    func load(_ url: URL) { webView?.load(URLRequest(url: url)) }
+
+    func interceptTorrent(_ request: BrowserTorrentRequest) {
+        pendingTorrent = request
+    }
+
+    func evaluateJavaScript(_ script: String) async throws -> Any? {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        return try await webView.evaluateJavaScript(script)
+    }
+
+    func callAsyncJavaScript(_ script: String) async throws -> Any? {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        return try await webView.callAsyncJavaScript(
+            script,
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+    }
+
+    func captureStorage() async throws -> BrowserStorageSnapshot {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        let host = webView.url?.host?.lowercased() ?? ""
+        let allCookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+            webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { continuation.resume(returning: $0) }
+        }
+        let cookieText = allCookies
+            .filter { cookie in
+                let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+                return host == domain || host.hasSuffix("." + domain)
+            }
+            .sorted { $0.name < $1.name }
+            .map { "\($0.name)=\($0.value)" }
+            .joined(separator: "; ")
+        let script = "JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
+        let result = try await webView.evaluateJavaScript(script)
+        let localStorageText = result as? String ?? "{}"
+        guard !cookieText.isEmpty || localStorageText != "{}" else {
+            throw APIError(statusCode: 0, message: "当前页面没有可同步的 Cookie 或 LocalStorage")
+        }
+        return BrowserStorageSnapshot(cookie: cookieText, localStorage: localStorageText)
+    }
+
+    func captureLongScreenshot() async throws -> UIImage {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        let width = webView.bounds.width
+        guard width > 0 else { throw APIError(statusCode: 0, message: "网页尚未完成布局") }
+
+        let contentHeight = max(webView.scrollView.contentSize.height, webView.bounds.height)
+        let maximumHeight = max(1, 60_000 / max(UIScreen.main.scale, 1))
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = CGRect(x: 0, y: 0, width: width, height: min(contentHeight, maximumHeight))
+        configuration.snapshotWidth = NSNumber(value: Double(width))
+
+        return try await withCheckedThrowingContinuation { continuation in
+            webView.takeSnapshot(with: configuration) { image, error in
+                if let image {
+                    continuation.resume(returning: image)
+                } else {
+                    continuation.resume(throwing: error ?? APIError(statusCode: 0, message: "网页长截图失败"))
+                }
+            }
+        }
+    }
+
+    func clearCurrentSiteData() async throws {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        let host = webView.url?.host?.lowercased() ?? ""
+        let store = webView.configuration.websiteDataStore.httpCookieStore
+        let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
+            store.getAllCookies { continuation.resume(returning: $0) }
+        }
+        for cookie in cookies {
+            let domain = cookie.domain.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            if host == domain || host.hasSuffix("." + domain) {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    store.delete(cookie) { continuation.resume() }
+                }
+            }
+        }
+        _ = try? await webView.evaluateJavaScript("window.localStorage.clear(); window.sessionStorage.clear();")
+        webView.reload()
+    }
 }
 
 struct NativeBrowserView: UIViewRepresentable {
@@ -699,20 +3774,25 @@ struct NativeBrowserView: UIViewRepresentable {
     let cookie: String
     let localStorage: String
     let userAgent: String
+    let session: BrowserSessionModel?
 
     init(
         urlString: String,
         title: String,
         cookie: String = "",
         localStorage: String = "",
-        userAgent: String = ""
+        userAgent: String = "",
+        session: BrowserSessionModel? = nil
     ) {
         self.urlString = urlString
         self.title = title
         self.cookie = cookie
         self.localStorage = localStorage
         self.userAgent = userAgent
+        self.session = session
     }
+
+    func makeCoordinator() -> Coordinator { Coordinator(session: session) }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -725,6 +3805,9 @@ struct NativeBrowserView: UIViewRepresentable {
 
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.allowsBackForwardNavigationGestures = true
+        view.navigationDelegate = context.coordinator
+        view.uiDelegate = context.coordinator
+        session?.attach(view)
         if !userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             view.customUserAgent = userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -747,7 +3830,90 @@ struct NativeBrowserView: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        context.coordinator.session = session
+        session?.attach(uiView)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+        weak var session: BrowserSessionModel?
+
+        init(session: BrowserSessionModel?) { self.session = session }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation?) {
+            session?.refreshState(webView)
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation?) {
+            session?.refreshState(webView)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation?) {
+            session?.refreshState(webView)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation?, withError error: Error) {
+            session?.refreshState(webView)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation?, withError error: Error) {
+            session?.refreshState(webView)
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            webView.reload()
+            session?.refreshState(webView)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            if let request = browserTorrentRequest(url: navigationAction.request.url) {
+                session?.interceptTorrent(request)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            let response = navigationResponse.response
+            let disposition = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Disposition")
+            if let request = browserTorrentRequest(
+                url: response.url,
+                mimeType: response.mimeType,
+                contentDisposition: disposition,
+                suggestedFileName: response.suggestedFilename
+            ) {
+                session?.interceptTorrent(request)
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            guard let url = navigationAction.request.url else { return nil }
+            if let request = browserTorrentRequest(url: url) {
+                session?.interceptTorrent(request)
+            } else {
+                webView.load(navigationAction.request)
+            }
+            return nil
+        }
+    }
 
     private func browserCookies(host: String, secure: Bool) -> [HTTPCookie] {
         cookie.split(separator: ";").compactMap { pair in
