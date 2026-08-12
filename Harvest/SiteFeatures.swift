@@ -300,16 +300,26 @@ final class SitesViewModel: ObservableObject {
 
     private func computeFilteredSites() -> [SiteItem] {
         let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        let compactQuery = compactSiteSearchText(normalizedQuery)
+        let searchTerms = normalizedQuery
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+            .filter { !$0.isEmpty }
         let values = sites.filter { site in
-            if !normalizedQuery.isEmpty {
+            if !searchTerms.isEmpty {
                 let config = config(for: site)
-                let searchableValues = [site.name, site.siteKey, site.url, site.username, site.email]
-                    + [config?.string("name", "site"), config?.string("nickname")].compactMap { $0 }
+                let searchableValues = [
+                    site.name, site.siteKey, site.url, site.username, site.email, site.userID,
+                    site.level, site.siteType, resolvedSiteType(for: site)
+                ]
+                    + site.tags
+                    + [config?.string("name", "site"), config?.string("nickname"), config?.string("tracker")].compactMap { $0 }
                     + (config.map { configStrings($0["url"]) } ?? [])
-                let matches = searchableValues.contains { value in
-                    value.localizedCaseInsensitiveContains(normalizedQuery)
-                        || (!compactQuery.isEmpty && compactSiteSearchText(value).contains(compactQuery))
+                let matches = searchTerms.allSatisfy { term in
+                    let compactTerm = compactSiteSearchText(term)
+                    return searchableValues.contains { value in
+                        value.localizedCaseInsensitiveContains(term)
+                            || (!compactTerm.isEmpty && compactSiteSearchText(value).contains(compactTerm))
+                    }
                 }
                 if !matches { return false }
             }
@@ -320,7 +330,7 @@ final class SitesViewModel: ObservableObject {
             case .unsigned: if !site.signIn || site.signed { return false }
             case .hasNewMessage: if site.mail <= 0 { return false }
             case .hasNewAnnouncement: if site.notice <= 0 { return false }
-            case .hasNewNotification: if site.unread <= 0 { return false }
+            case .hasNewNotification: if site.mail <= 0 && site.notice <= 0 { return false }
             case .noTodayData: if site.hasTodayData { return false }
             case .hasUploadDelta: if site.uploadDelta <= 0 { return false }
             case .hasDownloadDelta: if site.downloadDelta <= 0 { return false }
@@ -340,7 +350,7 @@ final class SitesViewModel: ObservableObject {
             case .graduated: if milestone(for: site) != .graduation { return false }
             case .noSeeding: if site.seeding > 0 { return false }
             case .downloading: if site.leeching <= 0 { return false }
-            case .lowRatio: if site.ratio >= 1 { return false }
+            case .lowRatio: if site.statusHistory.isEmpty || site.ratio >= 1 { return false }
             }
             if !selectedTags.isEmpty && selectedTags.isDisjoint(with: site.tags) { return false }
             if !selectedTypes.isEmpty && !selectedTypes.contains(resolvedSiteType(for: site)) { return false }
@@ -351,7 +361,9 @@ final class SitesViewModel: ObservableObject {
             return true
         }
         return values.sorted { left, right in
-            if left.unread != right.unread { return left.unread > right.unread }
+            let leftNoticeCount = left.mail + left.notice
+            let rightNoticeCount = right.mail + right.notice
+            if leftNoticeCount != rightNoticeCount { return leftNoticeCount > rightNoticeCount }
             let comparison: ComparisonResult
             switch sortField {
             case .updated: comparison = left.updatedAt.compare(right.updatedAt)
@@ -374,6 +386,7 @@ final class SitesViewModel: ObservableObject {
             case .ratio: comparison = numberCompare(left.ratio, right.ratio)
             case .sortID: comparison = left.sortID == right.sortID ? .orderedSame : (left.sortID < right.sortID ? .orderedAscending : .orderedDescending)
             }
+            if comparison == .orderedSame { return left.id < right.id }
             return ascending ? comparison == .orderedAscending : comparison == .orderedDescending
         }
     }
@@ -390,15 +403,25 @@ final class SitesViewModel: ObservableObject {
             .filter { !$0.isEmpty }
             .sorted()
     }
-    var activeSiteCount: Int { sites.lazy.filter(\.enabled).count }
-    var pendingSignInCount: Int { sites.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
-    var unreadCount: Int { sites.reduce(0) { $0 + $1.unread } }
+    var filteredActiveSiteCount: Int { filtered.lazy.filter(\.enabled).count }
+    var filteredPendingSignInCount: Int { filtered.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
+    var filteredUnreadCount: Int { filtered.reduce(0) { $0 + $1.unread } }
+    var activeFilterCount: Int {
+        var count = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 1
+        if availability != .alive { count += 1 }
+        if condition != .all { count += 1 }
+        count += selectedTags.count + selectedTypes.count
+        if !selectedUsername.isEmpty { count += 1 }
+        if !selectedEmail.isEmpty { count += 1 }
+        if sortField != .updated || ascending != SiteSortField.updated.defaultAscending { count += 1 }
+        return count
+    }
     var hasFilters: Bool {
-        availability != .alive || condition != .all || !selectedTags.isEmpty || !selectedTypes.isEmpty
-            || !selectedUsername.isEmpty || !selectedEmail.isEmpty || sortField != .updated || !ascending
+        activeFilterCount > 0
     }
 
     func resetFilters() {
+        query = ""
         availability = .alive
         condition = .all
         sortField = .updated
@@ -415,7 +438,10 @@ final class SitesViewModel: ObservableObject {
     }
 
     func selectSortField(_ field: SiteSortField) {
-        guard sortField != field else { return }
+        if sortField == field {
+            ascending.toggle()
+            return
+        }
         sortField = field
         ascending = field.defaultAscending
     }
@@ -515,7 +541,7 @@ final class SitesViewModel: ObservableObject {
             let headers = appState.accessToken.isEmpty
                 ? [:]
                 : ["Authorization": "Bearer \(appState.accessToken)"]
-            for fileExtension in ["png", "gif", "jpg", "jpeg", "webp", "ico"] {
+            for fileExtension in ["gif", "png", "jpg", "jpeg", "webp", "ico"] {
                 let relative = "local/icons/\(urlPathSegment(siteName)).\(fileExtension)"
                 guard let url = URL(string: relative, relativeTo: serverURL)?.absoluteURL else { continue }
                 if seen.insert(url.absoluteString).inserted {
@@ -589,37 +615,36 @@ struct SitesView: View {
     @State private var editingSite: SiteItem?
     @State private var deletingSite: SiteItem?
     @State private var repeatingSite: SiteItem?
+    @State private var isRunningGlobalAction = false
 
     var body: some View {
-        Group {
-            if model.isLoading { LoadingState() }
-            else if model.filtered.isEmpty {
-                EmptyState(
-                    icon: "globe.badge.chevron.backward",
-                    title: model.sites.isEmpty ? "还没有站点" : "没有匹配站点",
-                    detail: model.sites.isEmpty ? "添加站点后可同步流量、签到和辅种状态" : "调整搜索或筛选条件后再试",
-                    actionTitle: model.sites.isEmpty ? "添加站点" : "清除筛选"
-                ) {
-                    if model.sites.isEmpty { showAdd = true }
-                    else {
-                        model.query = ""
-                        model.resetFilters()
+        VStack(spacing: 0) {
+            if model.usingCachedData {
+                SessionCacheBanner(cachedAt: model.cachedAt)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+            }
+            SiteSearchFilterBar(model: model) { showFilters = true }
+            Group {
+                if model.isLoading { LoadingState() }
+                else if model.filtered.isEmpty {
+                    EmptyState(
+                        icon: "globe.badge.chevron.backward",
+                        title: model.sites.isEmpty ? "还没有站点" : "没有匹配站点",
+                        detail: model.sites.isEmpty ? "添加站点后可同步流量、签到和辅种状态" : "调整搜索或筛选条件后再试",
+                        actionTitle: model.sites.isEmpty ? "添加站点" : "清除筛选"
+                    ) {
+                        if model.sites.isEmpty { showAdd = true }
+                        else { model.resetFilters() }
                     }
-                }
-            } else {
-                VStack(spacing: 0) {
-                    if model.usingCachedData {
-                        SessionCacheBanner(cachedAt: model.cachedAt)
-                            .padding(.horizontal, 16)
-                            .padding(.top, 8)
-                            .padding(.bottom, 8)
-                    }
+                } else {
                     SiteListSummaryBar(
                         visibleCount: model.filtered.count,
                         totalCount: model.sites.count,
-                        activeCount: model.activeSiteCount,
-                        pendingSignInCount: model.pendingSignInCount,
-                        unreadCount: model.unreadCount
+                        activeCount: model.filteredActiveSiteCount,
+                        pendingSignInCount: model.filteredPendingSignInCount,
+                        unreadCount: model.filteredUnreadCount
                     )
                     List {
                         ForEach(model.filtered) { site in
@@ -653,24 +678,35 @@ struct SitesView: View {
                     .refreshable { await model.load(appState) }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .searchable(text: $model.query, prompt: "站点、昵称、镜像、账号")
         .navigationTitle("站点")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button { showFilters = true } label: {
-                    Image(systemName: model.hasFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
-                }
-                .accessibilityLabel("筛选和排序")
                 Menu {
+                    Section("站点数据") {
+                        Button { Task { await runGlobalAction(APIPath.siteStatus) } } label: {
+                            Label("刷新全部站点", systemImage: "arrow.clockwise")
+                        }
+                        Button { Task { await runGlobalAction(APIPath.siteSign) } } label: {
+                            Label("全部站点签到", systemImage: "checkmark.seal")
+                        }
+                    }
+                    Section("配置") {
                     Button { showAdd = true } label: { Label("添加站点", systemImage: "plus") }
                     Button { showImport = true } label: { Label("导入站点", systemImage: "square.and.arrow.down") }
                     Button { showGenerator = true } label: { Label("配置生成器", systemImage: "doc.badge.gearshape") }
                     Button { showTimeline = true } label: { Label("站点时间轴", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
+                    }
                 } label: {
-                    Image(systemName: "plus")
+                    if isRunningGlobalAction {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "ellipsis.circle")
+                    }
                 }
+                .disabled(isRunningGlobalAction)
                 .accessibilityLabel("站点工具")
             }
         }
@@ -721,6 +757,119 @@ struct SitesView: View {
         Button { Task { await model.operate(appState, site: site, path: APIPath.siteStatus) } } label: { Label("刷新数据", systemImage: "arrow.clockwise") }
         Button { Task { await model.operate(appState, site: site, path: APIPath.siteSign) } } label: { Label("签到", systemImage: "checkmark.seal") }
         Button { repeatingSite = site } label: { Label("辅种", systemImage: "square.stack.3d.up") }
+    }
+
+    @MainActor private func runGlobalAction(_ path: String) async {
+        guard !isRunningGlobalAction else { return }
+        isRunningGlobalAction = true
+        defer { isRunningGlobalAction = false }
+        let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
+        if await appState.perform(endpoint, method: .get) {
+            await model.load(appState, cached: false)
+        }
+    }
+}
+
+private struct SiteSearchFilterBar: View {
+    @ObservedObject var model: SitesViewModel
+    let openFilters: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("搜索站点、镜像、账号、标签", text: $model.query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                    if !model.query.isEmpty {
+                        Button { model.query = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("清除搜索")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .frame(minHeight: 36)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                Button(action: openFilters) {
+                    Label(
+                        model.activeFilterCount == 0 ? "筛选" : "筛选 \(model.activeFilterCount)",
+                        systemImage: model.hasFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
+                    )
+                    .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .tint(model.hasFilters ? HarvestTheme.blue : .secondary)
+                .accessibilityLabel("筛选和排序，已启用 \(model.activeFilterCount) 项")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            if model.hasFilters {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        if !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            filterToken("搜索：\(model.query)", icon: "magnifyingglass") { model.query = "" }
+                        }
+                        if model.availability != .alive {
+                            filterToken(model.availability.rawValue, icon: "antenna.radiowaves.left.and.right") { model.availability = .alive }
+                        }
+                        if model.condition != .all {
+                            filterToken(model.condition.rawValue, icon: "checklist") { model.condition = .all }
+                        }
+                        ForEach(model.selectedTypes.sorted(), id: \.self) { type in
+                            filterToken(type, icon: "square.grid.2x2") { model.selectedTypes.remove(type) }
+                        }
+                        ForEach(model.selectedTags.sorted(), id: \.self) { tag in
+                            filterToken("#\(tag)", icon: "tag") { model.selectedTags.remove(tag) }
+                        }
+                        if !model.selectedUsername.isEmpty {
+                            filterToken(model.selectedUsername, icon: "person") { model.selectedUsername = "" }
+                        }
+                        if !model.selectedEmail.isEmpty {
+                            filterToken(model.selectedEmail, icon: "envelope") { model.selectedEmail = "" }
+                        }
+                        if model.sortField != .updated || model.ascending != SiteSortField.updated.defaultAscending {
+                            filterToken(model.sortField.rawValue, icon: model.ascending ? "arrow.up" : "arrow.down") {
+                                model.sortField = .updated
+                                model.ascending = SiteSortField.updated.defaultAscending
+                            }
+                        }
+                        Button("清除全部") { model.resetFilters() }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.plain)
+                            .foregroundStyle(HarvestTheme.coral)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+        .background(Color(uiColor: .secondarySystemBackground))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func filterToken(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                Text(title).lineLimit(1)
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .font(.caption.weight(.medium))
+        }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .controlSize(.small)
+        .tint(HarvestTheme.blue)
+        .accessibilityLabel("移除筛选：\(title)")
     }
 }
 
@@ -1010,6 +1159,30 @@ struct SiteFilterSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    HStack {
+                        Label("筛选结果", systemImage: "line.3.horizontal.decrease.circle")
+                        Spacer()
+                        Text("\(model.filtered.count) / \(model.sites.count)")
+                            .font(.subheadline.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(model.hasFilters ? HarvestTheme.blue : .secondary)
+                    }
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("搜索站点、镜像、账号、标签", text: $model.query)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        if !model.query.isEmpty {
+                            Button { model.query = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("清除搜索")
+                        }
+                    }
+                }
                 Section("状态") {
                     Picker("存活状态", selection: $model.availability) {
                         ForEach(SiteAvailabilityFilter.allCases) { Text($0.rawValue).tag($0) }
@@ -1019,16 +1192,24 @@ struct SiteFilterSheet: View {
                     }
                 }
                 if !model.availableTags.isEmpty {
-                    Section("标签") {
+                    Section {
                         ForEach(model.availableTags, id: \.self) { tag in
                             Toggle(tag, isOn: tagBinding(tag))
+                        }
+                    } header: {
+                        filterSectionHeader("标签", selectedCount: model.selectedTags.count) {
+                            model.selectedTags.removeAll()
                         }
                     }
                 }
                 if !model.availableTypes.isEmpty {
-                    Section("类型") {
+                    Section {
                         ForEach(model.availableTypes, id: \.self) { type in
                             Toggle(type, isOn: typeBinding(type))
+                        }
+                    } header: {
+                        filterSectionHeader("类型", selectedCount: model.selectedTypes.count) {
+                            model.selectedTypes.removeAll()
                         }
                     }
                 }
@@ -1036,16 +1217,23 @@ struct SiteFilterSheet: View {
                     filterPicker("用户名", selection: $model.selectedUsername, values: model.availableUsernames)
                     filterPicker("邮箱", selection: $model.selectedEmail, values: model.availableEmails)
                 }
-                Section("排序") {
-                    Picker(
-                        "字段",
-                        selection: Binding(
-                            get: { model.sortField },
-                            set: { model.selectSortField($0) }
-                        )
-                    ) {
-                        ForEach(SiteSortField.allCases) { Text($0.rawValue).tag($0) }
+                Section("排序字段") {
+                    ForEach(SiteSortField.allCases) { field in
+                        Button { model.selectSortField(field) } label: {
+                            HStack {
+                                Text(field.rawValue)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                if model.sortField == field {
+                                    Image(systemName: model.ascending ? "arrow.up" : "arrow.down")
+                                        .foregroundStyle(HarvestTheme.blue)
+                                        .accessibilityLabel(model.ascending ? "升序" : "降序")
+                                }
+                            }
+                        }
                     }
+                }
+                Section("排序方向") {
                     Picker("方向", selection: $model.ascending) {
                         Text("降序").tag(false)
                         Text("升序").tag(true)
@@ -1060,6 +1248,22 @@ struct SiteFilterSheet: View {
                     Button("重置") { model.resetFilters() }.disabled(!model.hasFilters)
                 }
                 ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+            }
+        }
+    }
+
+    private func filterSectionHeader(
+        _ title: String,
+        selectedCount: Int,
+        clear: @escaping () -> Void
+    ) -> some View {
+        HStack {
+            Text(selectedCount == 0 ? title : "\(title) · 已选 \(selectedCount)")
+            Spacer()
+            if selectedCount > 0 {
+                Button("清除", action: clear)
+                    .font(.caption)
+                    .textCase(nil)
             }
         }
     }
@@ -1874,9 +2078,10 @@ struct SiteRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             header
+            accountSummary
             trafficSection
             coreMetrics
-            metadataSection
+            activitySection
         }
         .padding(12)
         .background(
@@ -1899,41 +2104,56 @@ struct SiteRow: View {
         return Array(repeating: GridItem(.flexible(), spacing: 6), count: count)
     }
 
-    private var metadataColumns: [GridItem] {
-        let count = dynamicTypeSize.isAccessibilitySize ? 2 : 3
-        return Array(repeating: GridItem(.flexible(), spacing: 7), count: count)
-    }
-
     private var header: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(alignment: .center, spacing: 10) {
             siteLogo(size: 48)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(site.name)
-                        .font(.headline)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.82)
-                        .layoutPriority(1)
-                    Spacer(minLength: 4)
-                    SiteAvailabilityBadge(enabled: site.enabled)
-                }
-
-                Text(siteIdentityText)
-                    .font(.caption)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(site.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .layoutPriority(1)
+                Label(joinedText, systemImage: "calendar.badge.clock")
+                    .font(.caption2.weight(.medium).monospacedDigit())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-
-                if !headerStatuses.isEmpty {
-                    HStack(spacing: 10) {
-                        ForEach(headerStatuses) { status in
-                            SiteInlineStatus(status: status)
-                        }
+                HStack(alignment: .center, spacing: 8) {
+                    if let signStatus {
+                        SiteInlineStatus(status: signStatus)
+                    }
+                    Spacer(minLength: 4)
+                    if let levelStatus {
+                        SiteInlineStatus(status: levelStatus)
                     }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var accountSummary: some View {
+        HStack(spacing: 0) {
+            SiteHeaderMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
+            summaryDivider
+            SiteHeaderMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
+            summaryDivider
+            SiteHeaderMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
+            summaryDivider
+            SiteHeaderMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
+            summaryDivider
+            SiteHeaderMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
+        }
+        .padding(.vertical, 6)
+        .background(HarvestTheme.green.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(HarvestTheme.green.opacity(0.09), lineWidth: 0.75)
+        }
+    }
+
+    private var summaryDivider: some View {
+        Divider()
+            .frame(height: 34)
     }
 
     @ViewBuilder private var trafficSection: some View {
@@ -1999,28 +2219,14 @@ struct SiteRow: View {
         }
     }
 
-    private var metadataSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            LazyVGrid(columns: metadataColumns, alignment: .leading, spacing: 6) {
-                SiteMetadataMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
-                SiteMetadataMetric(icon: "calendar", label: "做种天数", value: "\(site.seedDays) 天", color: HarvestTheme.green)
-                SiteMetadataMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
-                SiteMetadataMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
-                SiteMetadataMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
-                SiteMetadataMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
-                SiteMetadataMetric(icon: "person.badge.clock", label: "注册", value: joinedText, color: HarvestTheme.blue)
-                SiteMetadataMetric(icon: "clock.fill", label: "活跃", value: shortDate(site.latestActive), color: HarvestTheme.green)
-                SiteMetadataMetric(icon: "arrow.clockwise", label: "同步", value: shortDate(site.updatedAt), color: HarvestTheme.amber)
-            }
-            if !site.tags.isEmpty {
-                SiteDetailLine(
-                    icon: "tag.fill",
-                    label: "标签",
-                    value: site.tags.joined(separator: " · "),
-                    color: HarvestTheme.blue,
-                    lineLimit: nil
-                )
-            }
+    private var activitySection: some View {
+        TimelineView(.periodic(from: .now, by: 60)) { context in
+            SiteDetailLine(
+                icon: "clock.arrow.circlepath",
+                label: "最近时间",
+                value: recentTimeText(relativeTo: context.date),
+                color: HarvestTheme.green
+            )
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 7)
@@ -2032,26 +2238,25 @@ struct SiteRow: View {
     }
 
     private func siteLogo(size: CGFloat) -> some View {
-        let radius = min(14, size * 0.24)
         return ZStack {
-            RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .fill(site.enabled ? HarvestTheme.blue : Color.secondary)
-            CachedRemoteImageCandidates(candidates: iconCandidates) { image in
-                image
-                    .resizable()
-                    .scaledToFit()
-                    .padding(size * 0.12)
-            } placeholder: {
+            Circle()
+                .fill(Color.white)
+            CachedAnimatedRemoteImageCandidates(
+                candidates: iconCandidates,
+                maximumPixelSize: size * UIScreen.main.scale
+            ) {
                 Image(systemName: site.enabled ? "globe.asia.australia.fill" : "globe.asia.australia")
                     .font(.system(size: size * 0.38, weight: .semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
+            .padding(size * 0.1)
+            .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .clipShape(Circle())
         .overlay {
-            RoundedRectangle(cornerRadius: radius, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.75)
+            Circle()
+                .stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
         }
         .overlay(alignment: .bottomTrailing) {
             Circle()
@@ -2063,18 +2268,20 @@ struct SiteRow: View {
         .accessibilityHidden(true)
     }
 
-    private var headerStatuses: [SiteStatusDescriptor] {
-        var statuses: [SiteStatusDescriptor] = []
+    private var signStatus: SiteStatusDescriptor? {
         if site.signed {
-            statuses.append(SiteStatusDescriptor(id: "signed", label: "今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green))
-        } else if site.signIn {
-            statuses.append(SiteStatusDescriptor(id: "sign", label: "今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber))
+            return SiteStatusDescriptor(id: "signed", label: "今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green)
         }
+        if site.signIn {
+            return SiteStatusDescriptor(id: "sign", label: "今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber)
+        }
+        return nil
+    }
+
+    private var levelStatus: SiteStatusDescriptor? {
         let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !level.isEmpty {
-            statuses.append(SiteStatusDescriptor(id: "level", label: level, icon: "medal.fill", color: HarvestTheme.blue))
-        }
-        return statuses
+        guard !level.isEmpty else { return nil }
+        return SiteStatusDescriptor(id: "level", label: level, icon: "medal.fill", color: HarvestTheme.blue)
     }
 
     private func dailyDeltaText(_ value: Double) -> String {
@@ -2084,19 +2291,26 @@ struct SiteRow: View {
         return "今日 \(prefix)\(formatBytes(abs(value)))"
     }
 
-    private var siteIdentityText: String {
-        let host = URL(string: site.url)?.host?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !host.isEmpty, !site.siteKey.isEmpty, host.caseInsensitiveCompare(site.siteKey) != .orderedSame {
-            return "\(site.siteKey) · \(host)"
-        }
-        if !host.isEmpty { return host }
-        return site.siteKey.isEmpty ? "未配置站点地址" : site.siteKey
+    private var joinedText: String {
+        guard let joined = parseDate(site.joinedAt) else { return "未登记" }
+        let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
+        return "\(days / 7)周\(days % 7)天"
     }
 
-    private var joinedText: String {
-        guard let joined = parseDate(site.joinedAt) else { return shortDate(site.joinedAt) }
-        let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
-        return "\(days) 天"
+    private func recentTimeText(relativeTo now: Date) -> String {
+        let dates = [parseDate(site.latestActive), parseDate(site.updatedAt)].compactMap { $0 }
+        guard let mostRecent = dates.max() else { return "-" }
+        let elapsed = max(0, now.timeIntervalSince(mostRecent))
+        if elapsed < 60 { return "刚刚" }
+        let minutes = Int(elapsed / 60)
+        if minutes < 60 { return "\(minutes)分钟前" }
+        let hours = Int(elapsed / 3_600)
+        if hours < 24 { return "\(hours)小时前" }
+        let days = Int(elapsed / 86_400)
+        if days < 7 { return "\(days)天前" }
+        if days < 30 { return "\(days / 7)周前" }
+        if days < 365 { return "\(days / 30)个月前" }
+        return "\(days / 365)年前"
     }
 
     private var ratioText: String { privateValue(String(format: "%.2f", site.ratio)) }
@@ -2104,15 +2318,6 @@ struct SiteRow: View {
     private var hrText: String {
         let value = site.hr.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "0" : value
-    }
-
-    private func shortDate(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "-" }
-        if let date = parseDate(trimmed) {
-            return date.formatted(date: .abbreviated, time: .omitted)
-        }
-        return String(trimmed.prefix(10))
     }
 
     private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
@@ -2124,7 +2329,7 @@ struct SiteRow: View {
             : "上传 \(formatBytes(site.uploaded))，下载 \(formatBytes(site.downloaded))，分享率 \(String(format: "%.2f", site.ratio))"
         let signStatus = site.signed ? "，今日已签到" : (site.signIn ? "，今日待签到" : "")
         let unread = site.unread > 0 ? "，未读 \(site.unread)" : ""
-        return "\(site.name)，\(state)\(signStatus)，\(traffic)，\(site.seeding) 个做种\(unread)"
+        return "\(site.name)，注册 \(joinedText)，\(state)\(signStatus)，\(traffic)，\(site.seeding) 个做种，最近时间 \(recentTimeText(relativeTo: Date()))\(unread)"
     }
 }
 
@@ -2133,23 +2338,6 @@ private struct SiteStatusDescriptor: Identifiable {
     let label: String
     let icon: String
     let color: Color
-}
-
-private struct SiteAvailabilityBadge: View {
-    let enabled: Bool
-
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(enabled ? HarvestTheme.green : HarvestTheme.coral)
-                .frame(width: 7, height: 7)
-            Text(enabled ? "可用" : "停用")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-        }
-        .fixedSize(horizontal: true, vertical: true)
-        .accessibilityLabel(enabled ? "站点可用" : "站点停用")
-    }
 }
 
 private struct SiteInlineStatus: View {
@@ -2162,6 +2350,37 @@ private struct SiteInlineStatus: View {
             .lineLimit(1)
             .minimumScaleFactor(0.75)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct SiteHeaderMetric: View {
+    let icon: String
+    let label: String
+    let value: String
+    let color: Color
+
+    var body: some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 18, height: 18)
+                    .background(color, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                Text(label)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            Text(value)
+                .font(.caption2.weight(.bold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity, minHeight: 38)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label) \(value)")
     }
 }
 
@@ -2225,36 +2444,6 @@ private struct SiteCardMetric: View {
         }
         .frame(maxWidth: .infinity, minHeight: 45)
         .accessibilityLabel("\(label) \(value)")
-    }
-}
-
-private struct SiteMetadataMetric: View {
-    let icon: String
-    let label: String
-    let value: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 22, height: 22)
-                .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(label)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                Text(value)
-                    .font(.caption.weight(.semibold).monospacedDigit())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.68)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -4889,18 +5078,23 @@ private struct SiteDetailIcon: View {
     let iconCandidates: [RemoteImageCandidate]
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(site.enabled ? HarvestTheme.blue : Color.secondary)
-            CachedRemoteImageCandidates(candidates: iconCandidates) { image in
-                image.resizable().scaledToFit().padding(8)
-            } placeholder: {
+            Circle().fill(Color.white)
+            CachedAnimatedRemoteImageCandidates(
+                candidates: iconCandidates,
+                maximumPixelSize: 64 * UIScreen.main.scale
+            ) {
                 Image(systemName: "globe.americas.fill")
                     .font(.title2.weight(.semibold))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
+            .padding(7)
+            .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: 64, height: 64)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(Circle())
+        .overlay {
+            Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
+        }
     }
 }
 

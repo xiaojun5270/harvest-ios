@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -112,6 +113,7 @@ actor RemoteImageDataCache {
         memoryCache.removeAllObjects()
         diskCache.removeAllCachedResponses()
         RemoteDecodedImageCache.shared.removeAll()
+        RemoteAnimatedImageCache.shared.removeAll()
     }
 
     private func isPublicCacheURL(_ url: URL) -> Bool {
@@ -149,6 +151,130 @@ private final class RemoteDecodedImageCache: @unchecked Sendable {
     }
 
     func removeAll() { cache.removeAllObjects() }
+}
+
+private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
+    let cacheKey: String
+    let frames: [UIImage]
+    let keyTimes: [NSNumber]
+    let duration: TimeInterval
+    let memoryCost: Int
+
+    init?(data: Data, cacheKey: String, maximumPixelSize: CGFloat) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 0 else { return nil }
+        let maximumFrameCount = 180
+        let frameStep = max(1, Int(ceil(Double(frameCount) / Double(maximumFrameCount))))
+
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maximumPixelSize))
+        ]
+        var decodedFrames: [UIImage] = []
+        var frameDurations: [TimeInterval] = []
+        decodedFrames.reserveCapacity(min(frameCount, maximumFrameCount))
+        frameDurations.reserveCapacity(min(frameCount, maximumFrameCount))
+
+        for index in stride(from: 0, to: frameCount, by: frameStep) {
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, index, thumbnailOptions as CFDictionary) else {
+                continue
+            }
+            decodedFrames.append(UIImage(cgImage: cgImage))
+            let endIndex = min(index + frameStep, frameCount)
+            let sampledDuration = (index..<endIndex).reduce(0) { partial, frameIndex in
+                partial + Self.frameDuration(source: source, index: frameIndex)
+            }
+            frameDurations.append(sampledDuration)
+        }
+        guard !decodedFrames.isEmpty else { return nil }
+
+        let totalDuration = max(frameDurations.reduce(0, +), 0.1)
+        var elapsed: TimeInterval = 0
+        var times: [NSNumber] = []
+        times.reserveCapacity(frameDurations.count)
+        for frameDuration in frameDurations {
+            times.append(NSNumber(value: elapsed / totalDuration))
+            elapsed += frameDuration
+        }
+
+        self.cacheKey = cacheKey
+        frames = decodedFrames
+        keyTimes = times
+        duration = totalDuration
+        memoryCost = decodedFrames.reduce(0) { partial, image in
+            partial + Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        }
+    }
+
+    private static func frameDuration(source: CGImageSource, index: Int) -> TimeInterval {
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+              let gif = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+            return 0.1
+        }
+        let unclamped = gif[kCGImagePropertyGIFUnclampedDelayTime] as? NSNumber
+        let clamped = gif[kCGImagePropertyGIFDelayTime] as? NSNumber
+        let value = (unclamped ?? clamped)?.doubleValue ?? 0.1
+        return value < 0.02 ? 0.1 : value
+    }
+}
+
+private final class RemoteAnimatedImageCache: @unchecked Sendable {
+    static let shared = RemoteAnimatedImageCache()
+    private let cache = NSCache<NSString, RemoteAnimatedImage>()
+
+    private init() {
+        cache.totalCostLimit = 48 * 1_024 * 1_024
+        cache.countLimit = 120
+    }
+
+    func image(for key: String) -> RemoteAnimatedImage? { cache.object(forKey: key as NSString) }
+
+    func insert(_ image: RemoteAnimatedImage, for key: String) {
+        cache.setObject(image, forKey: key as NSString, cost: image.memoryCost)
+    }
+
+    func removeAll() { cache.removeAllObjects() }
+}
+
+private final class AnimatedRemoteUIImageView: UIImageView {
+    private var displayedCacheKey = ""
+
+    func display(_ animatedImage: RemoteAnimatedImage) {
+        guard displayedCacheKey != animatedImage.cacheKey else { return }
+        displayedCacheKey = animatedImage.cacheKey
+        layer.removeAnimation(forKey: "harvest.site-logo.animation")
+        image = animatedImage.frames.first
+        guard animatedImage.frames.count > 1 else { return }
+
+        let animation = CAKeyframeAnimation(keyPath: "contents")
+        animation.values = animatedImage.frames.compactMap(\.cgImage)
+        guard animation.values?.count == animatedImage.frames.count else { return }
+        animation.keyTimes = animatedImage.keyTimes
+        animation.duration = animatedImage.duration
+        animation.calculationMode = .discrete
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        layer.add(animation, forKey: "harvest.site-logo.animation")
+    }
+}
+
+private struct AnimatedRemoteImageView: UIViewRepresentable {
+    let image: RemoteAnimatedImage
+
+    func makeUIView(context: Context) -> AnimatedRemoteUIImageView {
+        let imageView = AnimatedRemoteUIImageView()
+        imageView.backgroundColor = .clear
+        imageView.contentMode = .scaleAspectFit
+        imageView.clipsToBounds = true
+        return imageView
+    }
+
+    func updateUIView(_ imageView: AnimatedRemoteUIImageView, context: Context) {
+        imageView.display(image)
+    }
 }
 
 let doubanImageReferer = "https://movie.douban.com/"
@@ -339,6 +465,85 @@ struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
     }
 
     private var candidateKey: String { candidates.map(\.id).joined(separator: "|") }
+
+    private func advanceCandidate() {
+        candidateIndex = min(candidateIndex + 1, candidates.count)
+    }
+}
+
+struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
+    let candidates: [RemoteImageCandidate]
+    let maximumPixelSize: CGFloat
+    private let placeholder: () -> Placeholder
+    @State private var candidateIndex = 0
+    @State private var loadedImage: RemoteAnimatedImage?
+
+    init(
+        candidates: [RemoteImageCandidate],
+        maximumPixelSize: CGFloat,
+        @ViewBuilder placeholder: @escaping () -> Placeholder
+    ) {
+        self.candidates = candidates
+        self.maximumPixelSize = maximumPixelSize
+        self.placeholder = placeholder
+    }
+
+    var body: some View {
+        Group {
+            if let loadedImage {
+                AnimatedRemoteImageView(image: loadedImage)
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: requestKey) { await loadCurrentCandidate() }
+        .onChange(of: candidateKey) { _, _ in
+            candidateIndex = 0
+            loadedImage = nil
+        }
+    }
+
+    private var candidateKey: String { candidates.map(\.id).joined(separator: "|") }
+
+    private var requestKey: String {
+        guard candidateIndex < candidates.count else { return "\(candidateKey)|exhausted" }
+        return "\(candidateKey)|\(candidateIndex)|\(Int(maximumPixelSize.rounded(.up)))"
+    }
+
+    @MainActor private func loadCurrentCandidate() async {
+        loadedImage = nil
+        guard candidateIndex < candidates.count else { return }
+        let candidate = candidates[candidateIndex]
+        guard let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
+            advanceCandidate()
+            return
+        }
+        let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
+        let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+        let decodedCacheKey = "\(dataCacheKey)|animated|\(Int(maximumPixelSize.rounded(.up)))"
+        if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
+            loadedImage = cached
+            return
+        }
+
+        do {
+            let data = try await RemoteImageDataCache.shared.data(for: normalizedURL, headers: effectiveHeaders)
+            guard !Task.isCancelled else { return }
+            let pixelSize = maximumPixelSize
+            let decoded = await Task.detached(priority: .utility) {
+                RemoteAnimatedImage(data: data, cacheKey: decodedCacheKey, maximumPixelSize: pixelSize)
+            }.value
+            guard !Task.isCancelled, let decoded else {
+                if !Task.isCancelled { advanceCandidate() }
+                return
+            }
+            RemoteAnimatedImageCache.shared.insert(decoded, for: decodedCacheKey)
+            loadedImage = decoded
+        } catch {
+            guard !Task.isCancelled else { return }
+            advanceCandidate()
+        }
+    }
 
     private func advanceCandidate() {
         candidateIndex = min(candidateIndex + 1, candidates.count)
