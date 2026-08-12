@@ -691,7 +691,7 @@ struct LoginView: View {
             .sheet(isPresented: $showHistory) {
                 LoginHistorySheet(server: $server, username: $username, password: $password)
                     .environmentObject(appState)
-                    .presentationDetents([.medium, .large])
+                    .presentationDetents([.large])
             }
             .sheet(isPresented: $showSetup) {
                 SetupWizardView(server: server, setupStatus: setupStatus) { adminUser, adminPassword in
@@ -705,7 +705,7 @@ struct LoginView: View {
             .sheet(isPresented: $showAppUpdate) {
                 AppUpdatePromptView()
                     .environmentObject(appState)
-                    .presentationDetents([.medium, .large])
+                    .presentationDetents([.large])
             }
             .confirmationDialog(
                 "清理所有持久化数据？",
@@ -1019,9 +1019,7 @@ struct MainShellView: View {
     var body: some View {
         NavigationStack {
             TabView(selection: $appState.selectedTab) {
-                if appState.mediaTMDBEnabled || appState.mediaDoubanEnabled {
-                    NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
-                }
+                NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
                 if appState.profile?.isSuperuser == true {
                     SitesView().tabItem { Label("站点", systemImage: "globe.asia.australia.fill") }.tag(1)
                     DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
@@ -1078,9 +1076,9 @@ struct MainShellView: View {
             }
         }
         .sheet(isPresented: $showingSettings) { SettingsView().environmentObject(appState) }
-        .sheet(isPresented: $showingNotices) { NoticeView().environmentObject(appState).presentationDetents([.medium, .large]) }
+        .sheet(isPresented: $showingNotices) { NoticeView().environmentObject(appState).presentationDetents([.large]) }
         .sheet(isPresented: $showingAppUpdate) {
-            AppUpdatePromptView().environmentObject(appState).presentationDetents([.medium, .large])
+            AppUpdatePromptView().environmentObject(appState).presentationDetents([.large])
         }
         .task(id: appState.autoRefreshMinutes) {
             while !Task.isCancelled {
@@ -1123,11 +1121,6 @@ struct MainShellView: View {
         }
         .onChange(of: appState.noticePresentationGeneration) { _, _ in
             presentPendingNoticeIfNeeded()
-        }
-        .onChange(of: appState.mediaTMDBEnabled || appState.mediaDoubanEnabled) { _, enabled in
-            if !enabled && appState.selectedTab == 0 {
-                appState.selectedTab = appState.profile?.isSuperuser == true ? 2 : 3
-            }
         }
     }
 

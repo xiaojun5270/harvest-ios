@@ -317,9 +317,9 @@ struct SettingsView: View {
                     }
                 }
 
-                Section("影视资讯") {
-                    Toggle("TMDB", isOn: Binding(get: { appState.mediaTMDBEnabled }, set: appState.setMediaTMDBEnabled))
-                    Toggle("豆瓣", isOn: Binding(get: { appState.mediaDoubanEnabled }, set: appState.setMediaDoubanEnabled))
+                Section("资讯页内容") {
+                    Toggle("显示 TMDB", isOn: Binding(get: { appState.mediaTMDBEnabled }, set: appState.setMediaTMDBEnabled))
+                    Toggle("显示豆瓣", isOn: Binding(get: { appState.mediaDoubanEnabled }, set: appState.setMediaDoubanEnabled))
                 }
 
                 Section("自动刷新") {

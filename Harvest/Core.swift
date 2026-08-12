@@ -710,6 +710,7 @@ struct MultipartPart {
 final class APIClient {
     static let shared = APIClient()
     private let session: URLSession
+    private let timeboxedSession: URLSession
 
     private init() {
         let configuration = URLSessionConfiguration.default
@@ -720,6 +721,15 @@ final class APIClient {
         configuration.urlCache = nil
         configuration.httpMaximumConnectionsPerHost = 8
         session = URLSession(configuration: configuration)
+
+        let timeboxedConfiguration = URLSessionConfiguration.default
+        timeboxedConfiguration.timeoutIntervalForRequest = 20
+        timeboxedConfiguration.timeoutIntervalForResource = 20
+        timeboxedConfiguration.waitsForConnectivity = false
+        timeboxedConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        timeboxedConfiguration.urlCache = nil
+        timeboxedConfiguration.httpMaximumConnectionsPerHost = 8
+        timeboxedSession = URLSession(configuration: timeboxedConfiguration)
     }
 
     func request(
@@ -728,7 +738,8 @@ final class APIClient {
         method: HTTPMethod = .get,
         token: String? = nil,
         query: [String: Any] = [:],
-        body: Any? = nil
+        body: Any? = nil,
+        timeoutInterval: TimeInterval? = nil
     ) async throws -> Any {
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
@@ -743,6 +754,7 @@ final class APIClient {
         }
 
         var request = URLRequest(url: url)
+        if let timeoutInterval { request.timeoutInterval = timeoutInterval }
         request.httpMethod = method.rawValue
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("Harvest-iOS/1.0", forHTTPHeaderField: "User-Agent")
@@ -754,7 +766,8 @@ final class APIClient {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }
 
-        let (data, response) = try await session.data(for: request)
+        let activeSession = timeoutInterval == nil ? session : timeboxedSession
+        let (data, response) = try await activeSession.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw APIError(statusCode: 0, message: "服务器未返回有效响应")
         }
@@ -1642,6 +1655,7 @@ final class AppState: ObservableObject {
         method: HTTPMethod = .get,
         query: [String: Any] = [:],
         body: Any? = nil,
+        timeoutInterval: TimeInterval? = nil,
         retry: Bool = true
     ) async throws -> Any {
         do {
@@ -1651,13 +1665,21 @@ final class AppState: ObservableObject {
                 method: method,
                 token: accessToken,
                 query: query,
-                body: body
+                body: body,
+                timeoutInterval: timeoutInterval
             )
             return result
         } catch let error as APIError where error.statusCode == 401 && retry && !refreshToken.isEmpty {
             await AppLogStore.shared.append(.warning, "\(method.rawValue) \(path) 返回 401，正在刷新令牌")
             try await refreshAccessToken()
-            return try await api(path, method: method, query: query, body: body, retry: false)
+            return try await api(
+                path,
+                method: method,
+                query: query,
+                body: body,
+                timeoutInterval: timeoutInterval,
+                retry: false
+            )
         } catch {
             await AppLogStore.shared.append(.error, "\(method.rawValue) \(path) 失败：\(error.localizedDescription)")
             throw error

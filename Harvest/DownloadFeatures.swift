@@ -1548,7 +1548,7 @@ struct DownloaderRefreshSettingsSheet: View {
                 ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.large])
     }
 
     @ViewBuilder private func refreshSlider(value: Binding<Int>, unit: String) -> some View {
@@ -1650,7 +1650,7 @@ struct TorrentFilterSheet: View {
                 ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.large])
     }
 }
 

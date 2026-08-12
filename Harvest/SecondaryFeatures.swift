@@ -119,35 +119,41 @@ final class TasksViewModel: ObservableObject {
     @Published var taskTypes: [String] = []
     @Published var crontabs: [[String: Any]] = []
     @Published var isLoading = true
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var isLoadingEditorSupport = false
     @Published var mode = "计划"
     @Published private(set) var cachedAt: Date?
     @Published private(set) var usingCachedData = false
     private var restoredCache = false
     private let sessionCacheKey = "tasks.snapshot.v1"
+    private let requestTimeout: TimeInterval = 20
 
     func load(_ appState: AppState) async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer {
+            isLoading = false
+            isRefreshing = false
+        }
         await restoreCacheIfNeeded(appState)
         isLoading = tasks.isEmpty && results.isEmpty
-        defer { isLoading = false }
+
         async let taskResult = loadEndpoint(appState, path: APIPath.schedules, label: "计划任务")
         async let resultResult = loadEndpoint(appState, path: APIPath.taskResults, label: "执行结果")
-        async let typeResult = loadEndpoint(appState, path: APIPath.taskTypes, label: "任务类型")
-        async let crontabResult = loadEndpoint(appState, path: APIPath.crontabs, label: "Cron 配置")
-        let values = await (taskResult, resultResult, typeResult, crontabResult)
-        if let taskValue = values.0.value {
+
+        let loadedTasks = await taskResult
+        if let taskValue = loadedTasks.value {
             tasks = jsonRows(taskValue).map(TaskItem.init)
             if tasks.isEmpty, let root = jsonPayloadDictionary(taskValue) { tasks = root.rows("tasks", "schedules").map(TaskItem.init) }
         }
-        if let resultValue = values.1.value {
+        isLoading = false
+
+        let loadedResults = await resultResult
+        if let resultValue = loadedResults.value {
             results = jsonRows(resultValue).map(TaskResultItem.init)
         }
-        if let typeValue = values.2.value {
-            taskTypes = jsonStrings(typeValue)
-        }
-        if let crontabValue = values.3.value {
-            crontabs = jsonRows(crontabValue)
-        }
-        let errors = [values.0.errorMessage, values.1.errorMessage, values.2.errorMessage, values.3.errorMessage].compactMap { $0 }
+
+        let errors = [loadedTasks.errorMessage, loadedResults.errorMessage].compactMap { $0 }
         usingCachedData = !errors.isEmpty && (!tasks.isEmpty || !results.isEmpty)
         if errors.isEmpty {
             cachedAt = nil
@@ -156,6 +162,27 @@ final class TasksViewModel: ObservableObject {
         } else {
             appState.presentedError = errors.joined(separator: "\n")
         }
+        if errors.isEmpty { await persistCache(appState) }
+    }
+
+    func loadEditorSupport(_ appState: AppState) async {
+        guard !isLoadingEditorSupport else { return }
+        guard taskTypes.isEmpty || crontabs.isEmpty else { return }
+        isLoadingEditorSupport = true
+        defer { isLoadingEditorSupport = false }
+
+        async let typeResult = taskTypes.isEmpty
+            ? loadEndpoint(appState, path: APIPath.taskTypes, label: "任务类型")
+            : (value: Optional<Any>.none, errorMessage: Optional<String>.none)
+        async let crontabResult = crontabs.isEmpty
+            ? loadEndpoint(appState, path: APIPath.crontabs, label: "Cron 配置")
+            : (value: Optional<Any>.none, errorMessage: Optional<String>.none)
+        let values = await (typeResult, crontabResult)
+        if let typeValue = values.0.value { taskTypes = jsonStrings(typeValue) }
+        if let crontabValue = values.1.value { crontabs = jsonRows(crontabValue) }
+
+        let errors = [values.0.errorMessage, values.1.errorMessage].compactMap { $0 }
+        if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
         if errors.isEmpty { await persistCache(appState) }
     }
 
@@ -214,7 +241,7 @@ final class TasksViewModel: ObservableObject {
         path: String,
         label: String
     ) async -> (value: Any?, errorMessage: String?) {
-        do { return (try await appState.api(path), nil) }
+        do { return (try await appState.api(path, timeoutInterval: requestTimeout), nil) }
         catch { return (nil, "\(label)：\(error.localizedDescription)") }
     }
 
@@ -288,7 +315,7 @@ struct TasksView: View {
                     Section { Picker("视图", selection: $model.mode) { Text("计划").tag("计划"); Text("执行记录").tag("执行记录") }.pickerStyle(.segmented).listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16)) }
                     if model.mode == "计划" {
                         if model.tasks.isEmpty {
-                            EmptyState(icon: "checklist", title: "没有计划任务", detail: "创建自动签到、站点更新或辅种任务", actionTitle: "新建任务") { showEditor = true }
+                            EmptyState(icon: "checklist", title: "没有计划任务", detail: "创建自动签到、站点更新或辅种任务", actionTitle: "新建任务") { openNewTaskEditor() }
                                 .frame(minHeight: 320)
                                 .listRowBackground(Color.clear)
                         } else {
@@ -297,7 +324,7 @@ struct TasksView: View {
                                     Task { await model.run(appState, task: task) }
                                 }
                                 .contentShape(Rectangle())
-                                .onTapGesture { editingTask = task }
+                                .onTapGesture { openTaskEditor(task) }
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                                     Button { Task { await model.toggle(appState, task: task) } } label: {
                                         Label(task.enabled ? "停用" : "启用", systemImage: task.enabled ? "pause" : "play")
@@ -305,7 +332,7 @@ struct TasksView: View {
                                     .tint(HarvestTheme.amber)
                                 }
                                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                    Button { editingTask = task } label: { Label("编辑", systemImage: "pencil") }.tint(HarvestTheme.blue)
+                                    Button { openTaskEditor(task) } label: { Label("编辑", systemImage: "pencil") }.tint(HarvestTheme.blue)
                                     Button(role: .destructive) { deletingTask = task } label: { Label("删除", systemImage: "trash") }
                                 }
                             }
@@ -339,7 +366,11 @@ struct TasksView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 if model.mode == "计划" {
-                    Button { showEditor = true } label: { Image(systemName: "plus") }.accessibilityLabel("新建任务")
+                    if model.isLoadingEditorSupport {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Button { openNewTaskEditor() } label: { Image(systemName: "plus") }.accessibilityLabel("新建任务")
+                    }
                 } else if !model.results.isEmpty {
                     Button(role: .destructive) { confirmClearResults = true } label: { Image(systemName: "trash") }.accessibilityLabel("清空执行记录")
                 }
@@ -383,6 +414,20 @@ struct TasksView: View {
                 Task { await model.removeResult(appState, result: result) }
             }
             Button("取消", role: .cancel) { deletingResult = nil }
+        }
+    }
+
+    private func openNewTaskEditor() {
+        Task {
+            await model.loadEditorSupport(appState)
+            showEditor = true
+        }
+    }
+
+    private func openTaskEditor(_ task: TaskItem) {
+        Task {
+            await model.loadEditorSupport(appState)
+            editingTask = task
         }
     }
 }
@@ -1522,7 +1567,7 @@ struct SearchView: View {
                 .padding(.top, 10)
             }
             if model.isLoading && (model.mode == "影视" || model.resources.isEmpty) { LoadingState() }
-            else if model.mode == "影视" && model.media.isEmpty { EmptyState(icon: "magnifyingglass", title: "搜索影视信息", detail: "同时搜索 TMDB 与豆瓣，查看评分和简介") }
+            else if model.mode == "影视" && model.media.isEmpty { EmptyState(icon: "magnifyingglass", title: "搜索影视信息", detail: "输入电影、剧集或演员名称开始搜索") }
             else if model.mode == "资源" && model.resources.isEmpty { EmptyState(icon: "rectangle.stack", title: "搜索站点资源", detail: "输入关键词获取可推送的种子资源") }
             else {
                 List {
@@ -1580,7 +1625,7 @@ struct SearchView: View {
         .sheet(isPresented: $showSettings) { SearchSettingsSheet(model: model) }
         .sheet(isPresented: $showResourceFilters) {
             ResourceFilterSheet(model: model)
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.large])
         }
         .task { await model.loadSites(appState); consumePendingResourceSearch() }
         .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
@@ -2454,6 +2499,16 @@ struct NewsView: View {
                     if usingCachedData {
                         SessionCacheBanner(cachedAt: cachedAt)
                     }
+                    if !appState.mediaTMDBEnabled && !appState.mediaDoubanEnabled {
+                        EmptyState(
+                            icon: "film.stack",
+                            title: "影视资讯未显示",
+                            actionTitle: "搜索影视"
+                        ) {
+                            appState.selectedTab = 5
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 240)
+                    }
                     ForEach(collections) { collection in
                         MediaCarousel(
                             title: collection.title,
@@ -2494,7 +2549,7 @@ struct NewsView: View {
         .onChange(of: appState.mediaDoubanEnabled) { _, _ in Task { await load() } }
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedCollection) { collection in MediaCollectionSheet(collection: collection).environmentObject(appState) }
-        .sheet(isPresented: $showNotices) { NoticeView().environmentObject(appState).presentationDetents([.medium, .large]) }
+        .sheet(isPresented: $showNotices) { NoticeView().environmentObject(appState).presentationDetents([.large]) }
     }
 
     private func load() async {

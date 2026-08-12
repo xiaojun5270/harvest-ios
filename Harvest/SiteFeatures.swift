@@ -744,7 +744,7 @@ struct SitesView: View {
         }
         .sheet(isPresented: $showTimeline) { SiteTimelineView(model: model).environmentObject(appState) }
         .sheet(item: $editingSite) { site in SiteEditorSheet(site: site, onSaved: { await model.load(appState, cached: false) }).environmentObject(appState) }
-        .sheet(item: $selectedSite) { site in SiteDetailView(site: site, model: model).environmentObject(appState).presentationDetents([.medium, .large]) }
+        .sheet(item: $selectedSite) { site in SiteDetailView(site: site, model: model).environmentObject(appState).presentationDetents([.large]) }
         .sheet(item: $levelSite) { site in
             NavigationStack {
                 SiteLevelProgressView(site: site, levels: parseSiteLevels(model.levelRules(for: site)))
@@ -754,7 +754,7 @@ struct SitesView: View {
                         }
                     }
             }
-            .presentationDetents([.medium, .large])
+            .presentationDetents([.large])
         }
         .fullScreenCover(item: $browserTarget) { target in
             NavigationStack {
@@ -5141,7 +5141,7 @@ private struct BrowserProfileSheet: View {
             }
             .overlay { if isSaving { ProgressView().controlSize(.large) } }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.large])
     }
 }
 
@@ -5242,7 +5242,7 @@ private struct BrowserBonusSheet: View {
             .onChange(of: selectedID) { _, _ in quantity = min(quantity, max(1, maximumQuantity)) }
         }
         .interactiveDismissDisabled(exchangeState.isRunning || isStarting)
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.large])
     }
 }
 
@@ -5446,7 +5446,7 @@ struct SiteEditorSheet: View {
                         }
                     }
                 }
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.large])
             }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
