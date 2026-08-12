@@ -678,7 +678,6 @@ struct SitesView: View {
                     .refreshable { await model.load(appState) }
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .navigationTitle("站点")
         .navigationBarTitleDisplayMode(.inline)
@@ -2078,7 +2077,6 @@ struct SiteRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             header
-            accountSummary
             trafficSection
             coreMetrics
             activitySection
@@ -2107,23 +2105,27 @@ struct SiteRow: View {
     private var header: some View {
         HStack(alignment: .center, spacing: 10) {
             siteLogo(size: 48)
-            VStack(alignment: .leading, spacing: 5) {
-                Text(site.name)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
-                    .layoutPriority(1)
-                Label(joinedText, systemImage: "calendar.badge.clock")
-                    .font(.caption2.weight(.medium).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .center, spacing: 8) {
-                    if let signStatus {
-                        SiteInlineStatus(status: signStatus)
-                    }
+                    Text(site.name)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                        .layoutPriority(2)
+                    compactAccountSummary
                     Spacer(minLength: 4)
                     if let levelStatus {
                         SiteInlineStatus(status: levelStatus)
+                    }
+                }
+                HStack(alignment: .center, spacing: 8) {
+                    Label(joinedText, systemImage: "calendar.badge.clock")
+                        .font(.caption2.weight(.medium).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let signStatus {
+                        SiteInlineStatus(status: signStatus)
                     }
                 }
             }
@@ -2131,29 +2133,15 @@ struct SiteRow: View {
         }
     }
 
-    private var accountSummary: some View {
-        HStack(spacing: 0) {
-            SiteHeaderMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
-            summaryDivider
-            SiteHeaderMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
-            summaryDivider
-            SiteHeaderMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
-            summaryDivider
-            SiteHeaderMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
-            summaryDivider
-            SiteHeaderMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
+    private var compactAccountSummary: some View {
+        HStack(spacing: 3) {
+            SiteHeaderCompactMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
+            SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
+            SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
+            SiteHeaderCompactMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
+            SiteHeaderCompactMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
         }
-        .padding(.vertical, 6)
-        .background(HarvestTheme.green.opacity(0.035), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(HarvestTheme.green.opacity(0.09), lineWidth: 0.75)
-        }
-    }
-
-    private var summaryDivider: some View {
-        Divider()
-            .frame(height: 34)
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder private var trafficSection: some View {
@@ -2353,32 +2341,25 @@ private struct SiteInlineStatus: View {
     }
 }
 
-private struct SiteHeaderMetric: View {
+private struct SiteHeaderCompactMetric: View {
     let icon: String
     let label: String
     let value: String
     let color: Color
 
     var body: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 3) {
-                Image(systemName: icon)
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 18, height: 18)
-                    .background(color, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-                Text(label)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-            }
+        HStack(spacing: 2) {
+            Image(systemName: icon)
+                .font(.system(size: 6.5, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(width: 13, height: 13)
+                .background(color, in: RoundedRectangle(cornerRadius: 3.5, style: .continuous))
             Text(value)
-                .font(.caption2.weight(.bold).monospacedDigit())
+                .font(.system(size: 8, weight: .bold).monospacedDigit())
                 .lineLimit(1)
-                .minimumScaleFactor(0.6)
+                .minimumScaleFactor(0.55)
         }
-        .frame(maxWidth: .infinity, minHeight: 38)
+        .frame(maxWidth: .infinity, minHeight: 16)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) \(value)")
     }
