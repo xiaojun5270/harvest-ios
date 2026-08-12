@@ -105,12 +105,31 @@ private func downloaderVersion(_ status: [String: Any], preferences: [String: An
 }
 
 enum TorrentSortField: String, CaseIterable, Identifiable {
+    case queuePosition = "队列顺序"
     case name = "名称"
-    case size = "大小"
+    case selectedSize = "选定大小"
+    case totalSize = "总大小"
     case progress = "进度"
+    case status = "状态"
+    case seeds = "种子"
+    case peers = "用户"
     case downloadSpeed = "下载速度"
     case uploadSpeed = "上传速度"
+    case eta = "剩余时间"
     case ratio = "分享率"
+    case category = "分类"
+    case tags = "标签"
+    case addedDate = "添加时间"
+    case completedDate = "完成时间"
+    case tracker = "Tracker"
+    case speedLimit = "下载/上传限速"
+    case downloaded = "已下载"
+    case uploaded = "已上传"
+    case sessionTransfer = "本次会话上传/下载"
+    case savePath = "保存路径"
+    case ratioLimit = "分享率限制"
+    case lastSeenComplete = "最后完整可见"
+    case activityDate = "最后活动"
     var id: String { rawValue }
 }
 
@@ -167,9 +186,25 @@ struct TorrentItem: Identifiable, @unchecked Sendable {
     var status: String
     var progress: Double
     var size: Double
+    var totalSize: Double
     var uploadSpeed: Double
     var downloadSpeed: Double
     var ratio: Double
+    var downloaded: Double
+    var uploaded: Double
+    var sessionDownloaded: Double
+    var sessionUploaded: Double
+    var remaining: Double
+    var downloadLimit: Double
+    var uploadLimit: Double
+    var ratioLimit: Double
+    var queuePosition: Int
+    var seedCount: Int
+    var peerCount: Int
+    var addedTimestamp: Double
+    var completedTimestamp: Double
+    var activityTimestamp: Double
+    var lastSeenCompleteTimestamp: Double
     var category: String
     var tags: [String]
     var savePath: String
@@ -192,12 +227,31 @@ struct TorrentItem: Identifiable, @unchecked Sendable {
         id = "\(downloaderID):\(torrentHash)"
         downloaderCategory = json.string("downloader_category", "client_type") ?? "Qb"
         status = torrentStatusLabel(json.string("state", "status") ?? "unknown", client: downloaderCategory)
-        let rawProgress = json.double("percentDone", "percentComplete", "percent_done", "progress", "completed") ?? 0
+        let rawProgress = json.double("percentDone", "percentComplete", "percent_done", "percent_complete", "progress") ?? 0
         progress = rawProgress > 1 ? rawProgress / 100 : rawProgress
-        size = json.double("sizeWhenDone", "totalSize", "size", "total_size", "length") ?? 0
+        size = json.double("sizeWhenDone", "size", "total_size", "completed", "length", "selected_size") ?? 0
+        totalSize = json.double("totalSize", "total_size", "size") ?? size
         uploadSpeed = json.double("rateUpload", "upspeed", "upload_speed", "rate_upload") ?? 0
         downloadSpeed = json.double("rateDownload", "dlspeed", "download_speed", "rate_download") ?? 0
         ratio = json.double("uploadRatio", "ratio", "upload_ratio") ?? 0
+        downloaded = json.double("downloadedEver", "downloaded", "total_downloaded") ?? 0
+        uploaded = json.double("uploadedEver", "uploaded", "total_uploaded") ?? 0
+        sessionDownloaded = json.double("downloadedSession", "downloaded_session", "session_downloaded") ?? 0
+        sessionUploaded = json.double("uploadedSession", "uploaded_session", "session_uploaded") ?? 0
+        remaining = json.double("leftUntilDone", "amount_left", "remaining")
+            ?? max(0, totalSize * (1 - min(1, max(0, progress))))
+        downloadLimit = json.double("downloadLimit", "dl_limit", "download_limit") ?? 0
+        uploadLimit = json.double("uploadLimit", "up_limit", "upload_limit") ?? 0
+        ratioLimit = json.double("seedRatioLimit", "ratio_limit", "share_ratio_limit") ?? 0
+        queuePosition = json.int(
+            "queuePosition", "queue_position", "queuePositionId", "queue_position_id", "queueId", "queue_id"
+        ) ?? 0
+        seedCount = json.int("peersGettingFromUs", "num_seeds", "seeds") ?? 0
+        peerCount = json.int("peersSendingToUs", "num_leechs", "num_leeches", "peers") ?? 0
+        addedTimestamp = torrentTimestamp(json, keys: ["addedDate", "added_on", "added_at"])
+        completedTimestamp = torrentTimestamp(json, keys: ["doneDate", "completion_on", "completed_at"])
+        activityTimestamp = torrentTimestamp(json, keys: ["activityDate", "last_activity", "activity_at"])
+        lastSeenCompleteTimestamp = torrentTimestamp(json, keys: ["lastSeenComplete", "last_seen_complete"])
         category = json.string("category", "label") ?? ""
         tags = json.strings("tags", "labels")
         if tags.isEmpty, let text = json.string("tags", "labels") {
@@ -235,6 +289,91 @@ struct TorrentItem: Identifiable, @unchecked Sendable {
 
     var copyMagnet: String {
         magnetLink.isEmpty ? "magnet:?xt=urn:btih:\(torrentHash)" : magnetLink
+    }
+}
+
+private func torrentTimestamp(_ json: [String: Any], keys: [String]) -> Double {
+    for key in keys {
+        if let value = json.double(key), value > 0 { return value }
+        if let value = json.string(key), let date = parseDate(value) { return date.timeIntervalSince1970 }
+    }
+    return 0
+}
+
+private func torrentPathCategories(_ path: String) -> [String] {
+    let normalized = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "\\", with: "/")
+    let parts = normalized.split(separator: "/").map(String.init).filter { !$0.isEmpty }
+    guard !parts.isEmpty else { return [] }
+    return parts.indices.map { parts.prefix($0 + 1).joined(separator: "/") }
+}
+
+private func torrentCategories(_ item: TorrentItem) -> [String] {
+    item.category.isEmpty ? torrentPathCategories(item.savePath) : [item.category]
+}
+
+private func torrentMatchesCategory(_ item: TorrentItem, category: String) -> Bool {
+    torrentCategories(item).contains(category)
+}
+
+private func torrentCategorySortText(_ item: TorrentItem) -> String {
+    item.category.isEmpty ? item.savePath : item.category
+}
+
+private func torrentETA(_ item: TorrentItem) -> Double {
+    guard item.remaining > 0 else { return 0 }
+    guard item.downloadSpeed > 0 else { return Double.greatestFiniteMagnitude }
+    return item.remaining / item.downloadSpeed
+}
+
+private func torrentSpeedLimitSortValue(_ item: TorrentItem) -> Double {
+    let unlimited = Double(1 << 30)
+    return (item.downloadLimit > 0 ? item.downloadLimit : unlimited)
+        + (item.uploadLimit > 0 ? item.uploadLimit : unlimited)
+}
+
+private func torrentStatusCode(_ item: TorrentItem) -> Int {
+    let source = item.raw.string("state", "status") ?? item.status
+    if let code = Int(source.trimmingCharacters(in: .whitespacesAndNewlines)) { return code }
+    switch source.lowercased() {
+    case "metadl", "forcedmetadl", "downloading", "forceddl": return 4
+    case "queueddl", "stalleddl": return 3
+    case "uploading", "forcedup": return 6
+    case "queuedup", "stalledup": return 5
+    case "checkingdl", "checkingup", "checkingresumedata", "allocating", "moving": return 2
+    case "queuedforchecking", "checking": return 1
+    case "pauseddl", "pausedup", "stoppeddl", "stoppedup", "error", "missingfiles", "unknown": return 0
+    default:
+        let state = item.status.lowercased()
+        if state.contains("等待下载") { return 3 }
+        if state.contains("等待做种") { return 5 }
+        if state.contains("download") || state.contains("下载中") { return 4 }
+        if state.contains("seed") || state.contains("upload") || state.contains("做种") { return 6 }
+        if state.contains("check") || state.contains("校验") { return 2 }
+        return 0
+    }
+}
+
+private func compareTorrentValues<T: Comparable>(_ left: T, _ right: T) -> Int {
+    left == right ? 0 : (left < right ? -1 : 1)
+}
+
+private func torrentConfigStrings(_ value: Any?) -> [String] {
+    if let text = value as? String {
+        return text.split(whereSeparator: { $0.isWhitespace || ",;|".contains($0) }).map(String.init)
+    }
+    if let values = value as? [Any] { return values.compactMap { $0 as? String } }
+    return []
+}
+
+private func torrentHosts(from text: String) -> [String] {
+    torrentConfigStrings(text).compactMap { rawValue in
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while value.hasPrefix("*.") { value.removeFirst(2) }
+        if !value.contains("://") { value = "https://\(value)" }
+        guard var host = URL(string: value)?.host?.lowercased(), !host.isEmpty else { return nil }
+        if host.hasPrefix("www.") { host.removeFirst(4) }
+        return host.trimmingCharacters(in: CharacterSet(charactersIn: "."))
     }
 }
 
@@ -280,6 +419,12 @@ final class DownloadsViewModel: ObservableObject {
             rebuildTorrentMetadata()
         }
     }
+    private var websiteConfigs: [[String: Any]] = [] {
+        didSet {
+            rebuildSiteIndex()
+            rebuildTorrentMetadata()
+        }
+    }
     @Published var isLoading = true
     @Published var query = "" { didSet { rebuildFilteredTorrents() } }
     @Published var filter = "全部" { didSet { rebuildFilteredTorrents() } }
@@ -287,7 +432,7 @@ final class DownloadsViewModel: ObservableObject {
     @Published var categoryFilter = "" { didSet { rebuildFilteredTorrents() } }
     @Published var tagFilters: Set<String> = [] { didSet { rebuildFilteredTorrents() } }
     @Published var siteFilter = "" { didSet { rebuildFilteredTorrents() } }
-    @Published var sortField = TorrentSortField.name { didSet { rebuildFilteredTorrents() } }
+    @Published var sortField = TorrentSortField.queuePosition { didSet { rebuildFilteredTorrents() } }
     @Published var sortAscending = true { didSet { rebuildFilteredTorrents() } }
     @Published var socketConnections: Set<Int> = []
     @Published private(set) var refreshEnabled = true
@@ -320,7 +465,7 @@ final class DownloadsViewModel: ObservableObject {
             : "downloads.downloaders.snapshot.v1"
     }
 
-    let statusFilters = ["全部", "下载中", "做种中", "等待中", "已暂停", "错误"]
+    let statusFilters = ["全部", "下载中", "做种中", "等待中", "已停止", "错误"]
 
     var availableCategories: [String] { derived.categories }
 
@@ -334,7 +479,7 @@ final class DownloadsViewModel: ObservableObject {
             + (categoryFilter.isEmpty ? 0 : 1)
             + (tagFilters.isEmpty ? 0 : 1)
             + (siteFilter.isEmpty ? 0 : 1)
-            + (sortField == .name && sortAscending ? 0 : 1)
+            + (sortField == .queuePosition && sortAscending ? 0 : 1)
     }
 
     var filtered: [TorrentItem] { derived.filtered }
@@ -349,7 +494,7 @@ final class DownloadsViewModel: ObservableObject {
         var result = torrents.filter { item in
             let queryMatch = query.isEmpty || item.name.localizedCaseInsensitiveContains(query)
             let downloaderMatch = downloaderFilter == 0 || item.downloaderID == downloaderFilter
-            let categoryMatch = categoryFilter.isEmpty || item.category == categoryFilter
+            let categoryMatch = categoryFilter.isEmpty || torrentMatchesCategory(item, category: categoryFilter)
             let tagMatch = tagFilters.isEmpty || item.tags.contains(where: tagFilters.contains)
             let siteMatch = siteFilter.isEmpty || siteLabels[item.id] == siteFilter
             return queryMatch && downloaderMatch && categoryMatch && tagMatch && siteMatch && matchesStatus(item)
@@ -357,18 +502,59 @@ final class DownloadsViewModel: ObservableObject {
         result.sort { left, right in
             let comparison: Int
             switch sortField {
+            case .queuePosition:
+                comparison = compareTorrentValues(left.queuePosition, right.queuePosition)
             case .name:
                 comparison = left.name.localizedCaseInsensitiveCompare(right.name).rawValue
-            case .size:
-                comparison = left.size == right.size ? 0 : (left.size < right.size ? -1 : 1)
+            case .selectedSize:
+                comparison = compareTorrentValues(left.size, right.size)
+            case .totalSize:
+                comparison = compareTorrentValues(left.totalSize, right.totalSize)
             case .progress:
-                comparison = left.progress == right.progress ? 0 : (left.progress < right.progress ? -1 : 1)
+                comparison = compareTorrentValues(left.progress, right.progress)
+            case .status:
+                comparison = compareTorrentValues(torrentStatusCode(left), torrentStatusCode(right))
+            case .seeds:
+                comparison = compareTorrentValues(left.seedCount, right.seedCount)
+            case .peers:
+                comparison = compareTorrentValues(left.peerCount, right.peerCount)
             case .downloadSpeed:
-                comparison = left.downloadSpeed == right.downloadSpeed ? 0 : (left.downloadSpeed < right.downloadSpeed ? -1 : 1)
+                comparison = compareTorrentValues(left.downloadSpeed, right.downloadSpeed)
             case .uploadSpeed:
-                comparison = left.uploadSpeed == right.uploadSpeed ? 0 : (left.uploadSpeed < right.uploadSpeed ? -1 : 1)
+                comparison = compareTorrentValues(left.uploadSpeed, right.uploadSpeed)
+            case .eta:
+                comparison = compareTorrentValues(torrentETA(left), torrentETA(right))
             case .ratio:
-                comparison = left.ratio == right.ratio ? 0 : (left.ratio < right.ratio ? -1 : 1)
+                comparison = compareTorrentValues(left.ratio, right.ratio)
+            case .category:
+                comparison = torrentCategorySortText(left).localizedCaseInsensitiveCompare(torrentCategorySortText(right)).rawValue
+            case .tags:
+                comparison = left.tags.joined(separator: ", ").localizedCaseInsensitiveCompare(right.tags.joined(separator: ", ")).rawValue
+            case .addedDate:
+                comparison = compareTorrentValues(left.addedTimestamp, right.addedTimestamp)
+            case .completedDate:
+                comparison = compareTorrentValues(left.completedTimestamp, right.completedTimestamp)
+            case .tracker:
+                comparison = left.tracker.localizedCaseInsensitiveCompare(right.tracker).rawValue
+            case .speedLimit:
+                comparison = compareTorrentValues(torrentSpeedLimitSortValue(left), torrentSpeedLimitSortValue(right))
+            case .downloaded:
+                comparison = compareTorrentValues(left.downloaded, right.downloaded)
+            case .uploaded:
+                comparison = compareTorrentValues(left.uploaded, right.uploaded)
+            case .sessionTransfer:
+                comparison = compareTorrentValues(
+                    left.sessionDownloaded + left.sessionUploaded,
+                    right.sessionDownloaded + right.sessionUploaded
+                )
+            case .savePath:
+                comparison = left.savePath.localizedCaseInsensitiveCompare(right.savePath).rawValue
+            case .ratioLimit:
+                comparison = compareTorrentValues(left.ratioLimit, right.ratioLimit)
+            case .lastSeenComplete:
+                comparison = compareTorrentValues(left.lastSeenCompleteTimestamp, right.lastSeenCompleteTimestamp)
+            case .activityDate:
+                comparison = compareTorrentValues(left.activityTimestamp, right.activityTimestamp)
             }
             if comparison == 0 { return left.id < right.id }
             return sortAscending ? comparison < 0 : comparison > 0
@@ -384,7 +570,7 @@ final class DownloadsViewModel: ObservableObject {
             let label = resolvedSiteLabel(for: torrent)
             if !label.isEmpty { labels[torrent.id] = label }
         }
-        next.categories = Array(Set(torrents.lazy.map(\.category).filter { !$0.isEmpty })).sorted()
+        next.categories = Array(Set(torrents.flatMap(torrentCategories))).sorted()
         next.tags = Array(Set(torrents.lazy.flatMap(\.tags))).sorted()
         next.siteLabels = labels
         next.sites = Array(Set(labels.values)).sorted()
@@ -397,15 +583,29 @@ final class DownloadsViewModel: ObservableObject {
         var keyLabels: [(String, String)] = []
         for site in sites {
             for value in [site.url, site.torrentsURL, site.rss] {
-                guard var host = URL(string: value)?.host?.lowercased(), !host.isEmpty else { continue }
-                if host.hasPrefix("www.") { host.removeFirst(4) }
-                hostLabels.append((host, site.name))
+                for host in torrentHosts(from: value) { hostLabels.append((host, site.name)) }
             }
             let key = site.siteKey.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             if !key.isEmpty { keyLabels.append((key, site.name)) }
         }
+        for config in websiteConfigs {
+            let key = config.string("name", "site")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !key.isEmpty else { continue }
+            let label = config.string("nickname")?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = label?.isEmpty == false ? label! : key
+            let trackers = torrentConfigStrings(config["tracker"])
+            let sourceValues = trackers.isEmpty ? torrentConfigStrings(config["url"]) : trackers
+            for value in sourceValues {
+                for host in torrentHosts(from: value) { hostLabels.append((host, displayName)) }
+            }
+            keyLabels.append((key.lowercased(), displayName))
+        }
+        var seenHosts = Set<String>()
         siteHostLabels = hostLabels
-        siteKeyLabels = keyLabels
+            .filter { seenHosts.insert("\($0.0)|\($0.1)").inserted }
+            .sorted { $0.0.count > $1.0.count }
+        var seenKeys = Set<String>()
+        siteKeyLabels = keyLabels.filter { seenKeys.insert("\($0.0)|\($0.1)").inserted }
     }
 
     func resetFilters() {
@@ -414,7 +614,7 @@ final class DownloadsViewModel: ObservableObject {
         categoryFilter = ""
         tagFilters = []
         siteFilter = ""
-        sortField = .name
+        sortField = .queuePosition
         sortAscending = true
     }
 
@@ -492,6 +692,11 @@ final class DownloadsViewModel: ObservableObject {
                     sites = jsonRows(siteRaw).map(SiteItem.init)
                 } catch { }
             }
+            if websiteConfigs.isEmpty || usingCachedData {
+                do {
+                    websiteConfigs = jsonRows(try await appState.api(APIPath.websiteList))
+                } catch { }
+            }
             usingCachedData = successfulDownloaderLoads < enabledDownloaders.count
             if !usingCachedData { cachedAt = nil }
             if !usingCachedData { await persistCache(appState) }
@@ -521,10 +726,14 @@ final class DownloadsViewModel: ObservableObject {
         let cachedSites: [SiteItem] = includesTorrentData
             ? (root["sites"] as? [[String: Any]] ?? []).map(SiteItem.init)
             : []
+        let cachedWebsiteConfigs: [[String: Any]] = includesTorrentData
+            ? root["website_configs"] as? [[String: Any]] ?? []
+            : []
         guard !cachedDownloaders.isEmpty || !cachedTorrents.isEmpty else { return }
         downloaders = cachedDownloaders
         torrents = cachedTorrents
         sites = cachedSites
+        websiteConfigs = cachedWebsiteConfigs
         cachedAt = cached.cachedAt
         usingCachedData = true
         isLoading = false
@@ -550,7 +759,8 @@ final class DownloadsViewModel: ObservableObject {
         [
             "downloaders": downloaders.map(downloaderCacheRow),
             "torrents": torrents.map(torrentCacheRow),
-            "sites": sites.map(siteCacheRow)
+            "sites": sites.map(siteCacheRow),
+            "website_configs": websiteConfigs.map(websiteConfigCacheRow)
         ]
     }
 
@@ -595,11 +805,29 @@ final class DownloadsViewModel: ObservableObject {
             "state": item.status,
             "progress": item.progress,
             "size": item.size,
+            "total_size": item.totalSize,
             "upload_speed": item.uploadSpeed,
             "download_speed": item.downloadSpeed,
             "ratio": item.ratio,
+            "downloaded": item.downloaded,
+            "uploaded": item.uploaded,
+            "downloaded_session": item.sessionDownloaded,
+            "uploaded_session": item.sessionUploaded,
+            "amount_left": item.remaining,
+            "download_limit": item.downloadLimit,
+            "upload_limit": item.uploadLimit,
+            "ratio_limit": item.ratioLimit,
+            "queue_position": item.queuePosition,
+            "num_seeds": item.seedCount,
+            "num_leechs": item.peerCount,
+            "added_on": item.addedTimestamp,
+            "completion_on": item.completedTimestamp,
+            "last_activity": item.activityTimestamp,
+            "last_seen_complete": item.lastSeenCompleteTimestamp,
             "category": item.category,
             "tags": item.tags,
+            "save_path": item.savePath,
+            "trackers": item.trackerURLs.map { ["announce": $0] },
             "site": siteLabel(for: item),
             "error_string": item.errorText,
             "force_start": item.forceStart,
@@ -619,6 +847,14 @@ final class DownloadsViewModel: ObservableObject {
             "icon": item.iconURL,
             "available": item.enabled
         ]
+    }
+
+    private func websiteConfigCacheRow(_ value: [String: Any]) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for key in ["name", "site", "nickname", "tracker", "url"] where value[key] != nil {
+            result[key] = value[key]
+        }
+        return result
     }
 
     func exportTorrent(_ appState: AppState, torrent: TorrentItem) async -> ExportedTorrentFile? {
@@ -655,7 +891,9 @@ final class DownloadsViewModel: ObservableObject {
         for tracker in torrent.trackerURLs {
             guard var host = URL(string: tracker)?.host?.lowercased(), !host.isEmpty else { continue }
             if host.hasPrefix("www.") { host.removeFirst(4) }
-            if let match = siteHostLabels.first(where: { host == $0.host || host.hasSuffix(".\($0.host)") }) {
+            if let match = siteHostLabels.first(where: {
+                host == $0.host || host.hasSuffix(".\($0.host)") || $0.host.hasSuffix(".\(host)")
+            }) {
                 return match.label
             }
         }
@@ -669,18 +907,18 @@ final class DownloadsViewModel: ObservableObject {
     }
 
     private func matchesStatus(_ item: TorrentItem) -> Bool {
-        let state = item.status.lowercased()
+        let code = torrentStatusCode(item)
         switch filter {
         case "下载中":
-            return state.contains("down") || state.contains("下载") || item.downloadSpeed > 0
+            return code == 3 || code == 4
         case "做种中":
-            return state.contains("seed") || state.contains("upload") || state.contains("做种")
+            return code == 5 || code == 6
         case "等待中":
-            return state.contains("wait") || state.contains("queue") || state.contains("check") || state.contains("等待") || state.contains("校验")
-        case "已暂停":
-            return state.contains("pause") || state.contains("stop") || state.contains("暂停") || state.contains("停止")
+            return code == 1 || code == 2
+        case "已停止":
+            return code == 0
         case "错误":
-            return item.hasError || state.contains("error") || state.contains("missing") || state.contains("错误")
+            return item.hasError
         default:
             return true
         }
@@ -1088,6 +1326,17 @@ final class DownloadsViewModel: ObservableObject {
             hasher.combine(item.uploadSpeed)
             hasher.combine(item.downloadSpeed)
             hasher.combine(item.ratio)
+            hasher.combine(item.queuePosition)
+            hasher.combine(item.seedCount)
+            hasher.combine(item.peerCount)
+            hasher.combine(item.remaining)
+            hasher.combine(item.downloadLimit)
+            hasher.combine(item.uploadLimit)
+            hasher.combine(item.ratioLimit)
+            hasher.combine(item.addedTimestamp)
+            hasher.combine(item.completedTimestamp)
+            hasher.combine(item.activityTimestamp)
+            hasher.combine(item.lastSeenCompleteTimestamp)
             hasher.combine(item.category)
             hasher.combine(item.tags)
             hasher.combine(item.errorText)
@@ -1105,6 +1354,7 @@ struct DownloadsView: View {
     @State private var showAddTorrent = false
     @State private var addTorrentDownloaderID = 0
     @State private var showAddDownloader = false
+    @State private var torrentListDownloader: DownloaderItem?
     @State private var editingDownloader: DownloaderItem?
     @State private var settingsDownloader: DownloaderItem?
     @State private var toolsDownloader: DownloaderItem?
@@ -1136,6 +1386,7 @@ struct DownloadsView: View {
                             ForEach(model.downloaders) { downloader in
                                 DownloaderCard(
                                     item: downloader,
+                                    onOpenTorrents: { torrentListDownloader = downloader },
                                     onAddTorrent: {
                                         addTorrentDownloaderID = downloader.id
                                         showAddTorrent = true
@@ -1204,6 +1455,17 @@ struct DownloadsView: View {
             .environmentObject(appState)
         }
         .sheet(isPresented: $showAddDownloader) { DownloaderEditorSheet { await model.load(appState) }.environmentObject(appState) }
+        .sheet(item: $torrentListDownloader) { downloader in
+            NavigationStack {
+                TorrentListView(initialDownloader: downloader)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("关闭") { torrentListDownloader = nil }
+                        }
+                    }
+            }
+            .environmentObject(appState)
+        }
         .sheet(item: $editingDownloader) { downloader in DownloaderEditorSheet(downloader: downloader) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $settingsDownloader) { downloader in DownloaderSettingsSheet(downloader: downloader).environmentObject(appState) }
         .sheet(item: $toolsDownloader) { downloader in DownloaderToolsSheet(downloader: downloader).environmentObject(appState) }
@@ -1315,6 +1577,11 @@ struct DownloaderRefreshSettingsSheet: View {
 struct TorrentFilterSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: DownloadsViewModel
+    var lockedDownloaderID: Int?
+
+    private var activeUserFilterCount: Int {
+        max(0, model.activeFilterCount - (model.downloaderFilter == lockedDownloaderID ? 1 : 0))
+    }
 
     var body: some View {
         NavigationStack {
@@ -1323,9 +1590,11 @@ struct TorrentFilterSheet: View {
                     Picker("状态", selection: $model.filter) {
                         ForEach(model.statusFilters, id: \.self) { Text($0).tag($0) }
                     }
-                    Picker("下载器", selection: $model.downloaderFilter) {
-                        Text("全部下载器").tag(0)
-                        ForEach(model.downloaders) { Text($0.name).tag($0.id) }
+                    if lockedDownloaderID == nil {
+                        Picker("下载器", selection: $model.downloaderFilter) {
+                            Text("全部下载器").tag(0)
+                            ForEach(model.downloaders) { Text($0.name).tag($0.id) }
+                        }
                     }
                     if !model.availableCategories.isEmpty {
                         Picker("分类", selection: $model.categoryFilter) {
@@ -1370,8 +1639,13 @@ struct TorrentFilterSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("重置") { model.resetFilters() }
-                        .disabled(model.activeFilterCount == 0)
+                    Button("重置") {
+                        model.resetFilters()
+                        if let lockedDownloaderID {
+                            model.downloaderFilter = lockedDownloaderID
+                        }
+                    }
+                    .disabled(activeUserFilterCount == 0)
                 }
                 ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
             }
@@ -1431,6 +1705,7 @@ private struct CompactFlowLayout: Layout {
 
 struct DownloaderCard: View {
     let item: DownloaderItem
+    let onOpenTorrents: () -> Void
     let onAddTorrent: () -> Void
     let onEdit: () -> Void
     let onSettings: () -> Void
@@ -1459,6 +1734,7 @@ struct DownloaderCard: View {
                 }
                 Spacer(minLength: 6)
                 Menu {
+                    Button(action: onOpenTorrents) { Label("种子列表", systemImage: "list.bullet.rectangle") }
                     Button(action: onAddTorrent) { Label("添加种子", systemImage: "link.badge.plus") }
                     Divider()
                     Button(action: onEdit) { Label("编辑", systemImage: "pencil") }
@@ -1511,6 +1787,9 @@ struct DownloaderCard: View {
             RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
                 .stroke(item.enabled ? HarvestTheme.green.opacity(0.25) : Color.primary.opacity(0.08))
         )
+        .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+        .onTapGesture(count: 2, perform: onOpenTorrents)
+        .accessibilityAction(named: Text("打开种子列表")) { onOpenTorrents() }
     }
 
     private func transferMetric(_ label: String, value: String, speed: String, icon: String, color: Color) -> some View {
@@ -1541,6 +1820,222 @@ private struct ManagedDownloaderCategory: Identifiable {
     let name: String
     let savePath: String
     var id: String { name }
+}
+
+struct TorrentListView: View {
+    @EnvironmentObject private var appState: AppState
+    @StateObject private var model = DownloadsViewModel(includesTorrentData: true)
+    @AppStorage(DownloaderRefreshDefaults.enabledKey) private var refreshEnabled = true
+    @AppStorage(DownloaderRefreshDefaults.intervalKey) private var refreshInterval = DownloaderRefreshDefaults.interval
+    @AppStorage(DownloaderRefreshDefaults.durationKey) private var refreshDuration = DownloaderRefreshDefaults.duration
+    let initialDownloader: DownloaderItem
+    @State private var selectedTorrent: TorrentItem?
+    @State private var selectedIDs: Set<String> = []
+    @State private var advancedTorrents: [TorrentItem] = []
+    @State private var showAdvancedActions = false
+    @State private var showFilters = false
+    @State private var showAddTorrent = false
+    @State private var exportedTorrent: ExportedTorrentFile?
+
+    private var selectedTorrents: [TorrentItem] {
+        model.filtered.filter { selectedIDs.contains($0.id) }
+    }
+
+    private var selectionMode: Bool { !selectedIDs.isEmpty }
+
+    private var activeUserFilterCount: Int {
+        max(0, model.activeFilterCount - (model.downloaderFilter == initialDownloader.id ? 1 : 0))
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if model.usingCachedData {
+                    SessionCacheBanner(cachedAt: model.cachedAt)
+                }
+                torrentSummary
+                if model.isLoading && model.filtered.isEmpty {
+                    LoadingState()
+                } else if model.filtered.isEmpty {
+                    EmptyState(
+                        icon: "tray",
+                        title: model.query.isEmpty && activeUserFilterCount == 0 ? "暂无种子" : "没有匹配的种子",
+                        detail: model.query.isEmpty && activeUserFilterCount == 0
+                            ? "当前下载器还没有种子任务"
+                            : "调整搜索、筛选或排序条件后再试",
+                        actionTitle: model.query.isEmpty && activeUserFilterCount == 0 ? "添加种子" : "清除筛选"
+                    ) {
+                        if model.query.isEmpty && activeUserFilterCount == 0 {
+                            showAddTorrent = true
+                        } else {
+                            model.query = ""
+                            model.resetFilters()
+                            model.downloaderFilter = initialDownloader.id
+                        }
+                    }
+                    .frame(minHeight: 280)
+                } else {
+                    ForEach(model.filtered) { torrent in
+                        TorrentRow(
+                            item: torrent,
+                            model: model,
+                            isSelecting: selectionMode,
+                            isSelected: selectedIDs.contains(torrent.id),
+                            onSelect: {
+                                if selectionMode { toggleSelection(torrent) }
+                                else { selectedTorrent = torrent }
+                            },
+                            onToggleSelection: { toggleSelection(torrent) },
+                            onAdvanced: { presentAdvancedActions([torrent]) },
+                            onExport: { Task { exportedTorrent = await model.exportTorrent(appState, torrent: torrent) } }
+                        )
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(Color(uiColor: .systemGroupedBackground))
+        .navigationTitle(initialDownloader.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $model.query, prompt: "搜索种子")
+        .refreshable { await model.load(appState) }
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if selectionMode {
+                    Button { presentAdvancedActions(selectedTorrents) } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .disabled(selectedTorrents.isEmpty)
+                    .accessibilityLabel("批量高级操作")
+                    Button("完成") { selectedIDs = [] }
+                } else {
+                    Button { showFilters = true } label: {
+                        Image(systemName: activeUserFilterCount > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                    }
+                    .accessibilityLabel("筛选与排序")
+                    Button { Task { await model.load(appState) } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel("刷新种子列表")
+                    Menu {
+                        Button { showAddTorrent = true } label: { Label("添加种子", systemImage: "link.badge.plus") }
+                        Button { model.toggleRefreshPause(appState) } label: {
+                            Label(model.refreshPaused ? "恢复实时刷新" : "暂停实时刷新", systemImage: model.refreshPaused ? "play.fill" : "pause.fill")
+                        }
+                        .disabled(!model.refreshEnabled)
+                        Button { selectAllVisible() } label: { Label("选择当前结果", systemImage: "checkmark.circle") }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel("种子列表操作")
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if selectionMode {
+                HStack(spacing: 12) {
+                    Text("已选 \(selectedTorrents.count) 项")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Button(selectedIDs.count == model.filtered.count ? "取消全选" : "全选") {
+                        if selectedIDs.count == model.filtered.count { selectedIDs = [] }
+                        else { selectAllVisible() }
+                    }
+                    Button("批量操作") { presentAdvancedActions(selectedTorrents) }
+                        .buttonStyle(.borderedProminent)
+                        .tint(HarvestTheme.green)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
+            }
+        }
+        .task {
+            model.downloaderFilter = initialDownloader.id
+            await model.load(appState)
+            guard !Task.isCancelled else { return }
+            model.startWatching(
+                appState,
+                enabled: refreshEnabled,
+                interval: refreshInterval,
+                duration: refreshDuration
+            )
+        }
+        .onDisappear { model.stopWatching() }
+        .onChange(of: refreshEnabled) { _, _ in synchronizeRefreshSettings() }
+        .onChange(of: refreshInterval) { _, _ in synchronizeRefreshSettings() }
+        .onChange(of: refreshDuration) { _, _ in synchronizeRefreshSettings() }
+        .onChange(of: model.filtered.map(\.id)) { _, visibleIDs in
+            selectedIDs.formIntersection(Set(visibleIDs))
+        }
+        .sheet(isPresented: $showFilters) {
+            TorrentFilterSheet(model: model, lockedDownloaderID: initialDownloader.id)
+        }
+        .sheet(isPresented: $showAddTorrent) {
+            AddTorrentSheet(
+                downloaders: model.downloaders,
+                initialDownloaderID: initialDownloader.id,
+                onSaved: { await model.load(appState) }
+            )
+            .environmentObject(appState)
+        }
+        .sheet(item: $selectedTorrent) { torrent in
+            TorrentDetailSheet(item: torrent, model: model).environmentObject(appState)
+        }
+        .sheet(isPresented: $showAdvancedActions) {
+            TorrentAdvancedActionsSheet(torrents: advancedTorrents, model: model) {
+                selectedIDs = []
+            }
+            .environmentObject(appState)
+        }
+        .sheet(item: $exportedTorrent) { file in
+            ActivityShareSheet(items: [file.url])
+        }
+    }
+
+    private var torrentSummary: some View {
+        HStack(spacing: 0) {
+            summaryMetric("任务", value: "\(model.filtered.count)", color: HarvestTheme.coral)
+            Divider().frame(height: 34)
+            summaryMetric("下载", value: formatSpeed(model.filtered.reduce(0) { $0 + $1.downloadSpeed }), color: HarvestTheme.blue)
+            Divider().frame(height: 34)
+            summaryMetric("上传", value: formatSpeed(model.filtered.reduce(0) { $0 + $1.uploadSpeed }), color: HarvestTheme.green)
+        }
+        .padding(.vertical, 10)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+    }
+
+    private func summaryMetric(_ label: String, value: String, color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(value).font(.caption.weight(.bold).monospacedDigit()).foregroundStyle(color).lineLimit(1).minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func toggleSelection(_ torrent: TorrentItem) {
+        if selectedIDs.contains(torrent.id) { selectedIDs.remove(torrent.id) }
+        else { selectedIDs.insert(torrent.id) }
+    }
+
+    private func selectAllVisible() {
+        selectedIDs = Set(model.filtered.map(\.id))
+    }
+
+    private func presentAdvancedActions(_ torrents: [TorrentItem]) {
+        guard !torrents.isEmpty else { return }
+        advancedTorrents = torrents
+        showAdvancedActions = true
+    }
+
+    private func synchronizeRefreshSettings() {
+        model.updateRefreshConfiguration(
+            appState,
+            enabled: refreshEnabled,
+            interval: refreshInterval,
+            duration: refreshDuration
+        )
+    }
 }
 
 struct DownloaderToolsSheet: View {
@@ -1823,6 +2318,7 @@ struct TorrentRow: View {
         .cardSurface()
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .onTapGesture(perform: onSelect)
+        .onLongPressGesture(perform: onToggleSelection)
         .confirmationDialog("确定删除种子「\(item.name)」？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("仅删除种子", role: .destructive) {
                 Task { await model.control(appState, torrent: item, command: "delete") }

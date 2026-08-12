@@ -3421,9 +3421,15 @@ private struct DisplayLogEntry: Identifiable, Hashable {
     let message: String
 }
 
+private struct SharedLogArchive: Identifiable {
+    let url: URL
+    var id: URL { url }
+}
+
 struct LogView: View {
     @EnvironmentObject private var appState: AppState
     @AppStorage("logs.fontSize") private var fontSize = 12.0
+    @AppStorage("logs.appThreshold") private var appThresholdRaw = AppLogThreshold.info.rawValue
     @State private var entries: [DisplayLogEntry] = []
     @State private var appAllEntries: [DisplayLogEntry] = []
     @State private var appVisibleStart = 0
@@ -3433,16 +3439,17 @@ struct LogView: View {
     @State private var source: LogSource = .app
     @State private var query = ""
     @State private var isLoading = true
-    @State private var level = "ALL"
+    @State private var filterLevel = "ALL"
+    @State private var serverLevel = "INFO"
     @State private var connected = false
     @State private var serverStreamStatus = "快照数据"
     @State private var streamRestartGeneration = 0
     @State private var paused = false
     @State private var following = true
-    @State private var shareText = ""
-    @State private var showingShare = false
+    @State private var sharedArchive: SharedLogArchive?
 
-    private let levels = ["ALL", "DEBUG", "INFO", "WARN", "ERROR"]
+    private let filterLevels = ["ALL", "VERBOSE", "DEBUG", "INFO", "WARN", "ERROR"]
+    private let serverLevels = ["DEBUG", "INFO", "WARN", "ERROR"]
     private let pageSize = 100
     private let minimumFontSize = 8.0
     private let maximumFontSize = 16.0
@@ -3452,11 +3459,12 @@ struct LogView: View {
     }
 
     private var filtered: [DisplayLogEntry] {
-        guard !query.isEmpty else { return entries }
-        return entries.filter {
-            $0.message.localizedCaseInsensitiveContains(query)
-                || $0.level.localizedCaseInsensitiveContains(query)
-                || $0.timestamp.localizedCaseInsensitiveContains(query)
+        entries.filter { entry in
+            guard selectedLogLevelMatches(entry.level) else { return false }
+            guard !query.isEmpty else { return true }
+            return entry.message.localizedCaseInsensitiveContains(query)
+                || entry.level.localizedCaseInsensitiveContains(query)
+                || entry.timestamp.localizedCaseInsensitiveContains(query)
         }
     }
 
@@ -3487,10 +3495,23 @@ struct LogView: View {
                         }
                         .font(.caption)
                         Spacer()
-                        Picker("级别", selection: $level) {
-                            ForEach(levels, id: \.self) { Text($0).tag($0) }
+                        Picker("内容筛选", selection: $filterLevel) {
+                            ForEach(filterLevels, id: \.self) { Text($0).tag($0) }
                         }
                         .pickerStyle(.menu)
+                        if source == .app {
+                            Picker("APP 级别", selection: $appThresholdRaw) {
+                                ForEach(AppLogThreshold.allCases) { level in
+                                    Text(level.label).tag(level.rawValue)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                        } else {
+                            Picker("服务级别", selection: $serverLevel) {
+                                ForEach(serverLevels, id: \.self) { Text($0).tag($0) }
+                            }
+                            .pickerStyle(.menu)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -3553,7 +3574,7 @@ struct LogView: View {
                         } label: { Label("到底部", systemImage: "arrow.down.to.line") }
                         Divider()
                         Button { UIPasteboard.general.string = logText } label: { Label("复制当前日志", systemImage: "doc.on.doc") }
-                            .disabled(visibleEntries.isEmpty)
+                            .disabled(entries.isEmpty)
                         Button { Task { await clearCurrent() } } label: { Label("清空当前视图", systemImage: "trash") }
                             .disabled(entries.isEmpty)
                         Button {
@@ -3575,22 +3596,18 @@ struct LogView: View {
                     }
                     .accessibilityLabel("日志工具")
 
-                    Button {
-                        shareText = logText
-                        showingShare = true
-                    } label: {
+                    Button { Task { await shareAppLogs() } } label: {
                         Image(systemName: "square.and.arrow.up")
                     }
-                    .disabled(visibleEntries.isEmpty)
-                        .accessibilityLabel("分享日志")
+                    .accessibilityLabel("打包分享 APP 日志")
                 }
             }
         }
         .searchable(text: $query, prompt: "筛选日志")
-        .sheet(isPresented: $showingShare) { ActivityShareSheet(items: [shareText]) }
+        .sheet(item: $sharedArchive) { archive in ActivityShareSheet(items: [archive.url]) }
         .navigationTitle("日志中心")
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: "\(source.rawValue)-\(level)-\(streamRestartGeneration)") {
+        .task(id: "\(source.rawValue)-\(serverLevel)-\(streamRestartGeneration)") {
             entries = []
             appAllEntries = []
             appVisibleStart = 0
@@ -3607,6 +3624,11 @@ struct LogView: View {
         .onChange(of: paused) { _, isPaused in
             if isPaused { serverStreamStatus = "已暂停" }
             streamRestartGeneration &+= 1
+        }
+        .onChange(of: appThresholdRaw) { _, rawValue in
+            let threshold = AppLogThreshold(rawValue: rawValue) ?? .info
+            if threshold.rawValue != rawValue { appThresholdRaw = threshold.rawValue }
+            recordAppLog(.info, "APP 日志级别已切换为：\(threshold.label)")
         }
     }
 
@@ -3634,9 +3656,7 @@ struct LogView: View {
 
     private func loadAppLogs(resetWindow: Bool = false) async {
         let records = await AppLogStore.shared.snapshot()
-        let next = records
-            .filter { selectedLogLevelMatches($0.level.rawValue) }
-            .map {
+        let next = records.map {
                 DisplayLogEntry(
                     id: $0.id.uuidString,
                     timestamp: $0.timestamp.formatted(date: .numeric, time: .standard),
@@ -3676,7 +3696,7 @@ struct LogView: View {
     private func fetchServerPage(offset: Int) async throws -> (entries: [DisplayLogEntry], count: Int, total: Int) {
         let raw = try await appState.api(
             APIPath.logs,
-            query: ["limit": pageSize, "offset": offset, "level": level == "ALL" ? "" : level]
+            query: ["limit": pageSize, "offset": offset, "level": serverLevel]
         )
         let payload = jsonPayloadDictionary(raw) ?? [:]
         let rows: [[String: Any]]
@@ -3729,7 +3749,7 @@ struct LogView: View {
                     path: APIPath.logsStream,
                     token: appState.accessToken,
                     method: .get,
-                    query: ["level": level == "ALL" ? "" : level, "limit": pageSize]
+                    query: ["level": serverLevel, "limit": pageSize]
                 )
                 for try await event in stream {
                     guard !Task.isCancelled else { return }
@@ -3797,18 +3817,23 @@ struct LogView: View {
 
     private func clearCurrent() async {
         if source == .app {
-            await AppLogStore.shared.clear()
-            appAllEntries = []
-            appVisibleStart = 0
+            appVisibleStart = appAllEntries.count
         } else {
             serverLoadedCount = 0
-            serverTotal = 0
         }
         entries = []
     }
 
+    @MainActor private func shareAppLogs() async {
+        do {
+            sharedArchive = SharedLogArchive(url: try await AppLogStore.shared.exportArchive())
+        } catch {
+            appState.presentedError = "打包 APP 日志失败：\(error.localizedDescription)"
+        }
+    }
+
     private var logText: String {
-        filtered.map { "[\($0.timestamp)] [\($0.level)] \($0.message)" }.joined(separator: "\n")
+        entries.map { "[\($0.timestamp)] [\($0.level)] \($0.message)" }.joined(separator: "\n")
     }
 
     private func scrollToTop(_ proxy: ScrollViewProxy) {
@@ -3827,14 +3852,16 @@ struct LogView: View {
         if text.contains("error") || text.contains("fatal") { return HarvestTheme.coral }
         if text.contains("warn") { return HarvestTheme.amber }
         if text.contains("debug") { return HarvestTheme.blue }
+        if text.contains("verbose") || text.contains("trace") { return Color(red: 0.48, green: 0.42, blue: 0.62) }
         return HarvestTheme.green
     }
 
     private func selectedLogLevelMatches(_ candidate: String) -> Bool {
-        guard level != "ALL" else { return true }
+        guard filterLevel != "ALL" else { return true }
         let normalized = candidate.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-        if level == "WARN" { return normalized == "WARN" || normalized == "WARNING" }
-        return normalized == level
+        if filterLevel == "VERBOSE" { return normalized == "VERBOSE" || normalized == "TRACE" }
+        if filterLevel == "WARN" { return normalized == "WARN" || normalized == "WARNING" }
+        return normalized == filterLevel
     }
 }
 

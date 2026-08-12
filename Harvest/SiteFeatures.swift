@@ -236,6 +236,12 @@ private enum SiteLevelMilestone {
     case graduation
 }
 
+private struct SiteBrowserTarget: Identifiable {
+    let site: SiteItem
+    let url: String
+    var id: Int { site.id }
+}
+
 @MainActor
 final class SitesViewModel: ObservableObject {
     private(set) var sites: [SiteItem] = [] { didSet { rebuildFilteredSites() } }
@@ -446,6 +452,18 @@ final class SitesViewModel: ObservableObject {
         ascending = field.defaultAscending
     }
 
+    func levelRules(for site: SiteItem) -> Any? {
+        config(for: site)?["level"]
+    }
+
+    func browserURL(for site: SiteItem) -> String {
+        let directURL = site.url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !directURL.isEmpty { return directURL }
+        guard let siteConfig = config(for: site) else { return "" }
+        return configStrings(siteConfig["url"]).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     func load(_ appState: AppState, cached: Bool = true) async {
         let cacheKey = "site.info.list"
         if !didRestoreCache {
@@ -612,6 +630,8 @@ struct SitesView: View {
     @State private var showGenerator = false
     @State private var showTimeline = false
     @State private var selectedSite: SiteItem?
+    @State private var browserTarget: SiteBrowserTarget?
+    @State private var levelSite: SiteItem?
     @State private var editingSite: SiteItem?
     @State private var deletingSite: SiteItem?
     @State private var repeatingSite: SiteItem?
@@ -648,16 +668,14 @@ struct SitesView: View {
                     )
                     List {
                         ForEach(model.filtered) { site in
-                            Button {
-                                selectedSite = site
-                            } label: {
-                                SiteRow(
-                                    site: site,
-                                    privacy: appState.privacyMode,
-                                    iconCandidates: model.logoCandidates(for: site, appState: appState)
-                                )
-                            }
-                                .buttonStyle(.plain)
+                            SiteRow(
+                                site: site,
+                                privacy: appState.privacyMode,
+                                iconCandidates: model.logoCandidates(for: site, appState: appState),
+                                onOpenDetails: { selectedSite = site },
+                                onOpenBrowser: { openBrowser(for: site) },
+                                onOpenLevel: { levelSite = site }
+                            )
                                 .contextMenu { SiteActions(site: site, model: model) }
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                                     Button { Task { await model.operate(appState, site: site, path: APIPath.siteSign) } } label: { Label("签到", systemImage: "checkmark.seal") }.tint(HarvestTheme.green)
@@ -727,6 +745,33 @@ struct SitesView: View {
         .sheet(isPresented: $showTimeline) { SiteTimelineView(model: model).environmentObject(appState) }
         .sheet(item: $editingSite) { site in SiteEditorSheet(site: site, onSaved: { await model.load(appState, cached: false) }).environmentObject(appState) }
         .sheet(item: $selectedSite) { site in SiteDetailView(site: site, model: model).environmentObject(appState).presentationDetents([.medium, .large]) }
+        .sheet(item: $levelSite) { site in
+            NavigationStack {
+                SiteLevelProgressView(site: site, levels: parseSiteLevels(model.levelRules(for: site)))
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("完成") { levelSite = nil }
+                        }
+                    }
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .fullScreenCover(item: $browserTarget) { target in
+            NavigationStack {
+                SiteBrowserScreen(
+                    site: target.site,
+                    urlString: target.url,
+                    title: target.site.name,
+                    onSynced: { await model.load(appState, cached: false) }
+                )
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("关闭") { browserTarget = nil }
+                    }
+                }
+            }
+            .environmentObject(appState)
+        }
         .confirmationDialog(
             "确定删除站点「\(deletingSite?.name ?? "")」？",
             isPresented: Binding(get: { deletingSite != nil }, set: { if !$0 { deletingSite = nil } }),
@@ -751,6 +796,21 @@ struct SitesView: View {
             }
             Button("取消", role: .cancel) { repeatingSite = nil }
         }
+    }
+
+    private func openBrowser(for site: SiteItem) {
+        var url = model.browserURL(for: site)
+        if url.hasPrefix("//") {
+            url = "https:\(url)"
+        } else if URL(string: url)?.scheme == nil, !url.isEmpty {
+            url = "https://\(url)"
+        }
+        guard let parsedURL = URL(string: url),
+              ["http", "https"].contains(parsedURL.scheme?.lowercased() ?? "") else {
+            appState.presentedError = "站点地址无效，无法打开"
+            return
+        }
+        browserTarget = SiteBrowserTarget(site: site, url: url)
     }
 
     @ViewBuilder private func SiteActions(site: SiteItem, model: SitesViewModel) -> some View {
@@ -2069,19 +2129,39 @@ struct SiteRow: View {
     let site: SiteItem
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
+    let onOpenDetails: () -> Void
+    let onOpenBrowser: () -> Void
+    let onOpenLevel: () -> Void
 
-    init(site: SiteItem, privacy: Bool, iconCandidates: [RemoteImageCandidate] = []) {
+    init(
+        site: SiteItem,
+        privacy: Bool,
+        iconCandidates: [RemoteImageCandidate] = [],
+        onOpenDetails: @escaping () -> Void = {},
+        onOpenBrowser: @escaping () -> Void = {},
+        onOpenLevel: @escaping () -> Void = {}
+    ) {
         self.site = site
         self.privacy = privacy
         self.iconCandidates = iconCandidates
+        self.onOpenDetails = onOpenDetails
+        self.onOpenBrowser = onOpenBrowser
+        self.onOpenLevel = onOpenLevel
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-            trafficSection
-            coreMetrics
-            activitySection
+            Button(action: onOpenDetails) {
+                VStack(alignment: .leading, spacing: 8) {
+                    trafficSection
+                    coreMetrics
+                    activitySection
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("查看\(site.name)详情")
         }
         .padding(11)
         .background(
@@ -2095,8 +2175,7 @@ struct SiteRow: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 1)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilitySummary)
+        .accessibilityElement(children: .contain)
     }
 
     private var metricColumns: [GridItem] {
@@ -2106,34 +2185,58 @@ struct SiteRow: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 9) {
-            siteLogo(size: 48)
+            Button(action: onOpenBrowser) {
+                siteLogo(size: 48)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("进入\(site.name)站点")
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .center, spacing: 5) {
-                    Text(site.name)
-                        .font(.headline)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
+                    Button(action: onOpenDetails) {
+                        Text(site.name)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
+                    }
+                    .buttonStyle(.plain)
                     Spacer(minLength: 4)
                     if hasCompactAccountSummary {
-                        compactAccountSummary
+                        Button(action: onOpenDetails) {
+                            compactAccountSummary
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看\(site.name)提醒详情")
                     }
                     if let levelStatus {
-                        SiteInlineStatus(status: levelStatus)
+                        Button(action: onOpenLevel) {
+                            SiteInlineStatus(status: levelStatus)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看等级\(levelStatus.label)详情")
                     }
                 }
                 HStack(alignment: .center, spacing: 8) {
-                    HStack(spacing: 2) {
-                        Image(systemName: "calendar.badge.clock")
-                            .font(.system(size: 12, weight: .medium))
-                            .frame(width: 15, height: 16, alignment: .center)
-                        Text(joinedText)
-                            .font(.caption2.weight(.medium).monospacedDigit())
-                            .lineLimit(1)
+                    Button(action: onOpenDetails) {
+                        HStack(spacing: 2) {
+                            Image(systemName: "calendar.badge.clock")
+                                .font(.system(size: 12, weight: .medium))
+                                .frame(width: 15, height: 16, alignment: .center)
+                            Text(joinedText)
+                                .font(.caption2.weight(.medium).monospacedDigit())
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(.secondary)
                     }
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
                     Spacer(minLength: 4)
                     if let signStatus {
-                        SiteInlineStatus(status: signStatus)
+                        Button(action: onOpenDetails) {
+                            SiteInlineStatus(status: signStatus)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看\(site.name)签到详情")
                     }
                 }
             }
@@ -2269,7 +2372,7 @@ struct SiteRow: View {
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
             .frame(width: imageSize, height: imageSize)
-            .clipped()
+            .clipShape(Circle())
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)
@@ -2342,15 +2445,6 @@ struct SiteRow: View {
 
     private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
 
-    private var accessibilitySummary: String {
-        let state = site.enabled ? "可用" : "停用"
-        let traffic = privacy
-            ? "流量数据已隐藏"
-            : "上传 \(formatBytes(site.uploaded))，下载 \(formatBytes(site.downloaded))，分享率 \(String(format: "%.2f", site.ratio))"
-        let signStatus = site.signed ? "，已签到" : (site.signIn ? "，未签到" : "")
-        let unread = site.unread > 0 ? "，未读 \(site.unread)" : ""
-        return "\(site.name)，注册 \(joinedText)，\(state)\(signStatus)，\(traffic)，\(site.seeding) 个做种，最近时间 \(recentTimeText(relativeTo: Date()))\(unread)"
-    }
 }
 
 private struct SiteStatusDescriptor: Identifiable {
@@ -2465,7 +2559,7 @@ private struct SiteCardMetric: View {
     let color: Color
 
     var body: some View {
-        VStack(spacing: 3) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .semibold))
@@ -2478,13 +2572,16 @@ private struct SiteCardMetric: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.75)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             Text(value)
                 .font(.caption.weight(.bold))
                 .monospacedDigit()
                 .lineLimit(1)
                 .minimumScaleFactor(0.52)
+                .frame(maxWidth: .infinity, alignment: .center)
         }
         .frame(maxWidth: .infinity, minHeight: 45)
+        .padding(.horizontal, 2)
         .accessibilityLabel("\(label) \(value)")
     }
 }
@@ -3334,6 +3431,8 @@ private struct SiteLevelRequirement: Identifiable {
     let score: Double
     let ratio: Double
     let torrents: Int
+    let leeches: Int
+    let seedingDelta: Double
     let rights: String
     let keepAccount: Bool
     let graduation: Bool
@@ -3353,6 +3452,8 @@ private struct SiteLevelRequirement: Identifiable {
         score = value.double("score") ?? 0
         ratio = value.double("ratio") ?? 0
         torrents = value.int("torrents") ?? 0
+        leeches = value.int("leeches") ?? 0
+        seedingDelta = value.double("seeding_delta", "seedingDelta") ?? 0
         rights = value.string("rights") ?? ""
         keepAccount = value.bool("keep_account", "keepAccount") ?? false
         graduation = value.bool("graduation") ?? false
@@ -3365,7 +3466,23 @@ private func parseSiteLevels(_ value: Any?) -> [SiteLevelRequirement] {
         guard let row = raw as? [String: Any] else { return nil }
         return SiteLevelRequirement(key: key, value: row)
     }
-    .filter { $0.levelID != 0 }
+    .filter { level in
+        level.levelID != 0
+            || !level.level.isEmpty
+            || !level.name.isEmpty
+            || level.days > 0
+            || level.uploaded > 0
+            || level.downloaded > 0
+            || level.bonus > 0
+            || level.score > 0
+            || level.ratio > 0
+            || level.torrents > 0
+            || level.leeches > 0
+            || level.seedingDelta > 0
+            || level.keepAccount
+            || level.graduation
+            || !level.rights.isEmpty
+    }
     .sorted { left, right in
         if left.levelID == right.levelID { return left.displayName < right.displayName }
         return left.levelID > right.levelID
@@ -3428,20 +3545,30 @@ private struct SiteLevelProgressView: View {
             } else if currentIndex != nil {
                 Section { Label("已达到最高配置等级", systemImage: "checkmark.seal.fill").foregroundStyle(HarvestTheme.green) }
             }
-            Section("等级列表") {
-                ForEach(levels) { level in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Text(level.displayName).font(.subheadline.weight(.semibold))
-                            Spacer()
-                            if currentIndex.map({ levels[$0].id == level.id }) == true {
-                                StatusPill(label: "当前", color: HarvestTheme.green)
+            if levels.isEmpty {
+                Section("等级规则") {
+                    Label("该站点暂未配置等级规则", systemImage: "info.circle")
+                        .foregroundStyle(.secondary)
+                    Text("当前等级仍以站点同步结果为准。")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            } else {
+                Section("等级列表") {
+                    ForEach(levels) { level in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(level.displayName).font(.subheadline.weight(.semibold))
+                                Spacer()
+                                if currentIndex.map({ levels[$0].id == level.id }) == true {
+                                    StatusPill(label: "当前", color: HarvestTheme.green)
+                                }
                             }
+                            Text(levelSummary(level)).font(.caption).foregroundStyle(.secondary)
+                            if !level.rights.isEmpty { Text(level.rights).font(.caption2).foregroundStyle(.tertiary) }
                         }
-                        Text(levelSummary(level)).font(.caption).foregroundStyle(.secondary)
-                        if !level.rights.isEmpty { Text(level.rights).font(.caption2).foregroundStyle(.tertiary) }
+                        .padding(.vertical, 3)
                     }
-                    .padding(.vertical, 3)
                 }
             }
         }
@@ -3464,6 +3591,8 @@ private struct SiteLevelProgressView: View {
             progressRow("注册天数", current: days, required: Double(level.days)) { String(format: "%.0f 天", $0) }
         }
         if level.ratio > 0 { progressRow("分享率", current: site.ratio, required: level.ratio) { String(format: "%.2f", $0) } }
+        if level.leeches > 0 { LabeledContent("下载任务要求", value: "\(level.leeches)") }
+        if level.seedingDelta > 0 { LabeledContent("做种增量要求", value: formatCompactNumber(level.seedingDelta)) }
     }
 
     private func progressRow(_ label: String, current: Double, required: Double, formatter: (Double) -> String) -> some View {
@@ -3487,6 +3616,8 @@ private struct SiteLevelProgressView: View {
         if level.downloaded > 0 { values.append("下载 \(formatBytes(level.downloaded))") }
         if level.ratio > 0 { values.append("分享率 \(String(format: "%.2f", level.ratio))") }
         if level.torrents > 0 { values.append("发种 \(level.torrents)") }
+        if level.leeches > 0 { values.append("下载中 \(level.leeches)") }
+        if level.seedingDelta > 0 { values.append("做种增量 \(formatCompactNumber(level.seedingDelta))") }
         return values.isEmpty ? "无升级条件" : values.joined(separator: " · ")
     }
 }
@@ -5132,6 +5263,7 @@ private struct SiteDetailIcon: View {
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
             .frame(width: imageSize, height: imageSize)
+            .clipShape(Circle())
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)
@@ -5168,6 +5300,8 @@ struct SiteEditorSheet: View {
     @State private var siteKey: String
     @State private var availableSites: [String] = []
     @State private var availableConfigs: [String: [String: Any]] = [:]
+    @State private var siteSearchQuery = ""
+    @State private var showSitePicker = false
     @State private var name: String
     @State private var sortID: String
     @State private var url = ""
@@ -5230,11 +5364,19 @@ struct SiteEditorSheet: View {
             Form {
                 Section("基本信息") {
                     if site == nil {
-                        Picker("站点配置", selection: $siteKey) {
-                            if availableSites.isEmpty { Text("暂无可用配置").tag("") }
-                            ForEach(availableSites, id: \.self) { Text($0).tag($0) }
+                        Button { showSitePicker = true } label: {
+                            HStack {
+                                Text("站点配置")
+                                Spacer()
+                                Text(siteKey.isEmpty ? "选择站点" : siteKey)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
                         }
-                        .onChange(of: siteKey) { _, value in applyConfigDefaults(value) }
+                        .disabled(availableSites.isEmpty)
                     } else {
                         LabeledContent("站点配置", value: siteKey)
                     }
@@ -5272,6 +5414,40 @@ struct SiteEditorSheet: View {
                 }
             }
             .navigationTitle(site == nil ? "添加站点" : "编辑站点").navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showSitePicker) {
+                NavigationStack {
+                    List {
+                        if filteredAvailableSites.isEmpty {
+                            ContentUnavailableView.search(text: siteSearchQuery)
+                        } else {
+                            ForEach(filteredAvailableSites, id: \.self) { key in
+                                Button {
+                                    siteKey = key
+                                    applyConfigDefaults(key)
+                                    showSitePicker = false
+                                } label: {
+                                    HStack {
+                                        Text(key).foregroundStyle(.primary)
+                                        Spacer()
+                                        if siteKey == key {
+                                            Image(systemName: "checkmark").foregroundStyle(HarvestTheme.green)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .searchable(text: $siteSearchQuery, prompt: "搜索站点配置")
+                    .navigationTitle("选择站点")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { showSitePicker = false }
+                        }
+                    }
+                }
+                .presentationDetents([.medium, .large])
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) { Button("保存") { Task {
@@ -5349,6 +5525,21 @@ struct SiteEditorSheet: View {
         brushRSS = config.bool("brush_rss", "brushRss") ?? brushRSS
         packageFile = config.bool("package_file", "packageFile") ?? packageFile
         hrDiscern = config.bool("hr_discern", "hrDiscern") ?? hrDiscern
+    }
+
+    private var filteredAvailableSites: [String] {
+        let query = siteSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return availableSites }
+        let compactQuery = query.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .joined()
+        return availableSites.filter { key in
+            if key.localizedCaseInsensitiveContains(query) { return true }
+            let compactKey = key.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .joined()
+            return !compactQuery.isEmpty && compactKey.contains(compactQuery)
+        }
     }
 
     private func nullableText(_ value: String) -> Any {

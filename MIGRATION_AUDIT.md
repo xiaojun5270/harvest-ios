@@ -1,6 +1,6 @@
 # iOS Native Migration Audit
 
-Audit date: 2026-08-11
+Audit date: 2026-08-13
 
 Reference: the Flutter implementation in the parent repository and its active
 UI/service call sites.
@@ -20,6 +20,30 @@ pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
 
+- Torrent filtering now mirrors Flutter's mobile semantics instead of relying
+  on broad status-string matches: queued downloads remain under downloading,
+  queued uploads remain under seeding, and waiting is limited to checking and
+  check-wait states. The native sort picker now exposes all 25 Flutter fields,
+  with the same queue-order ascending default, and decodes the required size,
+  peer, transfer, limit, path, ratio, and timestamp values. Those values are
+  retained in the persistent snapshot, so restored data can still be sorted.
+- Uncategorized torrents now expose cumulative download-path categories like
+  Flutter. Torrent-to-site matching also consumes website-config Tracker
+  domains, including wildcard, multi-host, and host-alias forms, instead of
+  depending only on the added site's main URL. The minimal non-sensitive
+  matching config is included in the account-scoped download snapshot.
+- The compact downloads page still renders downloader modules only, but every
+  downloader menu now opens its complete torrent list. That previously
+  unreachable native workflow includes persistent cache restoration,
+  WebSocket updates, search, status/category/tag/site filters, sorting, detail,
+  files, Trackers, `.torrent` export, long-press selection, select-all, bulk
+  controls, advanced qBittorrent/Transmission actions, safe data deletion, and
+  torrent creation. A downloader opened from its card remains a locked scope;
+  this scope is hidden from the filter count and survives filter reset.
+- The not-yet-added site catalog now opens as a searchable native sheet instead
+  of a long picker. Search supports case/diacritic folding and the same
+  punctuation-insensitive matching used by the main site list, preserves the
+  current selection, and applies the selected config defaults immediately.
 - Authenticated site browsing now implements native JavaScript alert, confirm,
   and text-input panels instead of dropping dialogs required by some login,
   exchange, posting, and account workflows. Browser navigation exposes an
@@ -120,6 +144,52 @@ pass, and device testing against a reachable Harvest server.
   aliases share the same waiting/running/success/failure labels.
 - Missing managed-user activation flags now default to disabled, and server log
   warning filters send `WARN` while still matching native `WARNING` app records.
+
+## 2026-08-13 Protocol Recheck
+
+- Authentication was rechecked from login through session restoration: HTTP
+  and HTTPS server URLs are accepted, ATS explicitly allows HTTP, token pairs
+  are found in bare or nested `data`/`result`/`token`/`tokens` payloads, profile
+  loading uses the access token, and a 401 refresh submits `refresh` before one
+  retry. Login-history removal also removes the matching Keychain password.
+- First-run setup and migration payloads match Flutter: database setup sends
+  `database_type`, `debug`, and the selected SQLite/PostgreSQL fields; admin
+  setup sends `admin_user` and `admin_pass`; TOML import sends `overwrite` plus
+  repeated `files` parts; backup, PTPP, PT-depiler, and SQLite imports send the
+  expected single `file` part.
+- Site create/edit preserves the server object and writes Flutter's complete
+  editable field set, including all ten capability switches. Browser storage,
+  dialogs, page shortcuts, file inputs, torrent interception, level detail,
+  sign history, status charts, and timeline entry points were checked for
+  reachability from the native UI.
+- Torrent control request bodies were checked command by command against
+  `torrent_control_provider.dart`: qBittorrent uses `torrent_hashes`,
+  Transmission uses `ids`, and start/pause/recheck/reannounce, queue movement,
+  location, category/labels, force start, auto management, super seeding,
+  upload/share limits, Tracker replacement, export, and delete flags use the
+  same command names and parameter units. Single and monkey-batch push payloads
+  also match Flutter's URL/ID, site, Cookie, tags, and advanced-option rules.
+- The mobile torrent toolbar was rechecked against `TorrentFilter`,
+  `TorrentSort`, `availableCategoriesProvider`, and `TorrentSiteMatcher`: all
+  six status choices, all 25 sort choices, path-derived categories, tags, and
+  website-config Tracker matching now have native equivalents.
+- APP update proxy enablement, selected proxy, and probe results are persisted.
+  Copy/download use the effective proxied GitHub URL while browser opening keeps
+  the original release URL. Log source paging, filtering, pause/resume snapshot
+  recovery, and bounded reconnect behavior were rechecked as reachable.
+- The log center now keeps Flutter's three level concepts separate: local/server
+  content filtering supports `ALL` through `ERROR`, including `VERBOSE`/`TRACE`
+  and `WARN`/`WARNING` aliases; server paging and SSE retain their own query
+  threshold; and the persisted APP console threshold exposes
+  `VERBOSE/DEBUG/INFO/WARN/ERROR/OFF`. Changing a presentation filter does not
+  discard local records or reconnect the server stream. Clear now resets only
+  the current view, so reload can recover retained records, while share exports
+  the complete persisted APP log as a standard ZIP archive. Copy retains the
+  complete currently loaded source even when a display filter is active.
+- Persistent torrent snapshots now retain sanitized save paths and Tracker
+  announce URLs. Restored results therefore keep path-derived categories,
+  save-path and Tracker sorting, and site matching without retaining Tracker
+  credential query values or URL user information.
 
 ## Performance and Persistent Cache Pass (2026-08-11)
 

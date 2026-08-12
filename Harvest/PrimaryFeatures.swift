@@ -45,6 +45,12 @@ private enum DashboardChartDefaults {
     static let itemCountRange = 10...50
 }
 
+private func isDashboardRequestCancellation(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    let nsError = error as NSError
+    return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+}
+
 struct DashboardDistributionItem: Identifiable {
     let name: String
     let value: Double
@@ -427,6 +433,7 @@ final class DashboardViewModel: ObservableObject {
             }
         }
         isLoading = snapshot.siteCount == 0 && !usingCachedData
+        defer { isLoading = false }
         do {
             let query: [String: Any] = days.map { ["days": $0] } ?? [:]
             let raw = try await appState.api(APIPath.dashboard, query: query)
@@ -436,9 +443,11 @@ final class DashboardViewModel: ObservableObject {
             usingCachedData = false
             await appState.writeSessionCache(raw, name: cacheKey)
         } catch {
-            if !usingCachedData { appState.presentedError = error.localizedDescription }
+            if !Task.isCancelled, !isDashboardRequestCancellation(error), !usingCachedData {
+                appState.presentedError = error.localizedDescription
+            }
         }
-        isLoading = false
+        guard !Task.isCancelled else { return }
         await loadAuthorization(appState)
     }
 
@@ -453,7 +462,9 @@ final class DashboardViewModel: ObservableObject {
             authorizationInfo = value
             authorizationError = nil
         } catch {
-            authorizationError = error.localizedDescription
+            if !Task.isCancelled, !isDashboardRequestCancellation(error) {
+                authorizationError = error.localizedDescription
+            }
         }
     }
 
@@ -932,15 +943,27 @@ struct DashboardView: View {
     @State private var showShare = false
     @State private var shareImage: UIImage?
     @State private var runningQuickAction: DashboardQuickAction?
+    @State private var showAccountAgeWeeks = false
 
     private var moduleOrder: [DashboardModule] { DashboardModule.decode(moduleOrderRaw) }
 
     var body: some View {
         ScrollView {
-            if model.isLoading {
-                LoadingState()
-            } else {
-                LazyVStack(spacing: 14) {
+            LazyVStack(spacing: 14) {
+                HStack {
+                    Spacer()
+                    Button { showSettings = true } label: {
+                        Label("卡片设置", systemImage: "slider.horizontal.3")
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(HarvestTheme.blue)
+                    .accessibilityLabel("仪表盘卡片设置")
+                }
+
+                if model.isLoading {
+                    LoadingState()
+                } else {
                     if model.usingCachedData {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                     }
@@ -958,8 +981,8 @@ struct DashboardView: View {
                         }
                     }
                 }
-                .padding(16)
             }
+            .padding(16)
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .refreshable { await model.load(appState, days: trendDays) }
@@ -1058,7 +1081,8 @@ struct DashboardView: View {
                     snapshot: model.snapshot,
                     privacy: appState.privacyMode,
                     accountAgeText: accountAgeText,
-                    accountAgeDetail: accountAgeDetail
+                    accountAgeDetail: accountAgeDetail,
+                    onToggleAccountAge: { showAccountAgeWeeks.toggle() }
                 )
             }
         case .quickActions:
@@ -1320,11 +1344,23 @@ struct DashboardView: View {
     private var accountAgeText: String {
         guard let joined = parseDate(model.snapshot.earliestJoinedAt) else { return "-" }
         let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
-        return "\(days) 天"
+        if showAccountAgeWeeks {
+            let weeks = days / 7
+            let remainingDays = days % 7
+            return remainingDays == 0 ? "\(weeks)周" : "\(weeks)周\(remainingDays)天"
+        }
+        if days >= 365 {
+            let years = days / 365
+            let months = (days % 365) / 30
+            return months > 0 ? "\(years)年\(months)个月" : "\(years)年"
+        }
+        if days >= 30 { return "\(days / 30)个月" }
+        return "\(days)天"
     }
 
     private var accountAgeDetail: String {
-        model.snapshot.earliestSite.isEmpty ? "最早站点未知" : model.snapshot.earliestSite
+        let mode = showAccountAgeWeeks ? "按周显示" : "按年显示"
+        return model.snapshot.earliestSite.isEmpty ? mode : "\(mode) · \(model.snapshot.earliestSite)"
     }
 
     @MainActor private func runGlobal(_ path: String) async {
@@ -1456,10 +1492,11 @@ private struct DashboardOverviewView: View {
     let privacy: Bool
     let accountAgeText: String
     let accountAgeDetail: String
+    let onToggleAccountAge: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            SectionHeader(title: "数据概览", subtitle: "累计数据与今日增量")
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeader(title: "数据概览")
 
             HStack(spacing: 0) {
                 overviewPrimaryMetric(
@@ -1481,63 +1518,60 @@ private struct DashboardOverviewView: View {
 
             Divider()
 
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
                 DashboardStatLine(
-                    label: "分享率",
-                    value: privateValue(String(format: "%.2f", snapshot.ratio)),
-                    detail: "\(snapshot.seeding) 个做种任务",
+                    label: "做种数",
+                    value: "\(snapshot.seeding)",
                     icon: "arrow.triangle.2.circlepath",
                     color: HarvestTheme.amber
                 )
                 DashboardStatLine(
                     label: "站点",
                     value: "\(snapshot.siteCount)",
-                    detail: "\(snapshot.unread) 条未读消息",
                     icon: "globe.americas",
                     color: HarvestTheme.coral
                 )
                 DashboardStatLine(
                     label: "今日上传",
                     value: privateValue(formatBytes(snapshot.todayUploaded)),
-                    detail: "今日增量",
                     icon: "arrow.up.right",
                     color: HarvestTheme.green
                 )
                 DashboardStatLine(
                     label: "今日下载",
                     value: privateValue(formatBytes(snapshot.todayDownloaded)),
-                    detail: "今日增量",
                     icon: "arrow.down.right",
                     color: HarvestTheme.blue
                 )
                 DashboardStatLine(
                     label: "做种体积",
                     value: privateValue(formatBytes(snapshot.seedVolume)),
-                    detail: "累计做种体积",
                     icon: "externaldrive.fill.badge.checkmark",
                     color: HarvestTheme.amber
                 )
                 DashboardStatLine(
                     label: "已发布",
                     value: "\(snapshot.published)",
-                    detail: "累计发布种子",
                     icon: "paperplane.fill",
                     color: HarvestTheme.coral
                 )
                 DashboardStatLine(
                     label: "下载中",
                     value: "\(snapshot.leeching)",
-                    detail: "正在下载任务",
                     icon: "arrow.down.circle.fill",
                     color: HarvestTheme.blue
                 )
-                DashboardStatLine(
-                    label: "P龄",
-                    value: accountAgeText,
-                    detail: accountAgeDetail,
-                    icon: "calendar",
-                    color: HarvestTheme.green
-                )
+                Button(action: onToggleAccountAge) {
+                    DashboardStatLine(
+                        label: "P龄",
+                        value: accountAgeText,
+                        icon: "calendar",
+                        color: HarvestTheme.green
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("P龄 \(accountAgeText)，\(accountAgeDetail)，点击切换显示方式")
             }
         }
         .cardSurface()
@@ -1567,14 +1601,13 @@ private struct DashboardOverviewView: View {
 private struct DashboardStatLine: View {
     let label: String
     let value: String
-    let detail: String
     let icon: String
     let color: Color
 
     var body: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 10) {
             SymbolBadge(icon: icon, color: color, size: 32)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(label)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -1583,14 +1616,10 @@ private struct DashboardStatLine: View {
                     .font(.subheadline.weight(.bold).monospacedDigit())
                     .lineLimit(1)
                     .minimumScaleFactor(0.65)
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(minHeight: 36)
         .accessibilityElement(children: .combine)
     }
 }
@@ -2272,10 +2301,10 @@ private struct DashboardShareContent: View {
                 shareMetric("总上传", privacy ? "••••" : formatBytes(snapshot.uploaded), HarvestTheme.green)
                 shareMetric("总下载", privacy ? "••••" : formatBytes(snapshot.downloaded), HarvestTheme.blue)
                 shareMetric("做种体积", privacy ? "••••" : formatBytes(snapshot.seedVolume), HarvestTheme.amber)
-                shareMetric("站点 / 做种", "\(snapshot.siteCount) / \(snapshot.seeding)", HarvestTheme.coral)
+                shareMetric("站点", "\(snapshot.siteCount)", HarvestTheme.coral)
                 shareMetric("今日上传", privacy ? "••••" : formatBytes(snapshot.todayUploaded), HarvestTheme.green)
                 shareMetric("今日下载", privacy ? "••••" : formatBytes(snapshot.todayDownloaded), HarvestTheme.blue)
-                shareMetric("分享率", privacy ? "••••" : String(format: "%.2f", snapshot.ratio), HarvestTheme.amber)
+                shareMetric("做种数", "\(snapshot.seeding)", HarvestTheme.amber)
                 shareMetric("发种 / 下载中", "\(snapshot.published) / \(snapshot.leeching)", HarvestTheme.coral)
             }
             if let serverPoint {

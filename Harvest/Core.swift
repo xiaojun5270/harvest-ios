@@ -158,10 +158,42 @@ struct APIError: LocalizedError {
 }
 
 enum AppLogLevel: String, Codable, CaseIterable, Sendable {
+    case verbose = "VERBOSE"
     case debug = "DEBUG"
     case info = "INFO"
     case warning = "WARNING"
     case error = "ERROR"
+
+    fileprivate var priority: Int {
+        switch self {
+        case .verbose: 0
+        case .debug: 1
+        case .info: 2
+        case .warning: 3
+        case .error: 4
+        }
+    }
+}
+
+enum AppLogThreshold: Int, CaseIterable, Identifiable, Sendable {
+    case verbose
+    case debug
+    case info
+    case warning
+    case error
+    case off
+
+    var id: Int { rawValue }
+    var label: String {
+        switch self {
+        case .verbose: "VERBOSE"
+        case .debug: "DEBUG"
+        case .info: "INFO"
+        case .warning: "WARN"
+        case .error: "ERROR"
+        case .off: "OFF"
+        }
+    }
 }
 
 struct AppLogRecord: Codable, Identifiable, Sendable {
@@ -195,6 +227,10 @@ actor AppLogStore {
         records.append(AppLogRecord(id: UUID(), timestamp: Date(), level: level, message: message))
         if records.count > 2_000 { records.removeFirst(records.count - 2_000) }
         persist()
+        let stored = UserDefaults.standard.object(forKey: "logs.appThreshold") as? Int
+        let threshold = AppLogThreshold(rawValue: stored ?? AppLogThreshold.info.rawValue) ?? .info
+        guard threshold != .off, level.priority >= threshold.rawValue else { return }
+        NSLog("[Harvest] [%@] %@", level.rawValue, message)
     }
 
     func snapshot() -> [AppLogRecord] { records }
@@ -204,9 +240,98 @@ actor AppLogStore {
         try? FileManager.default.removeItem(at: fileURL)
     }
 
+    func exportArchive() throws -> URL {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let text = records.map { record in
+            "[\(formatter.string(from: record.timestamp))] [\(record.level.rawValue)] \(record.message)"
+        }.joined(separator: "\n") + (records.isEmpty ? "" : "\n")
+        let contents = Data(text.utf8)
+        let archive = try storedZIPArchive(fileName: "app.log", contents: contents)
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("harvest_app_logs_\(Int(Date().timeIntervalSince1970))")
+            .appendingPathExtension("zip")
+        try archive.write(to: output, options: .atomic)
+        return output
+    }
+
     private func persist() {
         guard let data = try? JSONEncoder().encode(records) else { return }
         try? data.write(to: fileURL, options: .atomic)
+    }
+}
+
+private func storedZIPArchive(fileName: String, contents: Data) throws -> Data {
+    guard let fileNameData = fileName.data(using: .utf8),
+          fileNameData.count <= Int(UInt16.max),
+          contents.count <= Int(UInt32.max) else {
+        throw APIError(statusCode: 0, message: "日志文件过大，无法生成 ZIP")
+    }
+    let crc = zipCRC32(contents)
+    let size = UInt32(contents.count)
+    var archive = Data()
+
+    archive.appendLittleEndian(UInt32(0x04034b50))
+    archive.appendLittleEndian(UInt16(20))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(crc)
+    archive.appendLittleEndian(size)
+    archive.appendLittleEndian(size)
+    archive.appendLittleEndian(UInt16(fileNameData.count))
+    archive.appendLittleEndian(UInt16(0))
+    archive.append(fileNameData)
+    archive.append(contents)
+
+    let centralDirectoryOffset = UInt32(archive.count)
+    archive.appendLittleEndian(UInt32(0x02014b50))
+    archive.appendLittleEndian(UInt16(20))
+    archive.appendLittleEndian(UInt16(20))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(crc)
+    archive.appendLittleEndian(size)
+    archive.appendLittleEndian(size)
+    archive.appendLittleEndian(UInt16(fileNameData.count))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt32(0))
+    archive.appendLittleEndian(UInt32(0))
+    archive.append(fileNameData)
+
+    let centralDirectorySize = UInt32(archive.count) - centralDirectoryOffset
+    archive.appendLittleEndian(UInt32(0x06054b50))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(0))
+    archive.appendLittleEndian(UInt16(1))
+    archive.appendLittleEndian(UInt16(1))
+    archive.appendLittleEndian(centralDirectorySize)
+    archive.appendLittleEndian(centralDirectoryOffset)
+    archive.appendLittleEndian(UInt16(0))
+    return archive
+}
+
+private func zipCRC32(_ data: Data) -> UInt32 {
+    var crc = UInt32.max
+    for byte in data {
+        crc ^= UInt32(byte)
+        for _ in 0..<8 {
+            crc = (crc >> 1) ^ ((crc & 1) == 1 ? 0xEDB88320 : 0)
+        }
+    }
+    return crc ^ UInt32.max
+}
+
+private extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var littleEndian = value.littleEndian
+        Swift.withUnsafeBytes(of: &littleEndian) { append(contentsOf: $0) }
     }
 }
 
