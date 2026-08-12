@@ -4228,60 +4228,17 @@ struct SiteRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
+        VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) {
-                    trafficMetric(
-                        label: "上传",
-                        value: privateValue(formatBytes(site.uploaded)),
-                        delta: dailyDeltaText(site.uploadDelta),
-                        icon: "arrow.up",
-                        color: HarvestTheme.green
-                    )
-                    Divider().frame(height: 58)
-                    trafficMetric(
-                        label: "下载",
-                        value: privateValue(formatBytes(site.downloaded)),
-                        delta: dailyDeltaText(site.downloadDelta),
-                        icon: "arrow.down",
-                        color: HarvestTheme.blue
-                    )
-                }
-                VStack(spacing: 10) {
-                    trafficMetric(
-                        label: "上传",
-                        value: privateValue(formatBytes(site.uploaded)),
-                        delta: dailyDeltaText(site.uploadDelta),
-                        icon: "arrow.up",
-                        color: HarvestTheme.green
-                    )
-                    trafficMetric(
-                        label: "下载",
-                        value: privateValue(formatBytes(site.downloaded)),
-                        delta: dailyDeltaText(site.downloadDelta),
-                        icon: "arrow.down",
-                        color: HarvestTheme.blue
-                    )
-                }
-            }
-
-            LazyVGrid(columns: metricColumns, spacing: 10) {
-                SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green)
-                SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue)
-                SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber)
-                SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral)
-                SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
-                SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber)
-                SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue)
-                SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: privateValue(formatBytes(site.seedVolume)), color: HarvestTheme.green)
-            }
-
+            trafficSection
+            coreMetrics
             Divider()
-            metadata
+            accountMetadata
+            Divider()
+            activityMetadata
         }
-        .padding(14)
+        .padding(16)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
@@ -4299,38 +4256,46 @@ struct SiteRow: View {
 
     private var metricColumns: [GridItem] {
         let count = dynamicTypeSize.isAccessibilitySize ? 2 : 4
-        return Array(repeating: GridItem(.flexible(), spacing: 8), count: count)
+        return Array(repeating: GridItem(.flexible(), spacing: 10), count: count)
+    }
+
+    private var metadataColumns: [GridItem] {
+        let count = dynamicTypeSize.isAccessibilitySize ? 2 : 3
+        return Array(repeating: GridItem(.flexible(), spacing: 10), count: count)
     }
 
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
-            siteLogo(size: 56)
-            VStack(alignment: .leading, spacing: 7) {
-                Text(site.name)
-                    .font(.headline)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+            siteLogo(size: 54)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(site.name)
+                        .font(.headline)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.82)
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
+                    SiteAvailabilityBadge(enabled: site.enabled)
+                }
 
                 Text(siteIdentityText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
 
-                CompactFlowLayout(spacing: 6) {
-                    siteBadge(
-                        site.enabled ? "可用" : "停用",
-                        icon: site.enabled ? "checkmark" : "pause.fill",
-                        color: site.enabled ? HarvestTheme.green : HarvestTheme.coral
-                    )
-                    if site.signed {
-                        siteBadge("今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green)
-                    } else if site.signIn {
-                        siteBadge("今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber)
-                    }
-                    let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !level.isEmpty {
-                        siteBadge(level, icon: "medal.fill", color: HarvestTheme.blue)
+                if !headerStatuses.isEmpty {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 12) {
+                            ForEach(headerStatuses) { status in
+                                SiteInlineStatus(status: status)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            ForEach(headerStatuses) { status in
+                                SiteInlineStatus(status: status)
+                            }
+                        }
                     }
                 }
             }
@@ -4338,18 +4303,80 @@ struct SiteRow: View {
         }
     }
 
-    private var metadata: some View {
-        CompactFlowLayout(spacing: 7) {
-            SiteMetadataItem(icon: "ticket.fill", label: "邀请 \(site.invitations)", color: HarvestTheme.coral)
-            SiteMetadataItem(icon: "calendar", label: "做种 \(site.seedDays) 天", color: HarvestTheme.green)
-            SiteMetadataItem(icon: "exclamationmark.triangle.fill", label: "H&R \(hrText)", color: HarvestTheme.amber)
-            SiteMetadataItem(icon: "envelope.fill", label: "邮件 \(site.mail)", color: HarvestTheme.blue)
-            SiteMetadataItem(icon: "bell.fill", label: "通知 \(site.notice)", color: HarvestTheme.coral)
-            SiteMetadataItem(icon: "person.badge.clock", label: "注册 \(joinedText)", color: HarvestTheme.blue)
-            SiteMetadataItem(icon: "clock.fill", label: "活跃 \(shortDate(site.latestActive))", color: HarvestTheme.green)
-            SiteMetadataItem(icon: "arrow.clockwise", label: "同步 \(shortDate(site.updatedAt))", color: HarvestTheme.amber)
-            ForEach(site.tags, id: \.self) { tag in
-                SiteMetadataItem(icon: "tag.fill", label: tag, color: HarvestTheme.blue)
+    @ViewBuilder private var trafficSection: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(spacing: 10) {
+                uploadMetric
+                Divider()
+                downloadMetric
+            }
+        } else {
+            HStack(spacing: 0) {
+                uploadMetric
+                Divider().frame(height: 60)
+                downloadMetric
+            }
+        }
+    }
+
+    private var uploadMetric: some View {
+        SiteTrafficMetric(
+            label: "上传",
+            value: privateValue(formatBytes(site.uploaded)),
+            delta: dailyDeltaText(site.uploadDelta),
+            icon: "arrow.up",
+            color: HarvestTheme.green
+        )
+    }
+
+    private var downloadMetric: some View {
+        SiteTrafficMetric(
+            label: "下载",
+            value: privateValue(formatBytes(site.downloaded)),
+            delta: dailyDeltaText(site.downloadDelta),
+            icon: "arrow.down",
+            color: HarvestTheme.blue
+        )
+    }
+
+    private var coreMetrics: some View {
+        LazyVGrid(columns: metricColumns, spacing: 10) {
+            SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green)
+            SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue)
+            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber)
+            SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral)
+            SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
+            SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber)
+            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue)
+            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: privateValue(formatBytes(site.seedVolume)), color: HarvestTheme.green)
+        }
+        .padding(.top, 2)
+    }
+
+    private var accountMetadata: some View {
+        LazyVGrid(columns: metadataColumns, alignment: .leading, spacing: 11) {
+            SiteMetadataMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
+            SiteMetadataMetric(icon: "calendar", label: "做种天数", value: "\(site.seedDays) 天", color: HarvestTheme.green)
+            SiteMetadataMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
+            SiteMetadataMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
+            SiteMetadataMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
+            SiteMetadataMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
+        }
+    }
+
+    private var activityMetadata: some View {
+        VStack(spacing: 8) {
+            SiteDetailLine(icon: "person.badge.clock", label: "注册", value: joinedText, color: HarvestTheme.blue)
+            SiteDetailLine(icon: "clock.fill", label: "活跃", value: shortDate(site.latestActive), color: HarvestTheme.green)
+            SiteDetailLine(icon: "arrow.clockwise", label: "同步", value: shortDate(site.updatedAt), color: HarvestTheme.amber)
+            if !site.tags.isEmpty {
+                SiteDetailLine(
+                    icon: "tag.fill",
+                    label: "标签",
+                    value: site.tags.joined(separator: " · "),
+                    color: HarvestTheme.blue,
+                    lineLimit: nil
+                )
             }
         }
     }
@@ -4386,34 +4413,18 @@ struct SiteRow: View {
         .accessibilityHidden(true)
     }
 
-    private func trafficMetric(label: String, value: String, delta: String, icon: String, color: Color) -> some View {
-        HStack(spacing: 10) {
-            SymbolBadge(icon: icon, color: color, size: 34)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(label)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(value)
-                    .font(.title3.weight(.bold).monospacedDigit())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.62)
-                Text(delta)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(color)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+    private var headerStatuses: [SiteStatusDescriptor] {
+        var statuses: [SiteStatusDescriptor] = []
+        if site.signed {
+            statuses.append(SiteStatusDescriptor(id: "signed", label: "今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green))
+        } else if site.signIn {
+            statuses.append(SiteStatusDescriptor(id: "sign", label: "今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber))
         }
-    }
-
-    private func siteBadge(_ label: String, icon: String, color: Color) -> some View {
-        Label(label, systemImage: icon)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(color, in: Capsule())
+        let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !level.isEmpty {
+            statuses.append(SiteStatusDescriptor(id: "level", label: level, icon: "medal.fill", color: HarvestTheme.blue))
+        }
+        return statuses
     }
 
     private func dailyDeltaText(_ value: Double) -> String {
@@ -4467,6 +4478,75 @@ struct SiteRow: View {
     }
 }
 
+private struct SiteStatusDescriptor: Identifiable {
+    let id: String
+    let label: String
+    let icon: String
+    let color: Color
+}
+
+private struct SiteAvailabilityBadge: View {
+    let enabled: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(enabled ? HarvestTheme.green : HarvestTheme.coral)
+                .frame(width: 7, height: 7)
+            Text(enabled ? "可用" : "停用")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .fixedSize(horizontal: true, vertical: true)
+        .accessibilityLabel(enabled ? "站点可用" : "站点停用")
+    }
+}
+
+private struct SiteInlineStatus: View {
+    let status: SiteStatusDescriptor
+
+    var body: some View {
+        Label(status.label, systemImage: status.icon)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(status.color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+private struct SiteTrafficMetric: View {
+    let label: String
+    let value: String
+    let delta: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 9) {
+            SymbolBadge(icon: icon, color: color, size: 34)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.headline.monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.62)
+                Text(delta)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(color)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
 private struct SiteCardMetric: View {
     let icon: String
     let label: String
@@ -4474,7 +4554,7 @@ private struct SiteCardMetric: View {
     let color: Color
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 5) {
             Image(systemName: icon)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.white)
@@ -4483,35 +4563,82 @@ private struct SiteCardMetric: View {
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
             Text(value)
                 .font(.caption.weight(.bold))
                 .monospacedDigit()
                 .lineLimit(1)
-                .minimumScaleFactor(0.58)
+                .minimumScaleFactor(0.52)
         }
-        .frame(maxWidth: .infinity, minHeight: 58)
+        .frame(maxWidth: .infinity, minHeight: 64)
         .accessibilityLabel("\(label) \(value)")
     }
 }
 
-private struct SiteMetadataItem: View {
+private struct SiteMetadataMetric: View {
     let icon: String
     let label: String
+    let value: String
     let color: Color
 
     var body: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 7) {
             Image(systemName: icon)
-                .font(.system(size: 9, weight: .semibold))
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 19, height: 19)
-                .background(color, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-            Text(label)
-                .font(.caption2.weight(.medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+                .frame(width: 24, height: 24)
+                .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Text(value)
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.68)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct SiteDetailLine: View {
+    let icon: String
+    let label: String
+    let value: String
+    let color: Color
+    let lineLimit: Int?
+
+    init(icon: String, label: String, value: String, color: Color, lineLimit: Int? = 1) {
+        self.icon = icon
+        self.label = label
+        self.value = value
+        self.color = color
+        self.lineLimit = lineLimit
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: icon)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 30, alignment: .leading)
+            Text(value)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+                .lineLimit(lineLimit)
+                .minimumScaleFactor(0.72)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
