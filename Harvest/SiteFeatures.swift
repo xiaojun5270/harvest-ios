@@ -170,7 +170,7 @@ enum SiteAvailabilityFilter: String, CaseIterable, Identifiable {
 
 enum SiteConditionFilter: String, CaseIterable, Identifiable {
     case all = "全部条件"
-    case unsigned = "今日未签到"
+    case unsigned = "未签到"
     case hasNewMessage = "有新邮件"
     case hasNewAnnouncement = "有新公告"
     case hasNewNotification = "有新通知"
@@ -673,6 +673,8 @@ struct SitesView: View {
                         }
                     }
                     .listStyle(.plain)
+                    .listRowSpacing(0)
+                    .contentMargins(.vertical, 0, for: .scrollContent)
                     .scrollContentBackground(.hidden)
                     .background(Color(uiColor: .systemGroupedBackground))
                     .refreshable { await model.load(appState) }
@@ -2091,7 +2093,7 @@ struct SiteRow: View {
                 .stroke(site.enabled ? HarvestTheme.green.opacity(0.22) : HarvestTheme.coral.opacity(0.18))
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 5)
+        .padding(.vertical, 3)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilitySummary)
@@ -2112,17 +2114,24 @@ struct SiteRow: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.78)
                         .layoutPriority(2)
-                    compactAccountSummary
+                    if hasCompactAccountSummary {
+                        compactAccountSummary
+                    }
                     Spacer(minLength: 4)
                     if let levelStatus {
                         SiteInlineStatus(status: levelStatus)
                     }
                 }
                 HStack(alignment: .center, spacing: 8) {
-                    Label(joinedText, systemImage: "calendar.badge.clock")
-                        .font(.caption2.weight(.medium).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    HStack(spacing: 2) {
+                        Image(systemName: "calendar.badge.clock")
+                            .font(.system(size: 12, weight: .medium))
+                            .frame(width: 15, height: 16, alignment: .center)
+                        Text(joinedText)
+                            .font(.caption2.weight(.medium).monospacedDigit())
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.secondary)
                     Spacer(minLength: 4)
                     if let signStatus {
                         SiteInlineStatus(status: signStatus)
@@ -2135,13 +2144,33 @@ struct SiteRow: View {
 
     private var compactAccountSummary: some View {
         HStack(spacing: 3) {
-            SiteHeaderCompactMetric(icon: "ticket.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
-            SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
-            SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue)
-            SiteHeaderCompactMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral)
-            SiteHeaderCompactMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral)
+            if site.invitations > 0 {
+                SiteHeaderCompactMetric(icon: "person.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
+            }
+            if hasHRContent {
+                SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
+            }
+            if site.mail > 0 {
+                SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue, breathes: true)
+            }
+            if site.notice > 0 {
+                SiteHeaderCompactMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral, breathes: true)
+            }
+            if site.unread > 0 {
+                SiteHeaderCompactMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral, breathes: true)
+            }
         }
-        .frame(maxWidth: .infinity)
+    }
+
+    private var hasCompactAccountSummary: Bool {
+        site.invitations > 0 || hasHRContent || site.mail > 0 || site.notice > 0 || site.unread > 0
+    }
+
+    private var hasHRContent: Bool {
+        let value = site.hr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        if let number = Double(value.replacingOccurrences(of: ",", with: "")) { return number > 0 }
+        return !["-", "--", "无", "none", "null", "nil"].contains(value.lowercased())
     }
 
     @ViewBuilder private var trafficSection: some View {
@@ -2226,6 +2255,7 @@ struct SiteRow: View {
     }
 
     private func siteLogo(size: CGFloat) -> some View {
+        let imageSize = floor(size * 0.68)
         return ZStack {
             Circle()
                 .fill(Color.white)
@@ -2237,11 +2267,11 @@ struct SiteRow: View {
                     .font(.system(size: size * 0.38, weight: .semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .padding(size * 0.15)
+            .frame(width: imageSize, height: imageSize)
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)
-        .clipShape(Circle())
+        .contentShape(Circle())
         .overlay {
             Circle()
                 .stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
@@ -2249,19 +2279,19 @@ struct SiteRow: View {
         .overlay(alignment: .bottomTrailing) {
             Circle()
                 .fill(site.enabled ? HarvestTheme.green : HarvestTheme.coral)
-                .frame(width: 11, height: 11)
+                .frame(width: 9, height: 9)
                 .overlay(Circle().stroke(Color(uiColor: .systemBackground), lineWidth: 2))
-                .offset(x: 2, y: 2)
+                .offset(x: 4, y: 4)
         }
         .accessibilityHidden(true)
     }
 
     private var signStatus: SiteStatusDescriptor? {
         if site.signed {
-            return SiteStatusDescriptor(id: "signed", label: "今日已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green)
+            return SiteStatusDescriptor(id: "signed", label: "已签到", icon: "checkmark.seal.fill", color: HarvestTheme.green)
         }
         if site.signIn {
-            return SiteStatusDescriptor(id: "sign", label: "今日待签到", icon: "checkmark.seal", color: HarvestTheme.amber)
+            return SiteStatusDescriptor(id: "sign", label: "未签到", icon: "checkmark.seal", color: HarvestTheme.amber)
         }
         return nil
     }
@@ -2315,7 +2345,7 @@ struct SiteRow: View {
         let traffic = privacy
             ? "流量数据已隐藏"
             : "上传 \(formatBytes(site.uploaded))，下载 \(formatBytes(site.downloaded))，分享率 \(String(format: "%.2f", site.ratio))"
-        let signStatus = site.signed ? "，今日已签到" : (site.signIn ? "，今日待签到" : "")
+        let signStatus = site.signed ? "，已签到" : (site.signIn ? "，未签到" : "")
         let unread = site.unread > 0 ? "，未读 \(site.unread)" : ""
         return "\(site.name)，注册 \(joinedText)，\(state)\(signStatus)，\(traffic)，\(site.seeding) 个做种，最近时间 \(recentTimeText(relativeTo: Date()))\(unread)"
     }
@@ -2332,36 +2362,65 @@ private struct SiteInlineStatus: View {
     let status: SiteStatusDescriptor
 
     var body: some View {
-        Label(status.label, systemImage: status.icon)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(status.color)
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
-            .fixedSize(horizontal: false, vertical: true)
+        HStack(spacing: 2) {
+            Image(systemName: status.icon)
+                .font(.system(size: 13, weight: .semibold))
+                .frame(width: 15, height: 17, alignment: .center)
+            Text(status.label)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .foregroundStyle(status.color)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
 private struct SiteHeaderCompactMetric: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let icon: String
     let label: String
     let value: String
     let color: Color
+    let breathes: Bool
+    @State private var isBright = false
+
+    init(icon: String, label: String, value: String, color: Color, breathes: Bool = false) {
+        self.icon = icon
+        self.label = label
+        self.value = value
+        self.color = color
+        self.breathes = breathes
+    }
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(alignment: .center, spacing: 2) {
             Image(systemName: icon)
                 .font(.system(size: 6.5, weight: .bold))
                 .foregroundStyle(.white)
-                .frame(width: 13, height: 13)
+                .frame(width: 14, height: 14, alignment: .center)
                 .background(color, in: RoundedRectangle(cornerRadius: 3.5, style: .continuous))
+                .opacity(breathes && !reduceMotion ? (isBright ? 1 : 0.3) : 1)
+                .animation(
+                    breathes && !reduceMotion
+                        ? .easeInOut(duration: 1.15).repeatForever(autoreverses: true)
+                        : .default,
+                    value: isBright
+                )
             Text(value)
                 .font(.system(size: 8, weight: .bold).monospacedDigit())
                 .lineLimit(1)
                 .minimumScaleFactor(0.55)
         }
-        .frame(maxWidth: .infinity, minHeight: 16)
+        .frame(minHeight: 16, alignment: .center)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) \(value)")
+        .onAppear { updateBreathingState() }
+        .onChange(of: reduceMotion) { _, _ in updateBreathingState() }
+    }
+
+    private func updateBreathingState() {
+        isBright = breathes && !reduceMotion
     }
 }
 
@@ -2498,7 +2557,7 @@ private struct SiteListSummaryBar: View {
             if showActive {
                 summaryMetric("可用", value: activeCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
             }
-            summaryMetric("待签", value: pendingSignInCount, icon: "checkmark.seal", color: HarvestTheme.amber)
+            summaryMetric("未签到", value: pendingSignInCount, icon: "checkmark.seal", color: HarvestTheme.amber)
             summaryMetric("未读", value: unreadCount, icon: "bell.badge.fill", color: HarvestTheme.coral)
         }
     }
@@ -5058,21 +5117,23 @@ private struct SiteDetailIcon: View {
     let site: SiteItem
     let iconCandidates: [RemoteImageCandidate]
     var body: some View {
+        let size: CGFloat = 64
+        let imageSize = floor(size * 0.68)
         ZStack {
             Circle().fill(Color.white)
             CachedAnimatedRemoteImageCandidates(
                 candidates: iconCandidates,
-                maximumPixelSize: 64 * UIScreen.main.scale
+                maximumPixelSize: size * UIScreen.main.scale
             ) {
                 Image(systemName: "globe.americas.fill")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .padding(10)
+            .frame(width: imageSize, height: imageSize)
             .opacity(site.enabled ? 1 : 0.62)
         }
-        .frame(width: 64, height: 64)
-        .clipShape(Circle())
+        .frame(width: size, height: size)
+        .contentShape(Circle())
         .overlay {
             Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
         }

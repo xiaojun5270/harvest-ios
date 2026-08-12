@@ -269,11 +269,13 @@ private struct AnimatedRemoteImageView: UIViewRepresentable {
         imageView.backgroundColor = .clear
         imageView.contentMode = .scaleAspectFit
         imageView.layer.contentsGravity = .resizeAspect
-        imageView.clipsToBounds = true
+        imageView.clipsToBounds = false
         return imageView
     }
 
     func updateUIView(_ imageView: AnimatedRemoteUIImageView, context: Context) {
+        imageView.contentMode = .scaleAspectFit
+        imageView.layer.contentsGravity = .resizeAspect
         imageView.display(image)
     }
 }
