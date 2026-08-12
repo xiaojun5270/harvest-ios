@@ -2237,7 +2237,7 @@ struct SiteRow: View {
                     .font(.system(size: size * 0.38, weight: .semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .padding(size * 0.1)
+            .padding(size * 0.15)
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)
@@ -5068,7 +5068,7 @@ private struct SiteDetailIcon: View {
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .padding(7)
+            .padding(10)
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: 64, height: 64)
