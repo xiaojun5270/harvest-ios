@@ -242,6 +242,10 @@ private final class RemoteAnimatedImageCache: @unchecked Sendable {
 private final class AnimatedRemoteUIImageView: UIImageView {
     private var displayedCacheKey = ""
 
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
+    }
+
     func display(_ animatedImage: RemoteAnimatedImage) {
         guard displayedCacheKey != animatedImage.cacheKey else { return }
         displayedCacheKey = animatedImage.cacheKey
@@ -269,14 +273,28 @@ private struct AnimatedRemoteImageView: UIViewRepresentable {
         imageView.backgroundColor = .clear
         imageView.contentMode = .scaleAspectFit
         imageView.layer.contentsGravity = .resizeAspect
-        imageView.clipsToBounds = false
+        imageView.clipsToBounds = true
+        imageView.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        imageView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        imageView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        imageView.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         return imageView
     }
 
     func updateUIView(_ imageView: AnimatedRemoteUIImageView, context: Context) {
         imageView.contentMode = .scaleAspectFit
         imageView.layer.contentsGravity = .resizeAspect
+        imageView.clipsToBounds = true
         imageView.display(image)
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: AnimatedRemoteUIImageView,
+        context: Context
+    ) -> CGSize? {
+        guard let width = proposal.width, let height = proposal.height else { return nil }
+        return CGSize(width: width, height: height)
     }
 }
 

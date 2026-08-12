@@ -2077,13 +2077,13 @@ struct SiteRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 8) {
             header
             trafficSection
             coreMetrics
             activitySection
         }
-        .padding(12)
+        .padding(11)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
@@ -2093,7 +2093,7 @@ struct SiteRow: View {
                 .stroke(site.enabled ? HarvestTheme.green.opacity(0.22) : HarvestTheme.coral.opacity(0.18))
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 3)
+        .padding(.vertical, 1)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilitySummary)
@@ -2105,19 +2105,18 @@ struct SiteRow: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: 9) {
             siteLogo(size: 48)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .center, spacing: 5) {
                     Text(site.name)
                         .font(.headline)
                         .lineLimit(1)
                         .minimumScaleFactor(0.78)
-                        .layoutPriority(2)
+                    Spacer(minLength: 4)
                     if hasCompactAccountSummary {
                         compactAccountSummary
                     }
-                    Spacer(minLength: 4)
                     if let levelStatus {
                         SiteInlineStatus(status: levelStatus)
                     }
@@ -2144,22 +2143,24 @@ struct SiteRow: View {
 
     private var compactAccountSummary: some View {
         HStack(spacing: 3) {
-            if site.invitations > 0 {
-                SiteHeaderCompactMetric(icon: "person.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
-            }
-            if hasHRContent {
-                SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
-            }
-            if site.mail > 0 {
-                SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue, breathes: true)
-            }
             if site.notice > 0 {
                 SiteHeaderCompactMetric(icon: "bell.fill", label: "通知", value: "\(site.notice)", color: HarvestTheme.coral, breathes: true)
             }
             if site.unread > 0 {
                 SiteHeaderCompactMetric(icon: "bell.badge.fill", label: "未读", value: "\(site.unread)", color: HarvestTheme.coral, breathes: true)
             }
+            if site.mail > 0 {
+                SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue, breathes: true)
+            }
+            if hasHRContent {
+                SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
+            }
+            if site.invitations > 0 {
+                SiteHeaderCompactMetric(icon: "person.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
+            }
         }
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
     }
 
     private var hasCompactAccountSummary: Bool {
@@ -2255,7 +2256,7 @@ struct SiteRow: View {
     }
 
     private func siteLogo(size: CGFloat) -> some View {
-        let imageSize = floor(size * 0.68)
+        let imageSize = floor(size * 0.70)
         return ZStack {
             Circle()
                 .fill(Color.white)
@@ -2268,6 +2269,7 @@ struct SiteRow: View {
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
             .frame(width: imageSize, height: imageSize)
+            .clipped()
             .opacity(site.enabled ? 1 : 0.62)
         }
         .frame(width: size, height: size)

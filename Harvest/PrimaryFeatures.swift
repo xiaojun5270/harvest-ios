@@ -618,7 +618,8 @@ final class DashboardViewModel: ObservableObject {
     }
 }
 
-private enum DashboardModule: String, CaseIterable, Identifiable {
+private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
+    case hero
     case userInfo
     case serverResources
     case designation
@@ -638,8 +639,18 @@ private enum DashboardModule: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    static let defaultOrder: [DashboardModule] = [
+        .hero, .overview, .userInfo, .quickActions, .siteStatus, .trend,
+        .serverResources, .designation, .todayIncrement, .siteUploadDistribution,
+        .siteDownloadDistribution, .seedDistribution, .usernameDistribution,
+        .emailDistribution, .monthlyUpload, .monthlyDownload, .monthlyPublish
+    ]
+
+    static var defaultOrderRaw: String { encode(defaultOrder) }
+
     var title: String {
         switch self {
+        case .hero: "仪表盘概览"
         case .userInfo: "用户信息"
         case .serverResources: "服务器资源"
         case .designation: "称号进度"
@@ -661,6 +672,7 @@ private enum DashboardModule: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
+        case .hero: "gauge.with.dots.needle.67percent"
         case .userInfo: "person.crop.circle"
         case .serverResources: "server.rack"
         case .designation: "medal"
@@ -684,7 +696,11 @@ private enum DashboardModule: String, CaseIterable, Identifiable {
         var decoded = raw.split(separator: ",").compactMap { DashboardModule(rawValue: String($0)) }
         var seen = Set<String>()
         decoded = decoded.filter { seen.insert($0.rawValue).inserted }
-        decoded.append(contentsOf: allCases.filter { !seen.contains($0.rawValue) })
+        if !seen.contains(DashboardModule.hero.rawValue) {
+            decoded.insert(.hero, at: 0)
+            seen.insert(DashboardModule.hero.rawValue)
+        }
+        decoded.append(contentsOf: defaultOrder.filter { !seen.contains($0.rawValue) })
         return decoded
     }
 
@@ -840,6 +856,7 @@ private struct DashboardCacheClearSheet: View {
             DashboardServerRefreshDefaults.intervalKey,
             DashboardServerRefreshDefaults.durationKey,
             "dashboard.showUserInfo",
+            "dashboard.showHero",
             "dashboard.showDesignation",
             "dashboard.showOverview",
             "dashboard.showQuickActions",
@@ -893,6 +910,7 @@ struct DashboardView: View {
     @AppStorage("dashboard.serverResource.interval") private var serverResourceInterval = DashboardServerRefreshDefaults.interval
     @AppStorage("dashboard.serverResource.duration") private var serverResourceDuration = DashboardServerRefreshDefaults.duration
     @AppStorage("dashboard.showUserInfo") private var showUserInfo = true
+    @AppStorage("dashboard.showHero") private var showHero = true
     @AppStorage("dashboard.showDesignation") private var showDesignation = true
     @AppStorage("dashboard.showOverview") private var showOverview = true
     @AppStorage("dashboard.showQuickActions") private var showQuickActions = true
@@ -908,7 +926,7 @@ struct DashboardView: View {
     @AppStorage("dashboard.showMonthlyUpload") private var showMonthlyUpload = true
     @AppStorage("dashboard.showMonthlyDownload") private var showMonthlyDownload = true
     @AppStorage("dashboard.showMonthlyPublish") private var showMonthlyPublish = true
-    @AppStorage("dashboard.moduleOrder") private var moduleOrderRaw = "overview,userInfo,quickActions,siteStatus,trend,serverResources,designation,todayIncrement,siteUploadDistribution,siteDownloadDistribution,seedDistribution,usernameDistribution,emailDistribution,monthlyUpload,monthlyDownload,monthlyPublish"
+    @AppStorage("dashboard.moduleOrder") private var moduleOrderRaw = DashboardModule.defaultOrderRaw
     @State private var showSettings = false
     @State private var showCacheClear = false
     @State private var showShare = false
@@ -926,17 +944,18 @@ struct DashboardView: View {
                     if model.usingCachedData {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                     }
-                    DashboardHeroView(
-                        greeting: greeting,
-                        updatedAt: model.lastUpdated,
-                        serverConnected: model.serverConnected,
-                        serverError: model.serverError,
-                        snapshot: model.snapshot,
-                        privacy: appState.privacyMode
-                    )
-
                     ForEach(moduleOrder) { module in
                         dashboardModule(module)
+                    }
+                    if !hasVisibleModules {
+                        EmptyState(
+                            icon: "rectangle.grid.2x2",
+                            title: "未显示仪表盘卡片",
+                            detail: "可在卡片设置中重新启用需要的模块",
+                            actionTitle: "打开卡片设置"
+                        ) {
+                            showSettings = true
+                        }
                     }
                 }
                 .padding(16)
@@ -977,7 +996,7 @@ struct DashboardView: View {
                 } label: { Image(systemName: "square.and.arrow.up") }
                     .accessibilityLabel("分享仪表盘长图")
                 Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("仪表盘设置")
+                    .accessibilityLabel("仪表盘卡片设置")
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -990,7 +1009,8 @@ struct DashboardView: View {
                 serverResourceDuration: $serverResourceDuration,
                 chartHeight: $chartHeight,
                 itemLimit: $itemLimit,
-                moduleOrderRaw: $moduleOrderRaw
+                moduleOrderRaw: $moduleOrderRaw,
+                moduleVisibilityBindings: moduleVisibilityBindings
             )
         }
         .sheet(isPresented: $showCacheClear) {
@@ -1006,6 +1026,17 @@ struct DashboardView: View {
 
     @ViewBuilder private func dashboardModule(_ module: DashboardModule) -> some View {
         switch module {
+        case .hero:
+            if showHero {
+                DashboardHeroView(
+                    greeting: greeting,
+                    updatedAt: model.lastUpdated,
+                    serverConnected: model.serverConnected,
+                    serverError: model.serverError,
+                    snapshot: model.snapshot,
+                    privacy: appState.privacyMode
+                )
+            }
         case .userInfo:
             if showUserInfo {
                 DashboardUserInfoView(
@@ -1026,7 +1057,8 @@ struct DashboardView: View {
                 DashboardOverviewView(
                     snapshot: model.snapshot,
                     privacy: appState.privacyMode,
-                    accountAgeText: accountAgeText
+                    accountAgeText: accountAgeText,
+                    accountAgeDetail: accountAgeDetail
                 )
             }
         case .quickActions:
@@ -1226,6 +1258,52 @@ struct DashboardView: View {
         }
     }
 
+    private var hasVisibleModules: Bool {
+        moduleOrder.contains { module in
+            switch module {
+            case .hero: showHero
+            case .userInfo: showUserInfo
+            case .serverResources: showServerResources
+            case .designation: showDesignation
+            case .overview: showOverview
+            case .quickActions: showQuickActions
+            case .trend: showTrend
+            case .siteStatus: showSiteStatus
+            case .usernameDistribution: showUsernameDistribution
+            case .emailDistribution: showEmailDistribution
+            case .siteUploadDistribution: showSiteUploadDistribution
+            case .siteDownloadDistribution: showSiteDownloadDistribution
+            case .todayIncrement: showTodayIncrement
+            case .seedDistribution: showSeedDistribution
+            case .monthlyUpload: showMonthlyUpload
+            case .monthlyDownload: showMonthlyDownload
+            case .monthlyPublish: showMonthlyPublish
+            }
+        }
+    }
+
+    private var moduleVisibilityBindings: [DashboardModule: Binding<Bool>] {
+        [
+            .hero: $showHero,
+            .userInfo: $showUserInfo,
+            .serverResources: $showServerResources,
+            .designation: $showDesignation,
+            .overview: $showOverview,
+            .quickActions: $showQuickActions,
+            .trend: $showTrend,
+            .siteStatus: $showSiteStatus,
+            .usernameDistribution: $showUsernameDistribution,
+            .emailDistribution: $showEmailDistribution,
+            .siteUploadDistribution: $showSiteUploadDistribution,
+            .siteDownloadDistribution: $showSiteDownloadDistribution,
+            .todayIncrement: $showTodayIncrement,
+            .seedDistribution: $showSeedDistribution,
+            .monthlyUpload: $showMonthlyUpload,
+            .monthlyDownload: $showMonthlyDownload,
+            .monthlyPublish: $showMonthlyPublish
+        ]
+    }
+
     private var greeting: String {
         let hour = Calendar.current.component(.hour, from: Date())
         let text = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好"
@@ -1240,9 +1318,13 @@ struct DashboardView: View {
     }
 
     private var accountAgeText: String {
-        guard let joined = parseDate(model.snapshot.earliestJoinedAt) else { return model.snapshot.earliestSite.isEmpty ? "最早站点未知" : model.snapshot.earliestSite }
+        guard let joined = parseDate(model.snapshot.earliestJoinedAt) else { return "-" }
         let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
-        return model.snapshot.earliestSite.isEmpty ? "P 龄 \(days) 天" : "\(model.snapshot.earliestSite) · \(days) 天"
+        return "\(days) 天"
+    }
+
+    private var accountAgeDetail: String {
+        model.snapshot.earliestSite.isEmpty ? "最早站点未知" : model.snapshot.earliestSite
     }
 
     @MainActor private func runGlobal(_ path: String) async {
@@ -1373,6 +1455,7 @@ private struct DashboardOverviewView: View {
     let snapshot: DashboardSnapshot
     let privacy: Bool
     let accountAgeText: String
+    let accountAgeDetail: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1430,16 +1513,30 @@ private struct DashboardOverviewView: View {
                 DashboardStatLine(
                     label: "做种体积",
                     value: privateValue(formatBytes(snapshot.seedVolume)),
-                    detail: "\(snapshot.leeching) 个下载中",
+                    detail: "累计做种体积",
                     icon: "externaldrive.fill.badge.checkmark",
                     color: HarvestTheme.amber
                 )
                 DashboardStatLine(
                     label: "已发布",
                     value: "\(snapshot.published)",
-                    detail: accountAgeText,
+                    detail: "累计发布种子",
                     icon: "paperplane.fill",
                     color: HarvestTheme.coral
+                )
+                DashboardStatLine(
+                    label: "下载中",
+                    value: "\(snapshot.leeching)",
+                    detail: "正在下载任务",
+                    icon: "arrow.down.circle.fill",
+                    color: HarvestTheme.blue
+                )
+                DashboardStatLine(
+                    label: "P龄",
+                    value: accountAgeText,
+                    detail: accountAgeDetail,
+                    icon: "calendar",
+                    color: HarvestTheme.green
                 )
             }
         }
@@ -1922,7 +2019,7 @@ struct DistributionView: View {
     }
 }
 
-struct DashboardSettingsSheet: View {
+private struct DashboardSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var trendDays: Int
     @Binding var autoRefresh: Bool
@@ -1933,23 +2030,17 @@ struct DashboardSettingsSheet: View {
     @Binding var chartHeight: Double
     @Binding var itemLimit: Int
     @Binding var moduleOrderRaw: String
-    @AppStorage("dashboard.showUserInfo") private var showUserInfo = true
-    @AppStorage("dashboard.showDesignation") private var showDesignation = true
-    @AppStorage("dashboard.showOverview") private var showOverview = true
-    @AppStorage("dashboard.showQuickActions") private var showQuickActions = true
-    @AppStorage("dashboard.showTrend") private var showTrend = true
-    @AppStorage("dashboard.showServerResources") private var showServerResources = true
-    @AppStorage("dashboard.showSiteStatus") private var showSiteStatus = true
-    @AppStorage("dashboard.showUsernameDistribution") private var showUsernameDistribution = true
-    @AppStorage("dashboard.showEmailDistribution") private var showEmailDistribution = true
-    @AppStorage("dashboard.showSiteUploadDistribution") private var showSiteUploadDistribution = true
-    @AppStorage("dashboard.showSiteDownloadDistribution") private var showSiteDownloadDistribution = true
-    @AppStorage("dashboard.showTodayIncrement") private var showTodayIncrement = true
-    @AppStorage("dashboard.showSeedDistribution") private var showSeedDistribution = true
-    @AppStorage("dashboard.showMonthlyUpload") private var showMonthlyUpload = true
-    @AppStorage("dashboard.showMonthlyDownload") private var showMonthlyDownload = true
-    @AppStorage("dashboard.showMonthlyPublish") private var showMonthlyPublish = true
+    let moduleVisibilityBindings: [DashboardModule: Binding<Bool>]
     @State private var modules: [DashboardModule]
+    @State private var moduleVisibility: [DashboardModule: Bool]
+    @State private var draftTrendDays: Int
+    @State private var draftAutoRefresh: Bool
+    @State private var draftRefreshInterval: Int
+    @State private var draftServerResourceAutoStart: Bool
+    @State private var draftServerResourceInterval: Int
+    @State private var draftServerResourceDuration: Int
+    @State private var draftChartHeight: Double
+    @State private var draftItemLimit: Int
 
     init(
         trendDays: Binding<Int>,
@@ -1960,7 +2051,8 @@ struct DashboardSettingsSheet: View {
         serverResourceDuration: Binding<Int>,
         chartHeight: Binding<Double>,
         itemLimit: Binding<Int>,
-        moduleOrderRaw: Binding<String>
+        moduleOrderRaw: Binding<String>,
+        moduleVisibilityBindings: [DashboardModule: Binding<Bool>]
     ) {
         _trendDays = trendDays
         _autoRefresh = autoRefresh
@@ -1971,18 +2063,28 @@ struct DashboardSettingsSheet: View {
         _chartHeight = chartHeight
         _itemLimit = itemLimit
         _moduleOrderRaw = moduleOrderRaw
+        self.moduleVisibilityBindings = moduleVisibilityBindings
         _modules = State(initialValue: DashboardModule.decode(moduleOrderRaw.wrappedValue))
+        _moduleVisibility = State(initialValue: moduleVisibilityBindings.mapValues { $0.wrappedValue })
+        _draftTrendDays = State(initialValue: trendDays.wrappedValue)
+        _draftAutoRefresh = State(initialValue: autoRefresh.wrappedValue)
+        _draftRefreshInterval = State(initialValue: refreshInterval.wrappedValue)
+        _draftServerResourceAutoStart = State(initialValue: serverResourceAutoStart.wrappedValue)
+        _draftServerResourceInterval = State(initialValue: serverResourceInterval.wrappedValue)
+        _draftServerResourceDuration = State(initialValue: serverResourceDuration.wrappedValue)
+        _draftChartHeight = State(initialValue: chartHeight.wrappedValue)
+        _draftItemLimit = State(initialValue: itemLimit.wrappedValue)
     }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("趋势") {
-                    Picker("数据天数", selection: $trendDays) { ForEach([1, 7, 14, 30, 60, 90, 180], id: \.self) { Text($0 == 1 ? "今日" : "\($0) 天").tag($0) } }
+                    Picker("数据天数", selection: $draftTrendDays) { ForEach([1, 7, 14, 30, 60, 90, 180], id: \.self) { Text($0 == 1 ? "今日" : "\($0) 天").tag($0) } }
                 }
                 Section("图表尺寸") {
-                    LabeledContent("图表高度", value: "\(Int(chartHeight)) pt")
-                    Slider(value: $chartHeight, in: DashboardChartDefaults.heightRange, step: 20) {
+                    LabeledContent("图表高度", value: "\(Int(draftChartHeight)) pt")
+                    Slider(value: $draftChartHeight, in: DashboardChartDefaults.heightRange, step: 20) {
                         Text("图表高度")
                     } minimumValueLabel: {
                         Text("120").font(.caption2)
@@ -1990,8 +2092,8 @@ struct DashboardSettingsSheet: View {
                         Text("480").font(.caption2)
                     }
                     Stepper(
-                        "站点显示数量：\(itemLimit)",
-                        value: $itemLimit,
+                        "站点显示数量：\(draftItemLimit)",
+                        value: $draftItemLimit,
                         in: DashboardChartDefaults.itemCountRange
                     )
                     Button { resetChartSizing() } label: {
@@ -1999,25 +2101,25 @@ struct DashboardSettingsSheet: View {
                     }
                 }
                 Section("自动刷新") {
-                    Toggle("自动刷新仪表盘", isOn: $autoRefresh)
-                    Picker("刷新间隔", selection: $refreshInterval) {
+                    Toggle("自动刷新仪表盘", isOn: $draftAutoRefresh)
+                    Picker("刷新间隔", selection: $draftRefreshInterval) {
                         Text("1 分钟").tag(60)
                         Text("5 分钟").tag(300)
                         Text("15 分钟").tag(900)
                         Text("30 分钟").tag(1_800)
                     }
-                    .disabled(!autoRefresh)
+                    .disabled(!draftAutoRefresh)
                 }
                 Section("服务器资源监控") {
-                    Toggle("进入页面自动监控", isOn: $serverResourceAutoStart)
+                    Toggle("进入页面自动监控", isOn: $draftServerResourceAutoStart)
                     Stepper(
-                        "采样间隔：\(serverResourceInterval) 秒",
-                        value: $serverResourceInterval,
+                        "采样间隔：\(draftServerResourceInterval) 秒",
+                        value: $draftServerResourceInterval,
                         in: DashboardServerRefreshDefaults.range
                     )
                     Stepper(
-                        "自动停止：\(serverResourceDuration) 分钟",
-                        value: $serverResourceDuration,
+                        "自动停止：\(draftServerResourceDuration) 分钟",
+                        value: $draftServerResourceDuration,
                         in: DashboardServerRefreshDefaults.range
                     )
                     Text("关闭自动监控时仅获取一次状态，也可在服务器资源卡片中手动开始连续监控。")
@@ -2027,13 +2129,22 @@ struct DashboardSettingsSheet: View {
                         Label("恢复默认监控设置", systemImage: "arrow.counterclockwise")
                     }
                 }
-                Section("模块顺序与显示") {
+                Section("卡片顺序与显示") {
+                    LabeledContent("已显示", value: "\(visibleModuleCount) / \(modules.count)")
+                        .foregroundStyle(.secondary)
                     ForEach(modules) { module in
                         Toggle(isOn: visibilityBinding(for: module)) {
                             Label(module.title, systemImage: module.icon)
                         }
                     }
                     .onMove(perform: moveModules)
+                    HStack(spacing: 12) {
+                        Button("全部显示") { setAllModulesVisible(true) }
+                            .frame(maxWidth: .infinity)
+                        Divider()
+                        Button("全部隐藏") { setAllModulesVisible(false) }
+                            .frame(maxWidth: .infinity)
+                    }
                     Button {
                         resetModules()
                     } label: {
@@ -2041,70 +2152,68 @@ struct DashboardSettingsSheet: View {
                     }
                 }
             }
-            .navigationTitle("仪表盘设置").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("仪表盘卡片设置").navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { EditButton() }
-                ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    EditButton()
+                    Button("保存") { save() }
+                }
             }
         }
     }
 
     private func visibilityBinding(for module: DashboardModule) -> Binding<Bool> {
-        switch module {
-        case .userInfo: $showUserInfo
-        case .designation: $showDesignation
-        case .overview: $showOverview
-        case .quickActions: $showQuickActions
-        case .trend: $showTrend
-        case .serverResources: $showServerResources
-        case .siteStatus: $showSiteStatus
-        case .usernameDistribution: $showUsernameDistribution
-        case .emailDistribution: $showEmailDistribution
-        case .siteUploadDistribution: $showSiteUploadDistribution
-        case .siteDownloadDistribution: $showSiteDownloadDistribution
-        case .todayIncrement: $showTodayIncrement
-        case .seedDistribution: $showSeedDistribution
-        case .monthlyUpload: $showMonthlyUpload
-        case .monthlyDownload: $showMonthlyDownload
-        case .monthlyPublish: $showMonthlyPublish
-        }
+        Binding(
+            get: { moduleVisibility[module] ?? true },
+            set: { moduleVisibility[module] = $0 }
+        )
     }
 
     private func moveModules(from source: IndexSet, to destination: Int) {
         modules.move(fromOffsets: source, toOffset: destination)
-        moduleOrderRaw = DashboardModule.encode(modules)
     }
 
     private func resetModules() {
-        modules = DashboardModule.allCases
-        moduleOrderRaw = DashboardModule.encode(modules)
-        showUserInfo = true
-        showDesignation = true
-        showOverview = true
-        showQuickActions = true
-        showTrend = true
-        showServerResources = true
-        showSiteStatus = true
-        showUsernameDistribution = true
-        showEmailDistribution = true
-        showSiteUploadDistribution = true
-        showSiteDownloadDistribution = true
-        showTodayIncrement = true
-        showSeedDistribution = true
-        showMonthlyUpload = true
-        showMonthlyDownload = true
-        showMonthlyPublish = true
+        modules = DashboardModule.defaultOrder
+        moduleVisibility = Dictionary(uniqueKeysWithValues: DashboardModule.allCases.map { ($0, true) })
+    }
+
+    private var visibleModuleCount: Int {
+        modules.lazy.filter { visibilityBinding(for: $0).wrappedValue }.count
+    }
+
+    private func setAllModulesVisible(_ visible: Bool) {
+        for module in modules {
+            visibilityBinding(for: module).wrappedValue = visible
+        }
     }
 
     private func resetServerResourceRefresh() {
-        serverResourceAutoStart = DashboardServerRefreshDefaults.autoStart
-        serverResourceInterval = DashboardServerRefreshDefaults.interval
-        serverResourceDuration = DashboardServerRefreshDefaults.duration
+        draftServerResourceAutoStart = DashboardServerRefreshDefaults.autoStart
+        draftServerResourceInterval = DashboardServerRefreshDefaults.interval
+        draftServerResourceDuration = DashboardServerRefreshDefaults.duration
     }
 
     private func resetChartSizing() {
-        chartHeight = DashboardChartDefaults.height
-        itemLimit = DashboardChartDefaults.itemCount
+        draftChartHeight = DashboardChartDefaults.height
+        draftItemLimit = DashboardChartDefaults.itemCount
+    }
+
+    private func save() {
+        trendDays = draftTrendDays
+        autoRefresh = draftAutoRefresh
+        refreshInterval = draftRefreshInterval
+        serverResourceAutoStart = draftServerResourceAutoStart
+        serverResourceInterval = draftServerResourceInterval
+        serverResourceDuration = draftServerResourceDuration
+        chartHeight = draftChartHeight
+        itemLimit = draftItemLimit
+        moduleOrderRaw = DashboardModule.encode(modules)
+        for (module, binding) in moduleVisibilityBindings {
+            binding.wrappedValue = moduleVisibility[module] ?? true
+        }
+        dismiss()
     }
 }
 
