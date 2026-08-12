@@ -14,6 +14,8 @@
 		100000000000000000000005 /* SecondaryFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000005 /* SecondaryFeatures.swift */; };
 		100000000000000000000006 /* ManagementFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000006 /* ManagementFeatures.swift */; };
 		100000000000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* Assets.xcassets */; };
+		100000000000000000000008 /* SiteFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000B /* SiteFeatures.swift */; };
+		100000000000000000000009 /* DownloadFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000C /* DownloadFeatures.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -27,6 +29,8 @@
 		200000000000000000000008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000009 /* Harvest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Harvest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		20000000000000000000000A /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		20000000000000000000000B /* SiteFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SiteFeatures.swift; sourceTree = "<group>"; };
+		20000000000000000000000C /* DownloadFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadFeatures.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,6 +60,8 @@
 				200000000000000000000002 /* Core.swift */,
 				200000000000000000000003 /* SharedViews.swift */,
 				200000000000000000000004 /* PrimaryFeatures.swift */,
+				20000000000000000000000B /* SiteFeatures.swift */,
+				20000000000000000000000C /* DownloadFeatures.swift */,
 				200000000000000000000005 /* SecondaryFeatures.swift */,
 				200000000000000000000006 /* ManagementFeatures.swift */,
 				200000000000000000000007 /* Assets.xcassets */,
@@ -146,6 +152,8 @@
 				100000000000000000000002 /* Core.swift in Sources */,
 				100000000000000000000003 /* SharedViews.swift in Sources */,
 				100000000000000000000004 /* PrimaryFeatures.swift in Sources */,
+				100000000000000000000008 /* SiteFeatures.swift in Sources */,
+				100000000000000000000009 /* DownloadFeatures.swift in Sources */,
 				100000000000000000000005 /* SecondaryFeatures.swift in Sources */,
 				100000000000000000000006 /* ManagementFeatures.swift in Sources */,
 			);
@@ -192,7 +200,8 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = iphoneos;
-				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_COMPILATION_MODE = singlefile;
+				SWIFT_ENABLE_BATCH_MODE = NO;
 				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
@@ -230,7 +239,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 291;
 				DEVELOPMENT_TEAM = "";
-				ENABLE_PREVIEWS = YES;
+				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Harvest/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = Harvest;
@@ -241,7 +250,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
-				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
