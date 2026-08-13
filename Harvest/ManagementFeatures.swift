@@ -347,6 +347,11 @@ struct SettingsView: View {
                 }
 
                 Section("管理") {
+                    if appState.profile?.isSuperuser == true {
+                        NavigationLink { TasksView().environmentObject(appState) } label: {
+                            Label("任务中心", systemImage: "checklist")
+                        }
+                    }
                     NavigationLink { BackendOptionsView().environmentObject(appState) } label: { Label("后端配置", systemImage: "slider.horizontal.3") }
                     NavigationLink { NotificationToolsView().environmentObject(appState) } label: { Label("通知与机器人", systemImage: "bell.and.waves.left.and.right") }
                     NavigationLink { UserManagementView().environmentObject(appState) } label: { Label("用户中心", systemImage: "person.2") }

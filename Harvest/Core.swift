@@ -1971,6 +1971,9 @@ final class AppState: ObservableObject {
     private func loadProfile() async throws {
         let nextProfile = try await fetchProfile(baseURL: baseURL, token: accessToken)
         profile = nextProfile
+        if selectedTab == 4 {
+            selectedTab = nextProfile.isSuperuser ? 2 : 3
+        }
         if !nextProfile.isSuperuser && ![0, 3, 5].contains(selectedTab) {
             selectedTab = 3
         }

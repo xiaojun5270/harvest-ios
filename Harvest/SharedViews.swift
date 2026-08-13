@@ -1126,7 +1126,6 @@ struct MainShellView: View {
     @State private var showingSettings = false
     @State private var showingNotices = false
     @State private var showingAppUpdate = false
-    @State private var showingSearch = false
     @State private var availableAppUpdate: String?
     @State private var handledNoticePresentation = 0
     @State private var lastNonSearchTab = 2
@@ -1186,17 +1185,11 @@ struct MainShellView: View {
                         .frame(width: 34, height: 30)
                     }
                         .accessibilityLabel("消息")
-                    LegacySearchToolbarButton { appState.presentSearch() }
                     Button { showingSettings = true } label: {
                         Image(systemName: "gearshape.fill").symbolRenderingMode(.hierarchical)
                     }
                         .accessibilityLabel("设置")
                 }
-            }
-            .navigationDestination(isPresented: $showingSearch) {
-                SearchView { showingSearch = false }
-                    .environmentObject(appState)
-                    .toolbar(.hidden, for: .tabBar)
             }
         }
         .sheet(isPresented: $showingSettings) { SettingsView().environmentObject(appState) }
@@ -1256,11 +1249,7 @@ struct MainShellView: View {
             }
         }
         .onChange(of: appState.searchPresentationGeneration) { _, _ in
-            if #available(iOS 18.0, *) {
-                appState.selectedTab = 5
-            } else {
-                showingSearch = true
-            }
+            appState.selectedTab = 5
         }
         .onChange(of: appState.selectedTab) { oldValue, newValue in
             if newValue == 5, oldValue != 5 {
@@ -1282,13 +1271,8 @@ struct MainShellView: View {
                 Tab("仪表盘", systemImage: "chart.bar.xaxis", value: 2) { DashboardView() }
             }
             Tab("下载", systemImage: "arrow.down.circle.fill", value: 3) { DownloadsView() }
-            if appState.profile?.isSuperuser == true {
-                Tab("任务", systemImage: "checklist", value: 4) { TasksView() }
-            }
-            Tab(value: 5, role: .search) {
+            Tab("搜索", systemImage: "magnifyingglass", value: 5) {
                 SearchView { appState.selectedTab = lastNonSearchTab }
-            } label: {
-                Label("搜索", systemImage: "magnifyingglass")
             }
         }
     }
@@ -1303,9 +1287,9 @@ struct MainShellView: View {
                 DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
             }
             DownloadsView().tabItem { Label("下载", systemImage: "arrow.down.circle.fill") }.tag(3)
-            if appState.profile?.isSuperuser == true {
-                TasksView().tabItem { Label("任务", systemImage: "checklist") }.tag(4)
-            }
+            SearchView { appState.selectedTab = lastNonSearchTab }
+                .tabItem { Label("搜索", systemImage: "magnifyingglass") }
+                .tag(5)
         }
     }
 
@@ -1318,24 +1302,8 @@ struct MainShellView: View {
     private func validContentTab(_ candidate: Int) -> Int {
         if candidate == 0, showsNewsTab { return candidate }
         if candidate == 3 { return candidate }
-        if appState.profile?.isSuperuser == true, (1...4).contains(candidate) { return candidate }
+        if appState.profile?.isSuperuser == true, (1...3).contains(candidate) { return candidate }
         return defaultContentTab
-    }
-}
-
-private struct LegacySearchToolbarButton: View {
-    let action: () -> Void
-
-    @ViewBuilder var body: some View {
-        if #available(iOS 18.0, *) {
-            EmptyView()
-        } else {
-            Button(action: action) {
-                Image(systemName: "magnifyingglass")
-                    .symbolRenderingMode(.hierarchical)
-            }
-            .accessibilityLabel("搜索")
-        }
     }
 }
 
