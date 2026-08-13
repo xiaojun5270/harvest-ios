@@ -2753,7 +2753,7 @@ struct NewsView: View {
                             title: "影视资讯未显示",
                             actionTitle: "搜索影视"
                         ) {
-                            appState.selectedTab = 5
+                            appState.presentSearch()
                         }
                         .frame(maxWidth: .infinity, minHeight: 240)
                     }

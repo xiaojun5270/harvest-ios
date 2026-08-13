@@ -57,9 +57,9 @@ struct DownloaderItem: Identifiable {
         main = json.bool("main", "is_main", "default") ?? false
         uploadSpeed = status.double("uploadSpeed", "upload_speed", "up_info_speed") ?? json.double("upload_speed", "up_speed", "upspeed") ?? 0
         downloadSpeed = status.double("downloadSpeed", "download_speed", "dl_info_speed") ?? json.double("download_speed", "down_speed", "dlspeed") ?? 0
-        activeTorrentCount = status.int("activeTorrentCount", "active_torrent_count") ?? 0
-        pausedTorrentCount = status.int("pausedTorrentCount", "paused_torrent_count") ?? 0
-        totalTorrentCount = status.int("torrentCount", "torrent_count", "totalTorrentCount") ?? 0
+        activeTorrentCount = downloaderMetricInt(json, keys: downloaderActiveCountKeys) ?? 0
+        pausedTorrentCount = downloaderMetricInt(json, keys: downloaderPausedCountKeys) ?? 0
+        totalTorrentCount = downloaderMetricInt(json, keys: downloaderTotalCountKeys) ?? 0
         freeSpace = downloaderFreeSpace(status) ?? downloaderFreeSpace(preferences) ?? 0
         uploadedSession = status.double("up_info_data", "uploadedSession", "uploadedBytes")
             ?? currentStats.double("uploadedBytes", "uploaded_bytes") ?? 0
@@ -74,6 +74,73 @@ struct DownloaderItem: Identifiable {
         hasLiveStatus = !status.isEmpty
         raw = json
     }
+}
+
+private let downloaderActiveCountKeys = [
+    "activeTorrentCount", "active_torrent_count", "activeTorrents", "active_torrents", "active_count"
+]
+
+private let downloaderPausedCountKeys = [
+    "pausedTorrentCount", "paused_torrent_count", "pausedTorrents", "paused_torrents", "paused_count"
+]
+
+private let downloaderTotalCountKeys = [
+    "torrentCount", "torrent_count", "totalTorrentCount", "total_torrent_count", "totalTorrents",
+    "total_torrents", "torrents_count"
+]
+
+private func downloaderMetricInt(
+    _ dictionary: [String: Any],
+    keys: [String],
+    depth: Int = 0
+) -> Int? {
+    guard depth < 6 else { return nil }
+    for key in keys {
+        if let value = dictionary.int(key) { return value }
+    }
+    for key in ["data", "result", "info", "status", "server_state", "serverState"] {
+        guard let nested = dictionary.dict(key),
+              let value = downloaderMetricInt(nested, keys: keys, depth: depth + 1) else { continue }
+        return value
+    }
+    return nil
+}
+
+private func mergingDownloaderStatus(
+    _ values: [String: Any],
+    into raw: [String: Any]
+) -> [String: Any] {
+    var merged = raw
+    var envelope = merged.dict("status") ?? [:]
+
+    if var data = envelope.dict("data") {
+        if var info = data.dict("info") {
+            values.forEach { info[$0.key] = $0.value }
+            data["info"] = info
+        } else if var status = data.dict("status") {
+            values.forEach { status[$0.key] = $0.value }
+            data["status"] = status
+        } else if var serverState = data.dict("server_state") {
+            values.forEach { serverState[$0.key] = $0.value }
+            data["server_state"] = serverState
+        } else {
+            values.forEach { data[$0.key] = $0.value }
+        }
+        envelope["data"] = data
+    } else if var info = envelope.dict("info") {
+        values.forEach { info[$0.key] = $0.value }
+        envelope["info"] = info
+    } else if var status = envelope.dict("status") {
+        values.forEach { status[$0.key] = $0.value }
+        envelope["status"] = status
+    } else if var serverState = envelope.dict("server_state") {
+        values.forEach { serverState[$0.key] = $0.value }
+        envelope["server_state"] = serverState
+    } else {
+        values.forEach { envelope[$0.key] = $0.value }
+    }
+    merged["status"] = envelope
+    return merged
 }
 
 private func downloaderFreeSpace(_ dictionary: [String: Any]) -> Double? {
@@ -354,6 +421,58 @@ private func torrentStatusCode(_ item: TorrentItem) -> Int {
     }
 }
 
+private struct DownloaderTorrentSummary: Sendable {
+    let active: Int
+    let paused: Int
+    let total: Int
+}
+
+private func downloaderTorrentRows(_ value: Any, depth: Int = 0) -> [[String: Any]] {
+    guard depth < 6 else { return [] }
+    if let rows = value as? [[String: Any]] { return rows }
+    guard let dictionary = jsonDictionary(value) else { return [] }
+
+    for key in ["torrents", "items", "list", "rows"] {
+        if let rows = dictionary[key] as? [[String: Any]] { return rows }
+        if let keyedRows = dictionary[key] as? [String: Any] {
+            let rows = keyedRows.compactMap { key, value -> [String: Any]? in
+                guard var row = value as? [String: Any] else { return nil }
+                if row["hash"] == nil && row["hashString"] == nil { row["hash"] = key }
+                return row
+            }
+            if !rows.isEmpty { return rows }
+        }
+    }
+    for key in ["data", "result"] {
+        guard let nested = dictionary[key] else { continue }
+        let rows = downloaderTorrentRows(nested, depth: depth + 1)
+        if !rows.isEmpty { return rows }
+    }
+    return jsonRows(value).filter { row in
+        row.string("hashString", "hash_string", "hash", "name", "title") != nil
+            || row.string("state", "status") != nil
+    }
+}
+
+private func downloaderTorrentSummary(_ value: Any, category: String) -> DownloaderTorrentSummary {
+    let root = jsonDictionary(value) ?? [:]
+    let rows = downloaderTorrentRows(value)
+    let derivedActive = rows.reduce(into: 0) { count, row in
+        let downloadSpeed = row.double("rateDownload", "dlspeed", "download_speed", "rate_download") ?? 0
+        let uploadSpeed = row.double("rateUpload", "upspeed", "upload_speed", "rate_upload") ?? 0
+        if downloadSpeed > 0 || uploadSpeed > 0 { count += 1 }
+    }
+    let derivedPaused = rows.reduce(into: 0) { count, row in
+        var source = row
+        source["downloader_category"] = category
+        if torrentStatusCode(TorrentItem(source)) == 0 { count += 1 }
+    }
+    let total = max(downloaderMetricInt(root, keys: downloaderTotalCountKeys) ?? 0, rows.count)
+    let active = max(downloaderMetricInt(root, keys: downloaderActiveCountKeys) ?? 0, derivedActive)
+    let paused = max(downloaderMetricInt(root, keys: downloaderPausedCountKeys) ?? 0, derivedPaused)
+    return DownloaderTorrentSummary(active: active, paused: paused, total: total)
+}
+
 private func compareTorrentValues<T: Comparable>(_ left: T, _ right: T) -> Int {
     left == right ? 0 : (left < right ? -1 : 1)
 }
@@ -630,6 +749,7 @@ final class DownloadsViewModel: ObservableObject {
             downloaders = jsonRows(raw).map(DownloaderItem.init)
             // The compact downloads screen only needs aggregate downloader status.
             guard includesTorrentData else {
+                downloaders = await downloadersWithTorrentSummaries(appState, items: downloaders)
                 torrents = []
                 sites = []
                 usingCachedData = false
@@ -707,6 +827,63 @@ final class DownloadsViewModel: ObservableObject {
             } else {
                 appState.presentedError = error.localizedDescription
             }
+        }
+    }
+
+    private func downloadersWithTorrentSummaries(
+        _ appState: AppState,
+        items: [DownloaderItem]
+    ) async -> [DownloaderItem] {
+        let candidates = items.filter { item in
+            let isTransmission = item.category.lowercased().contains("tr")
+            return item.enabled && !isTransmission && (
+                item.totalTorrentCount == 0
+                    || (item.activeTorrentCount == 0 && (item.downloadSpeed > 0 || item.uploadSpeed > 0))
+                    || downloaderMetricInt(item.raw, keys: downloaderTotalCountKeys) == nil
+                    || downloaderMetricInt(item.raw, keys: downloaderActiveCountKeys) == nil
+            )
+        }
+        guard !candidates.isEmpty else { return items }
+
+        let responses = await withTaskGroup(of: (Int, String, Data?).self) { group in
+            for downloader in candidates {
+                let id = downloader.id
+                let category = downloader.category
+                group.addTask {
+                    do {
+                        let value = try await appState.api("\(APIPath.downloaderMain)\(id)")
+                        guard JSONSerialization.isValidJSONObject(value),
+                              let data = try? JSONSerialization.data(withJSONObject: value) else {
+                            return (id, category, nil)
+                        }
+                        return (id, category, data)
+                    } catch {
+                        recordAppLog(.warning, "下载器 \(id) 种子统计读取失败：\(error.localizedDescription)")
+                        return (id, category, nil)
+                    }
+                }
+            }
+            var values: [(Int, String, Data?)] = []
+            for await response in group { values.append(response) }
+            return values
+        }
+
+        var summaries: [Int: DownloaderTorrentSummary] = [:]
+        for (id, category, data) in responses {
+            guard let data,
+                  let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { continue }
+            summaries[id] = downloaderTorrentSummary(value, category: category)
+        }
+        guard !summaries.isEmpty else { return items }
+
+        return items.map { item in
+            guard let summary = summaries[item.id] else { return item }
+            let merged = mergingDownloaderStatus([
+                "activeTorrentCount": summary.active,
+                "pausedTorrentCount": summary.paused,
+                "torrentCount": summary.total
+            ], into: item.raw)
+            return DownloaderItem(merged)
         }
     }
 
@@ -1300,8 +1477,23 @@ final class DownloadsViewModel: ObservableObject {
                         let downloader = updated[index]
                         let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
                         guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
+                        let liveTotal = downloaderMetricInt(live, keys: downloaderTotalCountKeys)
+                        var fallbackStatus: [String: Any] = [:]
+                        if downloaderMetricInt(live, keys: downloaderActiveCountKeys) == nil
+                            || ((liveTotal ?? 0) == 0 && downloader.totalTorrentCount > 0) {
+                            fallbackStatus["activeTorrentCount"] = downloader.activeTorrentCount
+                        }
+                        if downloaderMetricInt(live, keys: downloaderPausedCountKeys) == nil {
+                            fallbackStatus["pausedTorrentCount"] = downloader.pausedTorrentCount
+                        }
+                        if liveTotal == nil || (liveTotal == 0 && downloader.totalTorrentCount > 0) {
+                            fallbackStatus["torrentCount"] = downloader.totalTorrentCount
+                        }
                         var merged = downloader.raw
                         merged["status"] = live
+                        if !fallbackStatus.isEmpty {
+                            merged = mergingDownloaderStatus(fallbackStatus, into: merged)
+                        }
                         let next = DownloaderItem(merged)
                         guard downloaderLiveSignature(next) != downloaderLiveSignature(downloader) else { continue }
                         updated[index] = next

@@ -1174,6 +1174,7 @@ final class AppState: ObservableObject {
     @Published var canOpenAdminUsers = false
     @Published var selectedTab = 2
     @Published var pendingResourceSearch: String?
+    @Published var searchPresentationGeneration = 0
     @Published var presentedError: String?
     @Published private(set) var manualTaskFeedback: ManualTaskFeedback?
     @Published var appearance: AppAppearance
@@ -1613,7 +1614,11 @@ final class AppState: ObservableObject {
         let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         pendingResourceSearch = value
-        selectedTab = 5
+        presentSearch()
+    }
+
+    func presentSearch() {
+        searchPresentationGeneration &+= 1
     }
 
     func logout() {
