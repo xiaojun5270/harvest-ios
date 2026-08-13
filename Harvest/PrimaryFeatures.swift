@@ -2288,83 +2288,90 @@ private struct DashboardAccountDistributionView: View {
     let usernames: [DashboardDistributionItem]
     let emails: [DashboardDistributionItem]
     let privacy: Bool
+    @State private var selection = AccountDistributionKind.username
 
-    private var rowCount: Int { max(usernames.count, emails.count) }
+    private var selectedItems: [DashboardDistributionItem] {
+        selection == .username ? usernames : emails
+    }
 
     var body: some View {
         DashboardScrollableModule(
             title: "账号分布",
-            subtitle: "用户名与邮箱并列对照",
+            subtitle: selection == .username ? "用户名使用分布" : "邮箱使用分布",
             icon: "person.text.rectangle",
             color: HarvestTheme.coral,
-            itemCount: rowCount,
+            itemCount: selectedItems.count,
             rowHeight: DashboardListLayout.accountRowHeight,
-            contentHeightAdjustment: 30
+            contentHeightAdjustment: 38
         ) {
             LazyVStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    accountHeader("用户名", icon: "person.fill")
-                    accountHeader("邮箱", icon: "envelope.fill")
+                Picker("账号类型", selection: $selection) {
+                    ForEach(AccountDistributionKind.allCases) { kind in
+                        Label(kind.title, systemImage: kind.icon).tag(kind)
+                    }
                 }
-                .padding(.horizontal, 8)
-                .frame(height: 30)
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 6)
+                .frame(height: 38)
 
-                ForEach(0..<rowCount, id: \.self) { index in
-                    HStack(spacing: 12) {
-                        accountEntry(item(in: usernames, at: index), index: index)
-                        Divider().frame(height: 20)
-                        accountEntry(item(in: emails, at: index), index: index)
+                ForEach(Array(selectedItems.enumerated()), id: \.offset) { index, item in
+                    HStack(spacing: 7) {
+                        dashboardRank(index + 1, color: HarvestTheme.coral)
+                        Text(privacyMaskedText(item.name, enabled: privacy))
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(selection == .email ? 0.68 : 0.82)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text(formatCompactNumber(item.value))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(HarvestTheme.coral)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.accountRowHeight)
                     .overlay(alignment: .bottom) {
-                        if index < rowCount - 1 { Divider().padding(.leading, 8) }
+                        if index < selectedItems.count - 1 { Divider().padding(.leading, 8) }
                     }
                 }
             }
         }
     }
+}
 
-    private func accountHeader(_ title: String, icon: String) -> some View {
-        Label(title, systemImage: icon)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
+private enum AccountDistributionKind: String, CaseIterable, Identifiable {
+    case username
+    case email
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .username: "用户名"
+        case .email: "邮箱"
+        }
     }
 
-    private func item(in items: [DashboardDistributionItem], at index: Int) -> DashboardDistributionItem? {
-        items.indices.contains(index) ? items[index] : nil
-    }
-
-    @ViewBuilder
-    private func accountEntry(_ item: DashboardDistributionItem?, index: Int) -> some View {
-        if let item {
-            HStack(spacing: 5) {
-                Text("\(index + 1)")
-                    .font(.caption2.weight(.bold).monospacedDigit())
-                    .foregroundStyle(HarvestTheme.coral)
-                    .frame(width: 16)
-                Text(privacyMaskedText(item.name, enabled: privacy))
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-                Spacer(minLength: 2)
-                Text(formatCompactNumber(item.value))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity)
-        } else {
-            Color.clear.frame(maxWidth: .infinity)
+    var icon: String {
+        switch self {
+        case .username: "person.fill"
+        case .email: "envelope.fill"
         }
     }
 }
 
-private func dashboardRank(_ rank: Int, color: Color) -> some View {
-    Text("\(rank)")
-        .font(.caption2.weight(.bold).monospacedDigit())
+private func dashboardRank(_ rank: Int, color: Color, compact: Bool = false) -> some View {
+    Text("#\(rank)")
+        .font(.system(size: compact ? 9 : 10, weight: .bold, design: .monospaced))
         .foregroundStyle(rank <= 3 ? color : Color.secondary)
-        .frame(width: 22, height: 22)
-        .background(rank <= 3 ? color.opacity(0.12) : Color.primary.opacity(0.045), in: Circle())
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(width: compact ? 30 : 38, height: 22)
+        .background(
+            rank <= 3 ? color.opacity(0.12) : Color.primary.opacity(0.045),
+            in: Capsule()
+        )
 }
 
 private struct DashboardScrollableModule<Content: View>: View {
@@ -2955,7 +2962,7 @@ private struct DashboardShareContent: View {
                 Spacer()
                 Text("用户名 / 邮箱").font(.caption).foregroundStyle(.secondary)
             }
-            HStack(spacing: 16) {
+            VStack(spacing: 10) {
                 shareAccountColumn("用户名", items: usernames, count: count)
                 Divider()
                 shareAccountColumn("邮箱", items: emails, count: count)
@@ -2974,15 +2981,15 @@ private struct DashboardShareContent: View {
             Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             ForEach(0..<count, id: \.self) { index in
                 HStack(spacing: 6) {
-                    Text("\(index + 1)")
-                        .font(.caption2.weight(.bold).monospacedDigit())
-                        .foregroundStyle(HarvestTheme.coral)
-                        .frame(width: 16)
+                    dashboardRank(index + 1, color: HarvestTheme.coral, compact: true)
                     if items.indices.contains(index) {
                         let item = items[index]
                         Text(privacyMaskedText(item.name, enabled: privacy))
                             .font(.caption.weight(.medium))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
                         Spacer(minLength: 2)
                         Text(formatCompactNumber(item.value))
                             .font(.caption2.monospacedDigit())

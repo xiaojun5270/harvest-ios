@@ -1129,7 +1129,6 @@ struct MainShellView: View {
     @State private var availableAppUpdate: String?
     @State private var handledNoticePresentation = 0
     @State private var lastNonSearchTab = 2
-    @State private var isSearchScreenVisible = false
 
     private var showsNewsTab: Bool {
         appState.mediaTMDBEnabled || appState.mediaDoubanEnabled
@@ -1139,32 +1138,53 @@ struct MainShellView: View {
         appState.profile?.isSuperuser == true ? 2 : 3
     }
 
+    private var navigationItems: [MainNavigationItem] {
+        var items: [MainNavigationItem] = []
+        if showsNewsTab {
+            items.append(.init(id: 0, title: "资讯", icon: "newspaper", selectedIcon: "newspaper.fill"))
+        }
+        if appState.profile?.isSuperuser == true {
+            items.append(.init(id: 1, title: "站点", icon: "globe.asia.australia", selectedIcon: "globe.asia.australia.fill"))
+            items.append(.init(id: 2, title: "仪表盘", icon: "chart.bar.xaxis", selectedIcon: "chart.bar.xaxis"))
+        }
+        items.append(.init(id: 3, title: "下载", icon: "arrow.down.circle", selectedIcon: "arrow.down.circle.fill"))
+        if appState.profile?.isSuperuser == true {
+            items.append(.init(id: 4, title: "任务", icon: "checklist", selectedIcon: "checklist"))
+        }
+        items.append(.init(id: 5, title: "搜索", icon: "magnifyingglass", selectedIcon: "magnifyingglass.circle.fill"))
+        return items
+    }
+
     var body: some View {
         NavigationStack {
             TabView(selection: $appState.selectedTab) {
                 if showsNewsTab {
-                    NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
+                    NewsView().tag(0)
                 }
                 if appState.profile?.isSuperuser == true {
-                    SitesView().tabItem { Label("站点", systemImage: "globe.asia.australia.fill") }.tag(1)
-                    DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
+                    SitesView().tag(1)
+                    DashboardView().tag(2)
                 }
-                DownloadsView().tabItem { Label("下载", systemImage: "arrow.down.circle.fill") }.tag(3)
+                DownloadsView().tag(3)
                 if appState.profile?.isSuperuser == true {
-                    TasksView().tabItem { Label("任务", systemImage: "checklist") }.tag(4)
+                    TasksView().tag(4)
                 }
                 SearchView {
                     appState.selectedTab = lastNonSearchTab
-                } onVisibilityChanged: { isVisible in
-                    isSearchScreenVisible = isVisible
                 }
-                .tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }
                 .tag(5)
+            }
+            .tabViewStyle(.page(indexDisplayMode: .never))
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if appState.selectedTab != 5 {
+                    MainLiquidNavigationBar(items: navigationItems, selection: $appState.selectedTab)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                }
             }
             .harvestNavigationChrome()
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(isSearchScreenVisible || appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
-            .toolbar(isSearchScreenVisible || appState.selectedTab == 5 ? .hidden : .visible, for: .tabBar)
+            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     BrandMark(size: 28)
@@ -1277,6 +1297,66 @@ struct MainShellView: View {
         guard appState.noticePresentationGeneration != handledNoticePresentation else { return }
         handledNoticePresentation = appState.noticePresentationGeneration
         showingNotices = true
+    }
+}
+
+private struct MainNavigationItem: Identifiable {
+    let id: Int
+    let title: String
+    let icon: String
+    let selectedIcon: String
+}
+
+private struct MainLiquidNavigationBar: View {
+    let items: [MainNavigationItem]
+    @Binding var selection: Int
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(items) { item in
+                let isSelected = selection == item.id
+                Button {
+                    selection = item.id
+                } label: {
+                    VStack(spacing: 3) {
+                        Image(systemName: isSelected ? item.selectedIcon : item.icon)
+                            .font(.system(size: 18, weight: isSelected ? .semibold : .medium))
+                            .symbolRenderingMode(.hierarchical)
+                            .frame(height: 21)
+                        Text(item.title)
+                            .font(.system(size: 10, weight: isSelected ? .semibold : .medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .contentShape(Rectangle())
+                    .background {
+                        if isSelected {
+                            Capsule()
+                                .fill(Color.accentColor.opacity(0.12))
+                                .padding(.horizontal, 2)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(item.title)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+            }
+        }
+        .padding(5)
+        .background {
+            if #available(iOS 26.0, *) {
+                Capsule()
+                    .fill(.clear)
+                    .glassEffect(.regular, in: Capsule())
+            } else {
+                Capsule()
+                    .fill(.ultraThinMaterial)
+                    .overlay(Capsule().stroke(Color.primary.opacity(0.08)))
+            }
+        }
+        .shadow(color: .black.opacity(0.10), radius: 12, y: 4)
     }
 }
 

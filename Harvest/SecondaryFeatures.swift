@@ -2765,7 +2765,6 @@ struct NewsView: View {
                             onShowAll: { selectedCollection = collection }
                         )
                     }
-                    .animation(.easeInOut(duration: 0.2), value: selectedSource)
                     Button { showNotices = true } label: {
                         NewsLinkRow(title: "消息动态", subtitle: "查看站点公告、任务结果和系统提醒", icon: "antenna.radiowaves.left.and.right", color: HarvestTheme.green)
                     }
