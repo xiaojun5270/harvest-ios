@@ -4249,6 +4249,9 @@ struct SiteDetailView: View {
 
     private var current: SiteItem { latestSite ?? site }
     private var levelRequirements: [SiteLevelRequirement] { parseSiteLevels(siteConfig["level"]) }
+    private var featureColumns: [GridItem] {
+        [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+    }
     private var historyPoints: [SiteHistoryPoint] {
         current.statusHistory.compactMap { row in
             guard let key = row.string("date", "created_at", "updated_at"), let date = parseDate(key) else { return nil }
@@ -4282,21 +4285,47 @@ struct SiteDetailView: View {
                     .padding(.vertical, 4)
                 }
                 Section("功能开关") {
-                    ForEach(SiteFeatureFlag.allCases) { flag in
-                        Toggle(isOn: Binding(
-                            get: { flag.value(in: current) },
-                            set: { value in Task { await updateFlag(flag, value: value) } }
-                        )) {
-                            HStack(spacing: 10) {
-                                Label(flag.title, systemImage: flag.icon)
+                    LazyVGrid(columns: featureColumns, spacing: 10) {
+                        ForEach(SiteFeatureFlag.allCases) { flag in
+                            HStack(spacing: 7) {
+                                Image(systemName: flag.icon)
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(flag.value(in: current) ? HarvestTheme.blue : Color.secondary)
+                                    .frame(width: 18)
+                                Text(flag.title)
+                                    .font(.subheadline.weight(.medium))
+                                    .lineLimit(1)
+                                Spacer(minLength: 2)
                                 if savingFlag == flag {
-                                    Spacer()
-                                    ProgressView().controlSize(.small)
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .frame(width: 51)
+                                } else {
+                                    Toggle("", isOn: Binding(
+                                        get: { flag.value(in: current) },
+                                        set: { value in Task { await updateFlag(flag, value: value) } }
+                                    ))
+                                    .labelsHidden()
+                                    .controlSize(.mini)
+                                    .tint(HarvestTheme.blue)
+                                    .disabled(savingFlag != nil)
+                                    .accessibilityLabel(flag.title)
+                                    .accessibilityValue(flag.value(in: current) ? "已开启" : "已关闭")
                                 }
                             }
+                            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .background(
+                                flag.value(in: current) ? HarvestTheme.blue.opacity(0.08) : Color.secondary.opacity(0.06),
+                                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .stroke(flag.value(in: current) ? HarvestTheme.blue.opacity(0.18) : Color.secondary.opacity(0.10))
+                            }
                         }
-                        .disabled(savingFlag != nil)
                     }
+                    .padding(.vertical, 2)
                 }
                 Section("账号") {
                     detailValue("用户名", value: current.username, privateValue: true)
@@ -5056,21 +5085,6 @@ struct SiteBrowserScreen: View {
                     Button { Task { await copyAuthorizationDiagnostics() } } label: {
                         Label("复制授权诊断", systemImage: "checkmark.shield")
                     }
-                    Menu {
-                        if !site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            Button("站点配置") { session.setUserAgent(site.userAgent) }
-                        }
-                        Button("Safari macOS") { session.setUserAgent(browserSafariMacUserAgent) }
-                        Button("Safari iPhone") { session.setUserAgent(browserSafariPhoneUserAgent) }
-                        Button("系统默认") { session.setUserAgent(nil) }
-                        Divider()
-                        Button("Chrome Android") { session.setUserAgent(browserChromeAndroidUserAgent) }
-                        Button("Chrome Windows") { session.setUserAgent(browserChromeWindowsUserAgent) }
-                        Button("Edge Windows") { session.setUserAgent(browserEdgeWindowsUserAgent) }
-                        Button("Firefox Windows") { session.setUserAgent(browserFirefoxWindowsUserAgent) }
-                    } label: {
-                        Label("切换 User-Agent", systemImage: "globe")
-                    }
                     Divider()
                     if effectiveSiteID > 0 {
                         Button { Task { await syncCredentials() } } label: {
@@ -5129,6 +5143,22 @@ struct SiteBrowserScreen: View {
                     }
                     .accessibilityLabel("站点快捷入口")
                 }
+                Menu {
+                    if !site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button("站点配置") { session.setUserAgent(site.userAgent) }
+                    }
+                    Button("Safari macOS") { session.setUserAgent(browserSafariMacUserAgent) }
+                    Button("Safari iPhone") { session.setUserAgent(browserSafariPhoneUserAgent) }
+                    Button("系统默认") { session.setUserAgent(nil) }
+                    Divider()
+                    Button("Chrome Android") { session.setUserAgent(browserChromeAndroidUserAgent) }
+                    Button("Chrome Windows") { session.setUserAgent(browserChromeWindowsUserAgent) }
+                    Button("Edge Windows") { session.setUserAgent(browserEdgeWindowsUserAgent) }
+                    Button("Firefox Windows") { session.setUserAgent(browserFirefoxWindowsUserAgent) }
+                } label: {
+                    Image(systemName: "globe")
+                }
+                .accessibilityLabel("切换 User-Agent")
                 Spacer()
                 Button { session.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .accessibilityLabel("刷新网页")
