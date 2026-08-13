@@ -46,8 +46,9 @@ private enum DashboardChartDefaults {
 private enum DashboardListLayout {
     static let visibleRows = 10
     static let siteRowHeight: CGFloat = 52
-    static let distributionRowHeight: CGFloat = 46
-    static let incrementRowHeight: CGFloat = 52
+    static let distributionRowHeight: CGFloat = 40
+    static let incrementRowHeight: CGFloat = 42
+    static let accountRowHeight: CGFloat = 36
 }
 
 private func isDashboardRequestCancellation(_ error: Error) -> Bool {
@@ -353,7 +354,6 @@ private func dashboardAuthorizationText(_ value: Any?, privacy: Bool, key: Strin
     }
     if let dictionary = value as? [String: Any] {
         return dictionary.compactMap { nestedKey, nestedValue -> String? in
-            guard !["username", "user_name", "name", "email", "mail", "user_email"].contains(nestedKey.lowercased()) else { return nil }
             let text = dashboardAuthorizationText(nestedValue, privacy: privacy, key: nestedKey)
             return text.isEmpty ? nil : "\(dashboardAuthorizationLabel(nestedKey))：\(text)"
         }
@@ -363,7 +363,12 @@ private func dashboardAuthorizationText(_ value: Any?, privacy: Bool, key: Strin
     let text = String(describing: value)
     guard privacy else { return text }
     let normalizedKey = key.lowercased()
-    if normalizedKey.contains("token") || normalizedKey.contains("email") || text.contains("@") { return "••••" }
+    if normalizedKey.contains("email") || normalizedKey.contains("mail") || text.contains("@") {
+        return privacyMaskedText(text, enabled: true)
+    }
+    if normalizedKey.contains("username") || normalizedKey.contains("user_name") {
+        return privacyMaskedText(text, enabled: true)
+    }
     return text
 }
 
@@ -725,8 +730,7 @@ private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
     case quickActions
     case trend
     case siteStatus
-    case usernameDistribution
-    case emailDistribution
+    case accountDistribution
     case siteUploadDistribution
     case siteDownloadDistribution
     case todayIncrement
@@ -738,10 +742,10 @@ private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
     var id: String { rawValue }
 
     static let defaultOrder: [DashboardModule] = [
-        .hero, .overview, .userInfo, .quickActions, .siteStatus, .trend,
-        .serverResources, .designation, .todayIncrement, .siteUploadDistribution,
-        .siteDownloadDistribution, .seedDistribution, .usernameDistribution,
-        .emailDistribution, .monthlyUpload, .monthlyDownload, .monthlyPublish
+        .hero, .designation, .overview, .userInfo, .quickActions, .siteStatus, .trend,
+        .serverResources, .todayIncrement, .siteUploadDistribution,
+        .siteDownloadDistribution, .seedDistribution, .accountDistribution,
+        .monthlyUpload, .monthlyDownload, .monthlyPublish
     ]
 
     static var defaultOrderRaw: String { encode(defaultOrder) }
@@ -756,8 +760,7 @@ private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
         case .quickActions: "快捷操作"
         case .trend: "流量趋势"
         case .siteStatus: "站点状态"
-        case .usernameDistribution: "用户名分布"
-        case .emailDistribution: "邮箱分布"
+        case .accountDistribution: "账号分布"
         case .siteUploadDistribution: "站点上传分布"
         case .siteDownloadDistribution: "站点下载分布"
         case .todayIncrement: "增量排行"
@@ -778,8 +781,7 @@ private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
         case .quickActions: "bolt.circle"
         case .trend: "chart.xyaxis.line"
         case .siteStatus: "chart.pie"
-        case .usernameDistribution: "person.2"
-        case .emailDistribution: "envelope"
+        case .accountDistribution: "person.text.rectangle"
         case .siteUploadDistribution: "arrow.up.circle"
         case .siteDownloadDistribution: "arrow.down.circle"
         case .todayIncrement: "chart.bar.xaxis"
@@ -791,7 +793,13 @@ private enum DashboardModule: String, CaseIterable, Hashable, Identifiable {
     }
 
     static func decode(_ raw: String) -> [DashboardModule] {
-        var decoded = raw.split(separator: ",").compactMap { DashboardModule(rawValue: String($0)) }
+        var decoded = raw.split(separator: ",").compactMap { value -> DashboardModule? in
+            let rawValue = String(value)
+            if rawValue == "usernameDistribution" || rawValue == "emailDistribution" {
+                return .accountDistribution
+            }
+            return DashboardModule(rawValue: rawValue)
+        }
         var seen = Set<String>()
         decoded = decoded.filter { seen.insert($0.rawValue).inserted }
         if !seen.contains(DashboardModule.hero.rawValue) {
@@ -1026,6 +1034,7 @@ struct DashboardView: View {
     @AppStorage("dashboard.showMonthlyDownload") private var showMonthlyDownload = true
     @AppStorage("dashboard.showMonthlyPublish") private var showMonthlyPublish = true
     @AppStorage("dashboard.moduleOrder") private var moduleOrderRaw = DashboardModule.defaultOrderRaw
+    @AppStorage("dashboard.moduleOrder.designationAboveOverview.v1") private var didMigrateDesignationOrder = false
     @State private var showSettings = false
     @State private var showCacheClear = false
     @State private var showShare = false
@@ -1062,26 +1071,30 @@ struct DashboardView: View {
             .padding(16)
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .overlay(alignment: .topTrailing) {
-            Button { showSettings = true } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(HarvestTheme.blue)
-                    .frame(width: 44, height: 44)
-                    .contentShape(Circle())
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack {
+                Spacer()
+                Button { showSettings = true } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(HarvestTheme.blue)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .background(.regularMaterial, in: Circle())
+                .overlay {
+                    Circle()
+                        .stroke(Color.white.opacity(0.58), lineWidth: 0.8)
+                }
+                .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
+                .accessibilityLabel("仪表盘卡片设置")
             }
-            .buttonStyle(.plain)
-            .background(.regularMaterial, in: Circle())
-            .overlay {
-                Circle()
-                    .stroke(Color.white.opacity(0.58), lineWidth: 0.8)
-            }
-            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
-            .padding(.top, 10)
-            .padding(.trailing, 16)
-            .accessibilityLabel("仪表盘卡片设置")
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
         }
         .refreshable { await model.load(appState, days: trendDays) }
+        .onAppear { migrateDesignationOrderIfNeeded() }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
             model.startDownloaderSpeedMonitoring(appState)
             await model.load(appState, days: trendDays)
@@ -1335,13 +1348,14 @@ struct DashboardView: View {
                 }
                 .cardSurface()
             }
-        case .usernameDistribution:
-            if showUsernameDistribution && !model.snapshot.usernameDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.usernameDistribution, metric: .count, privacy: appState.privacyMode)
-            }
-        case .emailDistribution:
-            if showEmailDistribution && !model.snapshot.emailDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.emailDistribution, metric: .count, privacy: appState.privacyMode)
+        case .accountDistribution:
+            if (showUsernameDistribution || showEmailDistribution)
+                && (!model.snapshot.usernameDistribution.isEmpty || !model.snapshot.emailDistribution.isEmpty) {
+                DashboardAccountDistributionView(
+                    usernames: model.snapshot.usernameDistribution,
+                    emails: model.snapshot.emailDistribution,
+                    privacy: appState.privacyMode
+                )
             }
         case .siteUploadDistribution:
             if showSiteUploadDistribution && !model.snapshot.siteUploadDistribution.isEmpty {
@@ -1389,8 +1403,7 @@ struct DashboardView: View {
             case .quickActions: showQuickActions
             case .trend: showTrend
             case .siteStatus: showSiteStatus
-            case .usernameDistribution: showUsernameDistribution
-            case .emailDistribution: showEmailDistribution
+            case .accountDistribution: showUsernameDistribution || showEmailDistribution
             case .siteUploadDistribution: showSiteUploadDistribution
             case .siteDownloadDistribution: showSiteDownloadDistribution
             case .todayIncrement: showTodayIncrement
@@ -1412,8 +1425,13 @@ struct DashboardView: View {
             .quickActions: $showQuickActions,
             .trend: $showTrend,
             .siteStatus: $showSiteStatus,
-            .usernameDistribution: $showUsernameDistribution,
-            .emailDistribution: $showEmailDistribution,
+            .accountDistribution: Binding(
+                get: { showUsernameDistribution || showEmailDistribution },
+                set: { value in
+                    showUsernameDistribution = value
+                    showEmailDistribution = value
+                }
+            ),
             .siteUploadDistribution: $showSiteUploadDistribution,
             .siteDownloadDistribution: $showSiteDownloadDistribution,
             .todayIncrement: $showTodayIncrement,
@@ -1427,13 +1445,11 @@ struct DashboardView: View {
     private var greeting: String {
         let hour = Calendar.current.component(.hour, from: Date())
         let text = hour < 6 ? "夜深了" : hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好"
-        return "\(text)，\(appState.profile?.username ?? "用户")"
+        let username = privacyMaskedText(appState.profile?.username ?? "用户", enabled: appState.privacyMode)
+        return "\(text)，\(username)"
     }
 
-    private func hidden(_ value: String) -> String { appState.privacyMode ? "••••" : value }
-
     private var serverHostLabel: String {
-        guard !appState.privacyMode else { return "••••" }
         return URL(string: appState.baseURL)?.host ?? appState.baseURL
     }
 
@@ -1456,7 +1472,18 @@ struct DashboardView: View {
 
     private var accountAgeDetail: String {
         let mode = showAccountAgeWeeks ? "按周显示" : "按年显示"
-        return model.snapshot.earliestSite.isEmpty ? mode : "\(mode) · \(model.snapshot.earliestSite)"
+        let siteName = privacyMaskedText(model.snapshot.earliestSite, enabled: appState.privacyMode)
+        return siteName.isEmpty ? mode : "\(mode) · \(siteName)"
+    }
+
+    private func migrateDesignationOrderIfNeeded() {
+        guard !didMigrateDesignationOrder else { return }
+        var modules = DashboardModule.decode(moduleOrderRaw)
+        modules.removeAll { $0 == .designation }
+        let overviewIndex = modules.firstIndex(of: .overview) ?? modules.startIndex
+        modules.insert(.designation, at: overviewIndex)
+        moduleOrderRaw = DashboardModule.encode(modules)
+        didMigrateDesignationOrder = true
     }
 
     @MainActor private func runGlobal(_ path: String) async {
@@ -1548,14 +1575,14 @@ private struct DashboardHeroView: View {
                 Divider().frame(height: 46)
                 heroMetric(
                     label: "下载速度",
-                    value: privacy ? "••••" : formatSpeed(snapshot.downloadSpeed),
+                    value: formatSpeed(snapshot.downloadSpeed),
                     detail: "实时",
                     color: HarvestTheme.blue
                 )
                 Divider().frame(height: 46)
                 heroMetric(
                     label: "上传速度",
-                    value: privacy ? "••••" : formatSpeed(snapshot.uploadSpeed),
+                    value: formatSpeed(snapshot.uploadSpeed),
                     detail: "实时",
                     color: HarvestTheme.green
                 )
@@ -1608,14 +1635,14 @@ private struct DashboardOverviewView: View {
             HStack(spacing: 0) {
                 overviewPrimaryMetric(
                     label: "总上传",
-                    value: privateValue(dashboardCompactBytes(snapshot.uploaded)),
+                    value: dashboardCompactBytes(snapshot.uploaded),
                     icon: "arrow.up",
                     color: HarvestTheme.green
                 )
                 Divider().frame(height: 46)
                 overviewPrimaryMetric(
                     label: "总下载",
-                    value: privateValue(dashboardCompactBytes(snapshot.downloaded)),
+                    value: dashboardCompactBytes(snapshot.downloaded),
                     icon: "arrow.down",
                     color: HarvestTheme.blue
                 )
@@ -1638,19 +1665,19 @@ private struct DashboardOverviewView: View {
                 )
                 DashboardStatLine(
                     label: "今日上传",
-                    value: privateValue(dashboardCompactBytes(snapshot.todayUploaded)),
+                    value: dashboardCompactBytes(snapshot.todayUploaded),
                     icon: "arrow.up.right",
                     color: HarvestTheme.green
                 )
                 DashboardStatLine(
                     label: "今日下载",
-                    value: privateValue(dashboardCompactBytes(snapshot.todayDownloaded)),
+                    value: dashboardCompactBytes(snapshot.todayDownloaded),
                     icon: "arrow.down.right",
                     color: HarvestTheme.blue
                 )
                 DashboardStatLine(
                     label: "做种体积",
-                    value: privateValue(dashboardCompactBytes(snapshot.seedVolume)),
+                    value: dashboardCompactBytes(snapshot.seedVolume),
                     icon: "externaldrive.fill.badge.checkmark",
                     color: HarvestTheme.amber
                 )
@@ -1702,7 +1729,6 @@ private struct DashboardOverviewView: View {
         .padding(.horizontal, 8)
     }
 
-    private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
 }
 
 private struct DashboardStatLine: View {
@@ -1742,7 +1768,7 @@ private struct DashboardUserInfoView: View {
 
     private var username: String {
         guard let profile else { return "未登录" }
-        return privacy ? "••••" : profile.username
+        return privacyMaskedText(profile.username, enabled: privacy)
     }
 
     private var role: String {
@@ -1970,6 +1996,8 @@ private struct DashboardSiteStatusView: View {
         DashboardScrollableModule(
             title: "站点状态",
             subtitle: "按累计上传排序",
+            icon: "globe.asia.australia.fill",
+            color: HarvestTheme.blue,
             itemCount: items.count,
             rowHeight: DashboardListLayout.siteRowHeight
         ) {
@@ -1977,7 +2005,7 @@ private struct DashboardSiteStatusView: View {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 10) {
-                            Text(privacy ? "••••" : item.name)
+                            Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.subheadline.weight(.semibold))
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -2025,22 +2053,24 @@ private struct DashboardIncrementRankingView: View {
     var body: some View {
         DashboardScrollableModule(
             title: rangeLabel,
-            subtitle: "按上传与下载总量排序",
+            subtitle: "上传与下载增量",
+            icon: "chart.bar.xaxis",
+            color: HarvestTheme.green,
             itemCount: items.count,
             rowHeight: DashboardListLayout.incrementRowHeight
         ) {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(privacy ? "••••" : item.name)
-                            .font(.subheadline.weight(.semibold))
+                    HStack(spacing: 8) {
+                        dashboardRank(index + 1, color: HarvestTheme.green)
+                        Text(privacyMaskedText(item.name, enabled: privacy))
+                            .font(.caption.weight(.semibold))
                             .lineLimit(1)
-                        HStack(spacing: 12) {
-                            incrementMetric(item.uploaded, icon: "arrow.up", color: HarvestTheme.green, alignment: .leading)
-                            incrementMetric(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue, alignment: .trailing)
-                        }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        incrementMetric(item.uploaded, icon: "arrow.up", color: HarvestTheme.green)
+                        incrementMetric(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue)
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.incrementRowHeight)
                     .overlay(alignment: .bottom) {
                         if index < items.count - 1 { Divider().padding(.leading, 10) }
@@ -2050,13 +2080,13 @@ private struct DashboardIncrementRankingView: View {
         }
     }
 
-    private func incrementMetric(_ value: Double, icon: String, color: Color, alignment: Alignment) -> some View {
+    private func incrementMetric(_ value: Double, icon: String, color: Color) -> some View {
         Label(dashboardCompactBytes(value), systemImage: icon)
-            .font(.caption.monospacedDigit())
+            .font(.caption2.weight(.medium).monospacedDigit())
             .foregroundStyle(color)
             .lineLimit(1)
-            .minimumScaleFactor(0.72)
-            .frame(maxWidth: .infinity, alignment: alignment)
+            .minimumScaleFactor(0.66)
+            .frame(width: 82, alignment: .trailing)
     }
 }
 
@@ -2097,12 +2127,24 @@ private enum DashboardMonthlyMetric: Equatable {
     }
 }
 
+private func dashboardMonthLabel(_ value: String) -> String {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count >= 7 else { return trimmed }
+    let yearEnd = trimmed.index(trimmed.startIndex, offsetBy: 4)
+    let monthStart = trimmed.index(trimmed.startIndex, offsetBy: 5)
+    let monthEnd = trimmed.index(monthStart, offsetBy: 2)
+    let year = String(trimmed[..<yearEnd])
+    let monthText = String(trimmed[monthStart..<monthEnd])
+    guard let month = Int(monthText) else { return String(trimmed.prefix(7)) }
+    return month == 1 ? "\(year.suffix(2))-01" : "\(month)月"
+}
+
 private struct DashboardMonthlyMetricView: View {
     let metric: DashboardMonthlyMetric
     let points: [DashboardMonthlyPoint]
     let chartHeight: Double
 
-    private var visiblePoints: [DashboardMonthlyPoint] { Array(points.suffix(12)) }
+    private var visiblePoints: [DashboardMonthlyPoint] { Array(points.suffix(3)) }
     private var total: Double { visiblePoints.reduce(0) { $0 + metric.value($1) } }
 
     var body: some View {
@@ -2110,17 +2152,29 @@ private struct DashboardMonthlyMetricView: View {
             HStack(alignment: .lastTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(metric.title).font(.title3.weight(.bold))
-                    Text("最近 \(visiblePoints.count) 个周期").font(.caption).foregroundStyle(.secondary)
+                    Text("近 3 个月对比").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(metric.format(total)).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(metric.format(total)).font(.subheadline.weight(.semibold))
+                    Text("三月合计").font(.caption2).foregroundStyle(.secondary)
+                }
             }
             Chart(visiblePoints) { point in
                 BarMark(
                     x: .value("周期", dashboardMonthLabel(point.key)),
-                    y: .value(metric.title, metric.value(point))
+                    y: .value(metric.title, metric.value(point)),
+                    width: .fixed(38)
                 )
                 .foregroundStyle(metric.color)
+                .cornerRadius(7)
+                .annotation(position: .top, spacing: 6) {
+                    Text(metric.format(metric.value(point)))
+                        .font(.caption2.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(metric.color)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.68)
+                }
             }
             .chartYAxis {
                 AxisMarks(position: .leading) { value in
@@ -2132,22 +2186,14 @@ private struct DashboardMonthlyMetricView: View {
                     }
                 }
             }
-            .chartXAxis { AxisMarks(values: .automatic(desiredCount: min(6, max(visiblePoints.count, 1)))) }
+            .chartXAxis {
+                AxisMarks(values: visiblePoints.map { dashboardMonthLabel($0.key) }) { _ in
+                    AxisValueLabel().font(.caption.weight(.medium))
+                }
+            }
             .frame(height: CGFloat(chartHeight))
         }
         .cardSurface()
-    }
-
-    private func dashboardMonthLabel(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= 7 else { return trimmed }
-        let yearEnd = trimmed.index(trimmed.startIndex, offsetBy: 4)
-        let monthStart = trimmed.index(trimmed.startIndex, offsetBy: 5)
-        let monthEnd = trimmed.index(monthStart, offsetBy: 2)
-        let year = String(trimmed[..<yearEnd])
-        let monthText = String(trimmed[monthStart..<monthEnd])
-        guard let month = Int(monthText) else { return String(trimmed.prefix(7)) }
-        return month == 1 ? "\(year.suffix(2))-01" : "\(month)月"
     }
 }
 
@@ -2196,16 +2242,19 @@ private struct DistributionView: View {
     var body: some View {
         DashboardScrollableModule(
             title: title,
-            subtitle: "按数值从高到低排序",
+            subtitle: "站点容量排行",
+            icon: metric.icon ?? "chart.bar.fill",
+            color: metric.color,
             itemCount: items.count,
             rowHeight: DashboardListLayout.distributionRowHeight
         ) {
             let maximum = max(items.map(\.value).max() ?? 1, 1)
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 10) {
-                            Text(privacy ? "••••" : item.name)
+                            dashboardRank(index + 1, color: metric.color)
+                            Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.caption.weight(.semibold))
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -2217,13 +2266,14 @@ private struct DistributionView: View {
                             .foregroundStyle(metric.color)
                             .lineLimit(1)
                             .minimumScaleFactor(0.68)
-                            .frame(width: 104, alignment: .trailing)
+                            .frame(width: 94, alignment: .trailing)
                         }
                         ProgressView(value: item.value, total: maximum)
                             .tint(metric.color)
-                            .scaleEffect(x: 1, y: 0.72, anchor: .center)
+                            .scaleEffect(x: 1, y: 0.58, anchor: .center)
+                            .padding(.leading, 30)
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.distributionRowHeight)
                     .overlay(alignment: .bottom) {
                         if index < items.count - 1 { Divider().padding(.leading, 10) }
@@ -2234,37 +2284,136 @@ private struct DistributionView: View {
     }
 }
 
+private struct DashboardAccountDistributionView: View {
+    let usernames: [DashboardDistributionItem]
+    let emails: [DashboardDistributionItem]
+    let privacy: Bool
+
+    private var rowCount: Int { max(usernames.count, emails.count) }
+
+    var body: some View {
+        DashboardScrollableModule(
+            title: "账号分布",
+            subtitle: "用户名与邮箱并列对照",
+            icon: "person.text.rectangle",
+            color: HarvestTheme.coral,
+            itemCount: rowCount,
+            rowHeight: DashboardListLayout.accountRowHeight,
+            contentHeightAdjustment: 30
+        ) {
+            LazyVStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    accountHeader("用户名", icon: "person.fill")
+                    accountHeader("邮箱", icon: "envelope.fill")
+                }
+                .padding(.horizontal, 8)
+                .frame(height: 30)
+
+                ForEach(0..<rowCount, id: \.self) { index in
+                    HStack(spacing: 12) {
+                        accountEntry(item(in: usernames, at: index), index: index)
+                        Divider().frame(height: 20)
+                        accountEntry(item(in: emails, at: index), index: index)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: DashboardListLayout.accountRowHeight)
+                    .overlay(alignment: .bottom) {
+                        if index < rowCount - 1 { Divider().padding(.leading, 8) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func accountHeader(_ title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func item(in items: [DashboardDistributionItem], at index: Int) -> DashboardDistributionItem? {
+        items.indices.contains(index) ? items[index] : nil
+    }
+
+    @ViewBuilder
+    private func accountEntry(_ item: DashboardDistributionItem?, index: Int) -> some View {
+        if let item {
+            HStack(spacing: 5) {
+                Text("\(index + 1)")
+                    .font(.caption2.weight(.bold).monospacedDigit())
+                    .foregroundStyle(HarvestTheme.coral)
+                    .frame(width: 16)
+                Text(privacyMaskedText(item.name, enabled: privacy))
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                Spacer(minLength: 2)
+                Text(formatCompactNumber(item.value))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+        } else {
+            Color.clear.frame(maxWidth: .infinity)
+        }
+    }
+}
+
+private func dashboardRank(_ rank: Int, color: Color) -> some View {
+    Text("\(rank)")
+        .font(.caption2.weight(.bold).monospacedDigit())
+        .foregroundStyle(rank <= 3 ? color : Color.secondary)
+        .frame(width: 22, height: 22)
+        .background(rank <= 3 ? color.opacity(0.12) : Color.primary.opacity(0.045), in: Circle())
+}
+
 private struct DashboardScrollableModule<Content: View>: View {
     let title: String
     let subtitle: String
+    let icon: String
+    let color: Color
     let itemCount: Int
     let rowHeight: CGFloat
+    let contentHeightAdjustment: CGFloat
     let content: Content
 
     init(
         title: String,
         subtitle: String,
+        icon: String,
+        color: Color,
         itemCount: Int,
         rowHeight: CGFloat,
+        contentHeightAdjustment: CGFloat = 0,
         @ViewBuilder content: () -> Content
     ) {
         self.title = title
         self.subtitle = subtitle
+        self.icon = icon
+        self.color = color
         self.itemCount = itemCount
         self.rowHeight = rowHeight
+        self.contentHeightAdjustment = contentHeightAdjustment
         self.content = content()
     }
 
     private var visibleRowCount: Int { min(max(itemCount, 1), DashboardListLayout.visibleRows) }
-    private var viewportHeight: CGFloat { CGFloat(visibleRowCount) * rowHeight }
+    private var viewportHeight: CGFloat {
+        CGFloat(visibleRowCount) * rowHeight + contentHeightAdjustment
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.title3.weight(.bold))
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(color)
+                    .frame(width: 30, height: 30)
+                    .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.headline)
                     Text(subtitle)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.78)
@@ -2272,10 +2421,7 @@ private struct DashboardScrollableModule<Content: View>: View {
                 Spacer(minLength: 4)
                 Text("\(itemCount) 项")
                     .font(.caption2.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.primary.opacity(0.06), in: Capsule())
+                    .foregroundStyle(color)
             }
 
             ScrollView(.vertical) {
@@ -2285,14 +2431,17 @@ private struct DashboardScrollableModule<Content: View>: View {
             .scrollDisabled(itemCount <= DashboardListLayout.visibleRows)
             .scrollIndicators(itemCount > DashboardListLayout.visibleRows ? .visible : .hidden)
             .scrollBounceBehavior(.basedOnSize)
-            .background(Color(uiColor: .tertiarySystemGroupedBackground).opacity(0.66))
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06))
-            }
+            .overlay(alignment: .top) { Divider() }
         }
-        .cardSurface()
+        .padding(12)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                .stroke(Color.primary.opacity(0.06))
+        }
     }
 }
 
@@ -2613,7 +2762,7 @@ private struct DashboardShareContent: View {
 
     private var username: String {
         guard let profile else { return "未登录" }
-        return privacy ? "••••" : profile.username
+        return privacyMaskedText(profile.username, enabled: privacy)
     }
 
     private var role: String {
@@ -2651,12 +2800,12 @@ private struct DashboardShareContent: View {
                 shareMetric("称号进度", designation, HarvestTheme.coral, detail: "\(snapshot.siteCount) 个站点接入")
             }
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
-                shareMetric("总上传", privacy ? "••••" : dashboardCompactBytes(snapshot.uploaded), HarvestTheme.green)
-                shareMetric("总下载", privacy ? "••••" : dashboardCompactBytes(snapshot.downloaded), HarvestTheme.blue)
-                shareMetric("做种体积", privacy ? "••••" : dashboardCompactBytes(snapshot.seedVolume), HarvestTheme.amber)
+                shareMetric("总上传", dashboardCompactBytes(snapshot.uploaded), HarvestTheme.green)
+                shareMetric("总下载", dashboardCompactBytes(snapshot.downloaded), HarvestTheme.blue)
+                shareMetric("做种体积", dashboardCompactBytes(snapshot.seedVolume), HarvestTheme.amber)
                 shareMetric("站点", "\(snapshot.siteCount)", HarvestTheme.coral)
-                shareMetric("今日上传", privacy ? "••••" : dashboardCompactBytes(snapshot.todayUploaded), HarvestTheme.green)
-                shareMetric("今日下载", privacy ? "••••" : dashboardCompactBytes(snapshot.todayDownloaded), HarvestTheme.blue)
+                shareMetric("今日上传", dashboardCompactBytes(snapshot.todayUploaded), HarvestTheme.green)
+                shareMetric("今日下载", dashboardCompactBytes(snapshot.todayDownloaded), HarvestTheme.blue)
                 shareMetric("做种数", "\(snapshot.seeding)", HarvestTheme.amber)
                 shareMetric("发种 / 下载中", "\(snapshot.published) / \(snapshot.leeching)", HarvestTheme.coral)
             }
@@ -2692,7 +2841,7 @@ private struct DashboardShareContent: View {
                     ForEach(visibleStatuses.indices, id: \.self) { index in
                         let item = visibleStatuses[index]
                         HStack(spacing: 16) {
-                            Text(privacy ? "••••" : item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Text(privacyMaskedText(item.name, enabled: privacy)).font(.subheadline.weight(.semibold)).lineLimit(1)
                             Spacer()
                             Label(dashboardCompactBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
                             Label(dashboardCompactBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
@@ -2712,7 +2861,7 @@ private struct DashboardShareContent: View {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 12) {
                     ForEach(increments.prefix(shareItemLimit)) { item in
                         VStack(alignment: .leading, spacing: 7) {
-                            Text(privacy ? "••••" : item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Text(privacyMaskedText(item.name, enabled: privacy)).font(.subheadline.weight(.semibold)).lineLimit(1)
                             HStack { Label(dashboardCompactBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green); Spacer(); Label(dashboardCompactBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue) }
                                 .font(.caption.monospacedDigit())
                         }
@@ -2724,9 +2873,7 @@ private struct DashboardShareContent: View {
             let distributions: [(String, [DashboardDistributionItem], DashboardDistributionMetric)] = [
                 ("站点上传分布", snapshot.siteUploadDistribution, .bytes(.upload)),
                 ("站点下载分布", snapshot.siteDownloadDistribution, .bytes(.download)),
-                ("做种分布", snapshot.seedDistribution, .bytes(.seed)),
-                ("用户名分布", snapshot.usernameDistribution, .count),
-                ("邮箱分布", snapshot.emailDistribution, .count)
+                ("做种分布", snapshot.seedDistribution, .bytes(.seed))
             ]
             if distributions.contains(where: { !$0.1.isEmpty }) {
                 shareSectionTitle("数据分布", subtitle: "各项前 \(shareItemLimit) 名")
@@ -2738,8 +2885,11 @@ private struct DashboardShareContent: View {
                     }
                 }
             }
+            if !snapshot.usernameDistribution.isEmpty || !snapshot.emailDistribution.isEmpty {
+                shareAccountDistribution()
+            }
             if !snapshot.monthlyHistory.isEmpty {
-                shareSectionTitle("月度统计", subtitle: "最近 \(min(snapshot.monthlyHistory.count, 12)) 个周期")
+                shareSectionTitle("月度统计", subtitle: "近 3 个月对比")
                 VStack(spacing: 14) {
                     shareMonthlyMetric(.upload)
                     shareMonthlyMetric(.download)
@@ -2784,7 +2934,7 @@ private struct DashboardShareContent: View {
             let maximum = max(items.map(\.value).max() ?? 1, 1)
             ForEach(items.prefix(shareItemLimit)) { item in
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack { Text(privacy ? "••••" : item.name).lineLimit(1); Spacer(); Text(metric.format(item.value)).monospacedDigit() }
+                    HStack { Text(privacyMaskedText(item.name, enabled: privacy)).lineLimit(1); Spacer(); Text(metric.format(item.value)).monospacedDigit() }
                         .font(.caption)
                     ProgressView(value: item.value, total: maximum).tint(metric.color)
                 }
@@ -2795,19 +2945,82 @@ private struct DashboardShareContent: View {
         .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
     }
 
+    private func shareAccountDistribution() -> some View {
+        let usernames = Array(snapshot.usernameDistribution.prefix(shareItemLimit))
+        let emails = Array(snapshot.emailDistribution.prefix(shareItemLimit))
+        let count = max(usernames.count, emails.count)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("账号分布", systemImage: "person.text.rectangle").font(.headline)
+                Spacer()
+                Text("用户名 / 邮箱").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack(spacing: 16) {
+                shareAccountColumn("用户名", items: usernames, count: count)
+                Divider()
+                shareAccountColumn("邮箱", items: emails, count: count)
+            }
+        }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+    }
+
+    private func shareAccountColumn(
+        _ title: String,
+        items: [DashboardDistributionItem],
+        count: Int
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            ForEach(0..<count, id: \.self) { index in
+                HStack(spacing: 6) {
+                    Text("\(index + 1)")
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                        .foregroundStyle(HarvestTheme.coral)
+                        .frame(width: 16)
+                    if items.indices.contains(index) {
+                        let item = items[index]
+                        Text(privacyMaskedText(item.name, enabled: privacy))
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 2)
+                        Text(formatCompactNumber(item.value))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Spacer()
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
     private func shareMonthlyMetric(_ metric: DashboardMonthlyMetric) -> some View {
-        let points = Array(snapshot.monthlyHistory.suffix(12))
+        let points = Array(snapshot.monthlyHistory.suffix(3))
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(metric.title).font(.headline)
                 Spacer()
-                Text(metric.format(points.reduce(0) { $0 + metric.value($1) }))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(metric.format(points.reduce(0) { $0 + metric.value($1) }))
+                        .font(.caption.weight(.semibold))
+                    Text("三月合计").font(.caption2).foregroundStyle(.secondary)
+                }
             }
             Chart(points) { point in
-                BarMark(x: .value("周期", point.key), y: .value(metric.title, metric.value(point)))
+                BarMark(
+                    x: .value("周期", dashboardMonthLabel(point.key)),
+                    y: .value(metric.title, metric.value(point)),
+                    width: .fixed(48)
+                )
                     .foregroundStyle(metric.color)
+                    .cornerRadius(8)
+                    .annotation(position: .top, spacing: 6) {
+                        Text(metric.format(metric.value(point)))
+                            .font(.caption2.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(metric.color)
+                    }
             }
             .chartYAxis {
                 AxisMarks(position: .leading) { value in
@@ -2817,6 +3030,11 @@ private struct DashboardShareContent: View {
                             Text(metric == .publish ? formatCompactNumber(number) : dashboardCompactBytes(number)).font(.caption2)
                         }
                     }
+                }
+            }
+            .chartXAxis {
+                AxisMarks(values: points.map { dashboardMonthLabel($0.key) }) { _ in
+                    AxisValueLabel().font(.caption.weight(.medium))
                 }
             }
             .frame(height: 180)

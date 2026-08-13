@@ -2150,6 +2150,23 @@ func prettyJSON(_ value: Any) -> String {
     return text
 }
 
+func privacyMaskedText(_ value: String, enabled: Bool) -> String {
+    guard enabled, !value.isEmpty else { return value }
+    let characters = Array(value)
+    guard characters.count > 1 else { return "•" }
+
+    let hiddenCount = min(
+        characters.count - 1,
+        max(1, Int((Double(characters.count) * 0.7).rounded()))
+    )
+    let visibleCount = characters.count - hiddenCount
+    let prefixCount = (visibleCount + 1) / 2
+    let suffixCount = visibleCount / 2
+    return String(characters.prefix(prefixCount))
+        + String(repeating: "•", count: hiddenCount)
+        + String(characters.suffix(suffixCount))
+}
+
 func markdownAttributedString(_ value: String, inlineOnly: Bool = false) -> AttributedString {
     if inlineOnly {
         return (try? AttributedString(

@@ -1652,6 +1652,7 @@ struct DownloaderRefreshSettingsSheet: View {
 }
 
 struct TorrentFilterSheet: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: DownloadsViewModel
     var lockedDownloaderID: Int?
@@ -1682,7 +1683,9 @@ struct TorrentFilterSheet: View {
                     if !model.availableSites.isEmpty {
                         Picker("站点", selection: $model.siteFilter) {
                             Text("全部站点").tag("")
-                            ForEach(model.availableSites, id: \.self) { Text($0).tag($0) }
+                            ForEach(model.availableSites, id: \.self) { site in
+                                Text(privacyMaskedText(site, enabled: appState.privacyMode)).tag(site)
+                            }
                         }
                     }
                 }
@@ -2430,7 +2433,9 @@ struct TorrentRow: View {
     private var metadataLine: String {
         var values = [item.status]
         let site = model.siteLabel(for: item)
-        if !site.isEmpty { values.append(site) }
+        if !site.isEmpty {
+            values.append(privacyMaskedText(site, enabled: appState.privacyMode))
+        }
         if !item.category.isEmpty { values.append(item.category) }
         if !item.tags.isEmpty { values.append(item.tags.prefix(2).joined(separator: ", ")) }
         return values.joined(separator: " · ")
@@ -2680,7 +2685,12 @@ struct TorrentDetailSheet: View {
                     LabeledContent("上传速度", value: formatSpeed(item.uploadSpeed))
                 }
                 Section("存储与分类") {
-                    if !item.siteHint.isEmpty { LabeledContent("站点", value: item.siteHint) }
+                    if !item.siteHint.isEmpty {
+                        LabeledContent(
+                            "站点",
+                            value: privacyMaskedText(item.siteHint, enabled: appState.privacyMode)
+                        )
+                    }
                     LabeledContent("分类", value: item.category.isEmpty ? "未分类" : item.category)
                     LabeledContent("标签", value: item.tags.isEmpty ? "无" : item.tags.joined(separator: "、"))
                     if !savePath.isEmpty { LabeledContent("保存路径", value: savePath) }
@@ -3006,7 +3016,7 @@ struct AddTorrentSheet: View {
                         if !sites.isEmpty {
                             Menu("从站点选择") {
                                 ForEach(sites) { site in
-                                    Button(site.name) {
+                                    Button(privacyMaskedText(site.name, enabled: appState.privacyMode)) {
                                         siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
                                         if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                             cookie = site.cookie

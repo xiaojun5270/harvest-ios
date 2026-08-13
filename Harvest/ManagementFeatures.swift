@@ -276,7 +276,15 @@ struct SettingsView: View {
                 Section {
                     HStack(spacing: 13) {
                         BrandMark(size: 48)
-                        VStack(alignment: .leading, spacing: 3) { Text(appState.profile?.username ?? "Harvest 用户").font(.headline); Text(appState.profile?.email.isEmpty == false ? appState.profile!.email : appState.baseURL).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(privacyMaskedText(appState.profile?.username ?? "Harvest 用户", enabled: appState.privacyMode)).font(.headline)
+                            Text(appState.profile?.email.isEmpty == false
+                                ? privacyMaskedText(appState.profile!.email, enabled: appState.privacyMode)
+                                : appState.baseURL)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     }.padding(.vertical, 5)
                 }
 
@@ -298,7 +306,9 @@ struct SettingsView: View {
                     Picker("界面字号", selection: Binding(get: { appState.interfaceScale }, set: appState.setInterfaceScale)) {
                         ForEach(AppInterfaceScale.allCases) { Text($0.rawValue).tag($0) }
                     }
-                    Toggle(isOn: Binding(get: { appState.privacyMode }, set: appState.setPrivacyMode)) { Label("隐藏敏感数据", systemImage: "eye.slash") }
+                    Toggle(isOn: Binding(get: { appState.privacyMode }, set: appState.setPrivacyMode)) {
+                        Label("隐藏站点名称、用户名和邮箱", systemImage: "eye.slash")
+                    }
                     Button { appState.resetAppearanceSettings() } label: {
                         Label("恢复默认外观", systemImage: "arrow.counterclockwise")
                     }
@@ -2932,7 +2942,7 @@ struct UserManagementView: View {
         .sheet(item: $editingUser) { user in UserEditorSheet(endpoint: APIPath.users, user: user) { await model.load(appState) }.environmentObject(appState) }
         .sheet(item: $resettingUser) { user in UserEditorSheet(endpoint: APIPath.users, user: user, resetPassword: true) { await model.load(appState) }.environmentObject(appState) }
         .confirmationDialog(
-            "确定删除用户「\(deletingUser?.username ?? "")」？",
+            "确定删除用户「\(privacyMaskedText(deletingUser?.username ?? "", enabled: appState.privacyMode))」？",
             isPresented: Binding(
                 get: { deletingUser != nil },
                 set: { if !$0 { deletingUser = nil } }
@@ -3174,7 +3184,7 @@ struct AdminView: View {
         .sheet(item: $resettingInvitesUser) { user in AdminInviteResetSheet(user: user) { count in await model.update(appState, user: user, values: ["email": user.email, "invite": count]) } }
         .sheet(isPresented: $showResetInvites) { ResetInvitesSheet { count in await model.resetInvites(appState, count: count) } }
         .confirmationDialog(
-            "确定删除授权用户「\(deletingUser?.email ?? "")」？",
+            "确定删除授权用户「\(privacyMaskedText(deletingUser?.email ?? "", enabled: appState.privacyMode))」？",
             isPresented: Binding(
                 get: { deletingUser != nil },
                 set: { if !$0 { deletingUser = nil } }
@@ -3192,14 +3202,17 @@ struct AdminView: View {
 }
 
 struct AdminUserRow: View {
+    @EnvironmentObject private var appState: AppState
     let user: AdminUserItem
     var body: some View {
         HStack(spacing: 12) {
             Circle().fill(user.isExpired ? HarvestTheme.coral.opacity(0.14) : user.tryUser ? HarvestTheme.amber.opacity(0.14) : HarvestTheme.green.opacity(0.14)).frame(width: 42, height: 42)
                 .overlay(Image(systemName: user.isExpired ? "calendar.badge.exclamationmark" : user.tryUser ? "hourglass" : "key.fill").foregroundStyle(user.isExpired ? HarvestTheme.coral : user.tryUser ? HarvestTheme.amber : HarvestTheme.green))
             VStack(alignment: .leading, spacing: 4) {
-                Text(user.username.isEmpty ? user.email : user.username).font(.headline)
-                if !user.username.isEmpty { Text(user.email).font(.caption).foregroundStyle(.secondary) }
+                Text(privacyMaskedText(user.username.isEmpty ? user.email : user.username, enabled: appState.privacyMode)).font(.headline)
+                if !user.username.isEmpty {
+                    Text(privacyMaskedText(user.email, enabled: appState.privacyMode)).font(.caption).foregroundStyle(.secondary)
+                }
                 Text(user.expiresAt.isEmpty ? "有效期 \(user.expire) 天" : "\(user.authorizationText) · \(user.expiresAt)").font(.caption2).foregroundStyle(user.isExpired ? HarvestTheme.coral : .secondary)
             }
             Spacer()
@@ -3292,6 +3305,7 @@ struct ResetInvitesSheet: View {
 }
 
 struct AdminInviteResetSheet: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let user: AdminUserItem
     let reset: (Int) async -> Bool
@@ -3300,7 +3314,9 @@ struct AdminInviteResetSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("授权用户") { LabeledContent("邮箱", value: user.email) }
+                Section("授权用户") {
+                    LabeledContent("邮箱", value: privacyMaskedText(user.email, enabled: appState.privacyMode))
+                }
                 Section("邀请数量") {
                     Picker("数量", selection: $count) {
                         Text("3 次").tag("3")
@@ -3322,9 +3338,33 @@ struct AdminInviteResetSheet: View {
 }
 
 struct UserRow: View {
+    @EnvironmentObject private var appState: AppState
     let user: ManagedUser
     var isCurrent = false
-    var body: some View { HStack(spacing: 12) { Circle().fill(user.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12)).frame(width: 42, height: 42).overlay(Text(user.username.isEmpty ? "?" : String(user.username.prefix(1)).uppercased()).font(.headline).foregroundStyle(user.active ? HarvestTheme.green : .secondary)); VStack(alignment: .leading, spacing: 4) { HStack { Text(user.username.isEmpty ? "未命名用户" : user.username).font(.headline); if user.staff { Image(systemName: "person.badge.shield.checkmark").foregroundStyle(HarvestTheme.blue).font(.caption) }; if user.admin { Image(systemName: "checkmark.shield.fill").foregroundStyle(HarvestTheme.coral).font(.caption) }; if isCurrent { Text("当前").font(.caption2).foregroundStyle(HarvestTheme.green) } }; Text(user.email.isEmpty ? "ID \(user.id)" : "\(user.email) · ID \(user.id)").font(.caption).foregroundStyle(.secondary) }; Spacer(); StatusPill(label: user.active ? "启用" : "停用", color: user.active ? HarvestTheme.green : .secondary) }.padding(.vertical, 4) }
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(user.active ? HarvestTheme.green.opacity(0.14) : Color.secondary.opacity(0.12))
+                .frame(width: 42, height: 42)
+                .overlay(Text(user.username.isEmpty ? "?" : String(user.username.prefix(1)).uppercased()).font(.headline).foregroundStyle(user.active ? HarvestTheme.green : .secondary))
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(privacyMaskedText(user.username.isEmpty ? "未命名用户" : user.username, enabled: appState.privacyMode)).font(.headline)
+                    if user.staff { Image(systemName: "person.badge.shield.checkmark").foregroundStyle(HarvestTheme.blue).font(.caption) }
+                    if user.admin { Image(systemName: "checkmark.shield.fill").foregroundStyle(HarvestTheme.coral).font(.caption) }
+                    if isCurrent { Text("当前").font(.caption2).foregroundStyle(HarvestTheme.green) }
+                }
+                Text(user.email.isEmpty
+                    ? "ID \(user.id)"
+                    : "\(privacyMaskedText(user.email, enabled: appState.privacyMode)) · ID \(user.id)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            StatusPill(label: user.active ? "启用" : "停用", color: user.active ? HarvestTheme.green : .secondary)
+        }
+        .padding(.vertical, 4)
+    }
 }
 
 struct UserEditorSheet: View {

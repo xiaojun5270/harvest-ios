@@ -1515,9 +1515,14 @@ struct SearchView: View {
     @State private var activeSearchTask: Task<Void, Never>?
     @FocusState private var searchFieldFocused: Bool
     let onClose: () -> Void
+    let onVisibilityChanged: (Bool) -> Void
 
-    init(onClose: @escaping () -> Void = {}) {
+    init(
+        onClose: @escaping () -> Void = {},
+        onVisibilityChanged: @escaping (Bool) -> Void = { _ in }
+    ) {
         self.onClose = onClose
+        self.onVisibilityChanged = onVisibilityChanged
     }
 
     var body: some View {
@@ -1641,6 +1646,7 @@ struct SearchView: View {
             }
         }
         .background(Color(uiColor: .systemBackground))
+        .toolbar(.hidden, for: .navigationBar)
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedResource) { selection in ResourcePushSheet(item: selection.value).environmentObject(appState) }
         .sheet(isPresented: $showSettings) {
@@ -1658,7 +1664,11 @@ struct SearchView: View {
             stopSearch(clearResults: true)
             model.resetLocalSettings()
         }
-        .onDisappear { stopSearch() }
+        .onAppear { onVisibilityChanged(true) }
+        .onDisappear {
+            onVisibilityChanged(false)
+            stopSearch()
+        }
     }
 
     private var searchPlaceholder: String {
@@ -1775,6 +1785,7 @@ private struct ResourceFilterValuesSection: View {
 }
 
 struct SearchSettingsSheet: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: SearchViewModel
     let onReload: () async -> Void
@@ -1891,7 +1902,7 @@ struct SearchSettingsSheet: View {
                                         didSave = false
                                     } label: {
                                         HStack(spacing: 5) {
-                                            Text(site.name)
+                                            Text(privacyMaskedText(site.name, enabled: appState.privacyMode))
                                                 .lineLimit(1)
                                                 .minimumScaleFactor(0.75)
                                             if selectedSiteIDs.contains(site.id) {
@@ -2494,7 +2505,7 @@ struct ResourcePushSheet: View {
                     if !sites.isEmpty {
                         Menu("从站点选择") {
                             ForEach(sites) { site in
-                                Button(site.name) {
+                                Button(privacyMaskedText(site.name, enabled: appState.privacyMode)) {
                                     siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
                                     if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                         cookie = site.cookie

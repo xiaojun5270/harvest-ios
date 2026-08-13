@@ -1036,7 +1036,7 @@ struct LoginHistorySheet: View {
                             Circle().fill(HarvestTheme.green.opacity(0.15)).frame(width: 40, height: 40)
                                 .overlay(Image(systemName: "person.fill").foregroundStyle(HarvestTheme.green))
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(record.username).font(.headline).foregroundStyle(.primary)
+                                Text(privacyMaskedText(record.username, enabled: appState.privacyMode)).font(.headline).foregroundStyle(.primary)
                                 Text(record.server).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
@@ -1091,7 +1091,7 @@ struct AccountSwitcherView: View {
                                 )
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
-                                    Text(record.username).font(.headline)
+                                    Text(privacyMaskedText(record.username, enabled: appState.privacyMode)).font(.headline)
                                     if isCurrent { Text("当前").font(.caption2).foregroundStyle(HarvestTheme.green) }
                                 }
                                 Text(record.server).font(.caption).foregroundStyle(.secondary).lineLimit(1)
@@ -1129,6 +1129,7 @@ struct MainShellView: View {
     @State private var availableAppUpdate: String?
     @State private var handledNoticePresentation = 0
     @State private var lastNonSearchTab = 2
+    @State private var isSearchScreenVisible = false
 
     private var showsNewsTab: Bool {
         appState.mediaTMDBEnabled || appState.mediaDoubanEnabled
@@ -1154,14 +1155,16 @@ struct MainShellView: View {
                 }
                 SearchView {
                     appState.selectedTab = lastNonSearchTab
+                } onVisibilityChanged: { isVisible in
+                    isSearchScreenVisible = isVisible
                 }
                 .tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }
                 .tag(5)
             }
             .harvestNavigationChrome()
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
-            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .tabBar)
+            .toolbar(isSearchScreenVisible || appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
+            .toolbar(isSearchScreenVisible || appState.selectedTab == 5 ? .hidden : .visible, for: .tabBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     BrandMark(size: 28)

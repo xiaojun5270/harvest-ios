@@ -524,17 +524,18 @@ final class SitesViewModel: ObservableObject {
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
+        let displayName = privacyMaskedText(site.name, enabled: appState.privacyMode)
         let title: String
         let successMessage: String
         if path == APIPath.siteSign {
-            title = "正在为\(site.name)签到"
-            successMessage = "\(site.name)签到完成"
+            title = "正在为\(displayName)签到"
+            successMessage = "\(displayName)签到完成"
         } else if path == APIPath.siteRepeat {
-            title = "正在为\(site.name)辅种"
-            successMessage = "\(site.name)辅种任务已提交"
+            title = "正在为\(displayName)辅种"
+            successMessage = "\(displayName)辅种任务已提交"
         } else {
-            title = "正在刷新\(site.name)"
-            successMessage = "\(site.name)数据已更新"
+            title = "正在刷新\(displayName)"
+            successMessage = "\(displayName)数据已更新"
         }
         _ = await appState.runManualTask(title: title, successMessage: successMessage) {
             guard await appState.perform(path + "\(site.id)", method: .get, showsFeedback: false) else {
@@ -821,7 +822,7 @@ struct SitesView: View {
                 SiteBrowserScreen(
                     site: target.site,
                     urlString: target.url,
-                    title: target.site.name,
+                    title: privacyMaskedText(target.site.name, enabled: appState.privacyMode),
                     onSynced: { await model.load(appState, cached: false) }
                 )
                 .toolbar {
@@ -833,7 +834,7 @@ struct SitesView: View {
             .environmentObject(appState)
         }
         .confirmationDialog(
-            "确定删除站点「\(deletingSite?.name ?? "")」？",
+            "确定删除站点「\(privacyMaskedText(deletingSite?.name ?? "", enabled: appState.privacyMode))」？",
             isPresented: Binding(get: { deletingSite != nil }, set: { if !$0 { deletingSite = nil } }),
             titleVisibility: .visible
         ) {
@@ -845,7 +846,7 @@ struct SitesView: View {
             Button("取消", role: .cancel) { deletingSite = nil }
         }
         .confirmationDialog(
-            "确定让站点「\(repeatingSite?.name ?? "")」执行辅种？",
+            "确定让站点「\(privacyMaskedText(repeatingSite?.name ?? "", enabled: appState.privacyMode))」执行辅种？",
             isPresented: Binding(get: { repeatingSite != nil }, set: { if !$0 { repeatingSite = nil } }),
             titleVisibility: .visible
         ) {
@@ -898,6 +899,7 @@ struct SitesView: View {
 }
 
 private struct SiteSearchFilterBar: View {
+    @EnvironmentObject private var appState: AppState
     @ObservedObject var model: SitesViewModel
     let openFilters: () -> Void
 
@@ -911,7 +913,7 @@ private struct SiteSearchFilterBar: View {
                         text: $model.query,
                         placeholder: "搜索站点、镜像、账号、标签"
                     )
-                    .frame(minHeight: 24)
+                    .frame(height: 24)
                     if !model.query.isEmpty {
                         Button { model.query = "" } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -958,10 +960,10 @@ private struct SiteSearchFilterBar: View {
                             filterToken("#\(tag)", icon: "tag") { model.selectedTags.remove(tag) }
                         }
                         if !model.selectedUsername.isEmpty {
-                            filterToken(model.selectedUsername, icon: "person") { model.selectedUsername = "" }
+                            filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode), icon: "person") { model.selectedUsername = "" }
                         }
                         if !model.selectedEmail.isEmpty {
-                            filterToken(model.selectedEmail, icon: "envelope") { model.selectedEmail = "" }
+                            filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode), icon: "envelope") { model.selectedEmail = "" }
                         }
                         if model.sortField != .updated || model.ascending != SiteSortField.updated.defaultAscending {
                             filterToken(model.sortField.rawValue, icon: model.ascending ? "arrow.up" : "arrow.down") {
@@ -1037,6 +1039,17 @@ private struct SiteSearchTextField: UIViewRepresentable {
         textField.placeholder = placeholder
         guard textField.markedTextRange == nil, textField.text != text else { return }
         textField.text = text
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: UITextField,
+        context: Context
+    ) -> CGSize? {
+        CGSize(
+            width: proposal.width ?? uiView.intrinsicContentSize.width,
+            height: 24
+        )
     }
 
     final class Coordinator: NSObject, UITextFieldDelegate {
@@ -1305,8 +1318,8 @@ struct SiteTimelineView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(entry.displayName).font(.headline).lineLimit(1)
-                    Text(entry.key).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(privacyMaskedText(entry.displayName, enabled: appState.privacyMode)).font(.headline).lineLimit(1)
+                    Text(privacyMaskedText(entry.key, enabled: appState.privacyMode)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
                 Text(showDurationOnTitle ? entry.durationText : entry.registeredText)
@@ -1329,11 +1342,11 @@ struct SiteTimelineView: View {
                         Image(systemName: "safari")
                     }
                     .buttonStyle(.bordered)
-                    .accessibilityLabel("选择 \(entry.displayName) 镜像")
+                    .accessibilityLabel("选择 \(privacyMaskedText(entry.displayName, enabled: appState.privacyMode)) 镜像")
                 } else if !entry.primaryURL.isEmpty {
                     NavigationLink { browserDestination(entry, urlString: entry.primaryURL) } label: { Image(systemName: "safari") }
                         .buttonStyle(.bordered)
-                        .accessibilityLabel("打开 \(entry.displayName)")
+                        .accessibilityLabel("打开 \(privacyMaskedText(entry.displayName, enabled: appState.privacyMode))")
                 }
             }
             if showDuration { timelineMetric("注册时长", value: entry.durationText) }
@@ -1341,7 +1354,7 @@ struct SiteTimelineView: View {
             if showDownloaded { timelineMetric("下载量", value: entry.site.map { formatBytes($0.downloaded) } ?? "-") }
             if showUsername { timelineMetric("用户名", value: privateValue(entry.site?.username ?? "-")) }
             if showEmail { timelineMetric("邮箱", value: privateValue(entry.site?.email ?? "-")) }
-            if showUID { timelineMetric("UID", value: privateValue(entry.site?.userID ?? "-")) }
+            if showUID { timelineMetric("UID", value: entry.site?.userID ?? "-") }
         }
         .cardSurface()
     }
@@ -1351,10 +1364,16 @@ struct SiteTimelineView: View {
             .font(.caption)
     }
 
-    private func privateValue(_ value: String) -> String { appState.privacyMode && value != "-" ? "••••" : value }
+    private func privateValue(_ value: String) -> String {
+        value == "-" ? value : privacyMaskedText(value, enabled: appState.privacyMode)
+    }
 
     @ViewBuilder private func browserDestination(_ entry: SiteTimelineEntry, urlString: String) -> some View {
-        SiteBrowserScreen(site: entry.browserSite, urlString: urlString, title: entry.displayName) {
+        SiteBrowserScreen(
+            site: entry.browserSite,
+            urlString: urlString,
+            title: privacyMaskedText(entry.displayName, enabled: appState.privacyMode)
+        ) {
             await model.load(appState, cached: false)
         }
     }
@@ -1372,6 +1391,7 @@ struct SiteTimelineView: View {
 }
 
 struct SiteFilterSheet: View {
+    @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: SitesViewModel
 
@@ -1393,7 +1413,7 @@ struct SiteFilterSheet: View {
                             text: $model.query,
                             placeholder: "搜索站点、镜像、账号、标签"
                         )
-                        .frame(minHeight: 24)
+                        .frame(height: 24)
                         if !model.query.isEmpty {
                             Button { model.query = "" } label: {
                                 Image(systemName: "xmark.circle.fill")
@@ -1435,8 +1455,8 @@ struct SiteFilterSheet: View {
                     }
                 }
                 Section("身份") {
-                    filterPicker("用户名", selection: $model.selectedUsername, values: model.availableUsernames)
-                    filterPicker("邮箱", selection: $model.selectedEmail, values: model.availableEmails)
+                    filterPicker("用户名", selection: $model.selectedUsername, values: model.availableUsernames, masksValues: true)
+                    filterPicker("邮箱", selection: $model.selectedEmail, values: model.availableEmails, masksValues: true)
                 }
                 Section("排序字段") {
                     ForEach(SiteSortField.allCases) { field in
@@ -1490,10 +1510,17 @@ struct SiteFilterSheet: View {
     }
 
     @ViewBuilder
-    private func filterPicker(_ title: String, selection: Binding<String>, values: [String]) -> some View {
+    private func filterPicker(
+        _ title: String,
+        selection: Binding<String>,
+        values: [String],
+        masksValues: Bool = false
+    ) -> some View {
         Picker(title, selection: selection) {
             Text("全部").tag("")
-            ForEach(values, id: \.self) { Text($0).tag($0) }
+            ForEach(values, id: \.self) { value in
+                Text(privacyMaskedText(value, enabled: masksValues && appState.privacyMode)).tag(value)
+            }
         }
     }
 
@@ -2327,7 +2354,7 @@ struct SiteRow: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("查看\(site.name)详情")
+            .accessibilityLabel("查看\(privacyMaskedText(site.name, enabled: privacy))详情")
         }
         .padding(11)
         .background(
@@ -2355,11 +2382,11 @@ struct SiteRow: View {
                 siteLogo(size: 48)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("进入\(site.name)站点")
+            .accessibilityLabel("进入\(privacyMaskedText(site.name, enabled: privacy))站点")
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .center, spacing: 5) {
                     Button(action: onOpenDetails) {
-                        Text(site.name)
+                        Text(privacyMaskedText(site.name, enabled: privacy))
                             .font(.headline)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
@@ -2372,7 +2399,7 @@ struct SiteRow: View {
                             compactAccountSummary
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("查看\(site.name)提醒详情")
+                        .accessibilityLabel("查看\(privacyMaskedText(site.name, enabled: privacy))提醒详情")
                     }
                     if let levelStatus {
                         Button(action: onOpenLevel) {
@@ -2402,14 +2429,14 @@ struct SiteRow: View {
                             SiteInlineStatus(status: milestoneStatus)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("查看\(site.name)\(milestoneStatus.label)详情")
+                        .accessibilityLabel("查看\(privacyMaskedText(site.name, enabled: privacy))\(milestoneStatus.label)详情")
                     }
                     if let signStatus {
                         Button(action: onOpenSignIn) {
                             SiteInlineStatus(status: signStatus)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("查看\(site.name)签到详情")
+                        .accessibilityLabel("查看\(privacyMaskedText(site.name, enabled: privacy))签到详情")
                     }
                 }
             }
@@ -2476,7 +2503,7 @@ struct SiteRow: View {
     private var uploadMetric: some View {
         SiteTrafficMetric(
             label: "上传",
-            value: privateValue(formatBytes(site.uploaded)),
+            value: formatBytes(site.uploaded),
             delta: dailyDeltaText(site.uploadDelta),
             icon: "arrow.up",
             color: HarvestTheme.green
@@ -2486,7 +2513,7 @@ struct SiteRow: View {
     private var downloadMetric: some View {
         SiteTrafficMetric(
             label: "下载",
-            value: privateValue(formatBytes(site.downloaded)),
+            value: formatBytes(site.downloaded),
             delta: dailyDeltaText(site.downloadDelta),
             icon: "arrow.down",
             color: HarvestTheme.blue
@@ -2502,7 +2529,7 @@ struct SiteRow: View {
             SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
             SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber)
             SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue)
-            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: privateValue(formatBytes(site.seedVolume)), color: HarvestTheme.green)
+            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.green)
         }
         .padding(.horizontal, 5)
         .padding(.vertical, 7)
@@ -2601,7 +2628,6 @@ struct SiteRow: View {
     }
 
     private func dailyDeltaText(_ value: Double) -> String {
-        guard !privacy else { return "今日 ••••" }
         guard site.hasTodayData else { return "今日暂无增量" }
         let prefix = value > 0 ? "+" : value < 0 ? "-" : ""
         return "今日 \(prefix)\(formatBytes(abs(value)))"
@@ -2629,14 +2655,12 @@ struct SiteRow: View {
         return "\(days / 365)年前"
     }
 
-    private var ratioText: String { privateValue(String(format: "%.2f", site.ratio)) }
-    private var ratioColor: Color { !privacy && site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.green }
+    private var ratioText: String { String(format: "%.2f", site.ratio) }
+    private var ratioColor: Color { site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.green }
     private var hrText: String {
         let value = site.hr.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "0" : value
     }
-
-    private func privateValue(_ value: String) -> String { privacy ? "••••" : value }
 
 }
 
@@ -3918,7 +3942,7 @@ private struct SiteSignInDetailView: View {
             HStack(spacing: 13) {
                 SiteDetailIcon(site: current, iconCandidates: logoCandidates)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(current.name)
+                    Text(privacyMaskedText(current.name, enabled: appState.privacyMode))
                         .font(.title3.weight(.bold))
                         .lineLimit(1)
                     Text(accountSubtitle)
@@ -3997,13 +4021,13 @@ private struct SiteSignInDetailView: View {
         VStack(alignment: .leading, spacing: 10) {
             sectionTitle("基础信息", icon: "info.circle")
             VStack(spacing: 0) {
-                informationRow("站点名称", value: current.siteKey.isEmpty ? current.name : current.siteKey)
-                informationRow("昵称", value: current.name)
+                informationRow("站点名称", value: privacyMaskedText(current.siteKey.isEmpty ? current.name : current.siteKey, enabled: appState.privacyMode))
+                informationRow("昵称", value: privacyMaskedText(current.name, enabled: appState.privacyMode))
                 informationRow("排序 ID", value: "\(current.sortID)")
                 if !current.siteType.isEmpty { informationRow("站点类型", value: current.siteType) }
                 if !current.username.isEmpty { informationRow("用户名", value: privateText(current.username)) }
                 if !current.email.isEmpty { informationRow("邮箱", value: privateText(current.email)) }
-                if !current.userID.isEmpty { informationRow("用户 ID", value: privateText(current.userID)) }
+                if !current.userID.isEmpty { informationRow("用户 ID", value: current.userID) }
                 informationRow("注册时间", value: registeredDetail)
                 if !current.latestActive.isEmpty { informationRow("最后活动", value: current.latestActive) }
                 informationRow("最后同步", value: current.updatedAt.isEmpty ? "未知" : current.updatedAt, drawsDivider: false)
@@ -4085,8 +4109,13 @@ private struct SiteSignInDetailView: View {
     }
 
     private var accountSubtitle: String {
-        let values = [current.username, current.email].filter { !$0.isEmpty }
-        return values.isEmpty ? (current.siteKey.isEmpty ? "站点账号" : current.siteKey) : privateText(values.joined(separator: " · "))
+        let values = [current.username, current.email]
+            .filter { !$0.isEmpty }
+            .map { privateText($0) }
+        let fallback = current.siteKey.isEmpty
+            ? "站点账号"
+            : privacyMaskedText(current.siteKey, enabled: appState.privacyMode)
+        return values.isEmpty ? fallback : values.joined(separator: " · ")
     }
 
     private var registeredSummary: String {
@@ -4166,7 +4195,7 @@ private struct SiteSignInDetailView: View {
     }
 
     private func privateText(_ value: String) -> String {
-        appState.privacyMode ? "••••" : value
+        privacyMaskedText(value, enabled: appState.privacyMode)
     }
 
     @MainActor private func loadDetail() async {
@@ -4242,8 +4271,10 @@ struct SiteDetailView: View {
                             iconCandidates: model.logoCandidates(for: current, appState: appState)
                         )
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(current.name).font(.headline)
-                            Text(current.siteType.isEmpty ? current.siteKey : current.siteType)
+                            Text(privacyMaskedText(current.name, enabled: appState.privacyMode)).font(.headline)
+                            Text(current.siteType.isEmpty
+                                ? privacyMaskedText(current.siteKey, enabled: appState.privacyMode)
+                                : current.siteType)
                                 .font(.caption).foregroundStyle(.secondary)
                             StatusPill(label: current.enabled ? "站点可用" : "站点停用", color: current.enabled ? HarvestTheme.green : .secondary)
                         }
@@ -4268,9 +4299,9 @@ struct SiteDetailView: View {
                     }
                 }
                 Section("账号") {
-                    detailValue("用户名", value: current.username)
+                    detailValue("用户名", value: current.username, privateValue: true)
                     detailValue("邮箱", value: current.email, privateValue: true)
-                    detailValue("用户 ID", value: current.userID, privateValue: true)
+                    detailValue("用户 ID", value: current.userID)
                     if !current.level.isEmpty {
                         if levelRequirements.isEmpty {
                             detailValue("等级", value: current.level)
@@ -4286,16 +4317,16 @@ struct SiteDetailView: View {
                     detailValue("最后活动", value: current.latestActive)
                 }
                 Section("数据") {
-                    LabeledContent("上传量", value: privateText(formatBytes(current.uploaded)))
-                    if current.uploadDelta != 0 { LabeledContent("今日上传增量", value: privateText(formatBytes(current.uploadDelta))) }
-                    LabeledContent("下载量", value: privateText(formatBytes(current.downloaded)))
-                    if current.downloadDelta != 0 { LabeledContent("今日下载增量", value: privateText(formatBytes(current.downloadDelta))) }
-                    LabeledContent("分享率", value: privateText(String(format: "%.2f", current.ratio)))
-                    LabeledContent("做种体积", value: privateText(formatBytes(current.seedVolume)))
+                    LabeledContent("上传量", value: formatBytes(current.uploaded))
+                    if current.uploadDelta != 0 { LabeledContent("今日上传增量", value: formatBytes(current.uploadDelta)) }
+                    LabeledContent("下载量", value: formatBytes(current.downloaded))
+                    if current.downloadDelta != 0 { LabeledContent("今日下载增量", value: formatBytes(current.downloadDelta)) }
+                    LabeledContent("分享率", value: String(format: "%.2f", current.ratio))
+                    LabeledContent("做种体积", value: formatBytes(current.seedVolume))
                     LabeledContent("做种天数", value: "\(current.seedDays)")
-                    LabeledContent("魔力值", value: privateText(formatCompactNumber(current.magic)))
-                    LabeledContent("时魔", value: privateText(formatCompactNumber(current.bonusHour)))
-                    LabeledContent("积分", value: privateText(formatCompactNumber(current.score)))
+                    LabeledContent("魔力值", value: formatCompactNumber(current.magic))
+                    LabeledContent("时魔", value: formatCompactNumber(current.bonusHour))
+                    LabeledContent("积分", value: formatCompactNumber(current.score))
                 }
                 Section("活动") {
                     LabeledContent("做种", value: "\(current.seeding)")
@@ -4376,7 +4407,7 @@ struct SiteDetailView: View {
                             SiteBrowserScreen(
                                 site: current,
                                 urlString: current.url,
-                                title: current.name,
+                                title: privacyMaskedText(current.name, enabled: appState.privacyMode),
                                 onSynced: {
                                     await model.load(appState, cached: false)
                                     await loadDetail()
@@ -4392,10 +4423,10 @@ struct SiteDetailView: View {
                 }
             }
             .overlay { if isLoading { ProgressView().controlSize(.large) } }
-            .navigationTitle(current.name).navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(privacyMaskedText(current.name, enabled: appState.privacyMode)).navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .task { await loadDetail() }
-            .confirmationDialog("确定让站点「\(current.name)」执行辅种？", isPresented: $confirmRepeat, titleVisibility: .visible) {
+            .confirmationDialog("确定让站点「\(privacyMaskedText(current.name, enabled: appState.privacyMode))」执行辅种？", isPresented: $confirmRepeat, titleVisibility: .visible) {
                 Button("执行辅种") { Task { await operate(APIPath.siteRepeat) } }
                 Button("取消", role: .cancel) { }
             }
@@ -4433,7 +4464,9 @@ struct SiteDetailView: View {
         if !value.isEmpty { LabeledContent(label, value: privateValue ? privateText(value) : value) }
     }
 
-    private func privateText(_ value: String) -> String { appState.privacyMode ? "••••" : value }
+    private func privateText(_ value: String) -> String {
+        privacyMaskedText(value, enabled: appState.privacyMode)
+    }
 
     private func signHistoryText(_ row: [String: Any]) -> String {
         let text = row.string("info", "message", "content") ?? prettyJSON(row)
