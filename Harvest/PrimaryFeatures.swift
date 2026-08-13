@@ -41,8 +41,13 @@ private enum DashboardServerRefreshDefaults {
 private enum DashboardChartDefaults {
     static let height = 260.0
     static let heightRange = 120.0...480.0
-    static let itemCount = 15
-    static let itemCountRange = 10...50
+}
+
+private enum DashboardListLayout {
+    static let visibleRows = 10
+    static let siteRowHeight: CGFloat = 52
+    static let distributionRowHeight: CGFloat = 46
+    static let incrementRowHeight: CGFloat = 52
 }
 
 private func isDashboardRequestCancellation(_ error: Error) -> Bool {
@@ -130,8 +135,6 @@ struct DashboardSnapshot {
         let overview = root.dict("overview", "summary", "statistics", "stats") ?? root
         uploaded = overview.double("totalUploaded", "total_uploaded", "uploaded", "upload", "upload_total", "total_upload") ?? 0
         downloaded = overview.double("totalDownloaded", "total_downloaded", "downloaded", "download", "download_total", "total_download") ?? 0
-        uploadSpeed = overview.double("uploadSpeed", "upload_speed", "upspeed", "up_speed") ?? 0
-        downloadSpeed = overview.double("downloadSpeed", "download_speed", "dlspeed", "down_speed") ?? 0
         ratio = overview.double("ratio", "share_ratio") ?? (downloaded > 0 ? uploaded / downloaded : 0)
         siteCount = overview.int("siteCount", "site_count", "sites") ?? 0
         seeding = overview.int("totalSeeding", "total_seeding", "seeding", "seeding_count", "seed_count") ?? 0
@@ -420,6 +423,9 @@ final class DashboardViewModel: ObservableObject {
     private var serverInterval = DashboardServerRefreshDefaults.interval
     private var serverDuration = DashboardServerRefreshDefaults.duration
     private var restoredCacheKey: String?
+    private var downloaderSpeedTask: Task<Void, Never>?
+    private var downloaderSpeedMonitoring = false
+    private var downloaders: [DownloaderItem] = []
 
     func load(_ appState: AppState, days: Int? = nil) async {
         let cacheKey = "dashboard.data.\(days ?? 0)"
@@ -437,7 +443,10 @@ final class DashboardViewModel: ObservableObject {
         do {
             let query: [String: Any] = days.map { ["days": $0] } ?? [:]
             let raw = try await appState.api(APIPath.dashboard, query: query)
-            snapshot = DashboardSnapshot(raw)
+            var updatedSnapshot = DashboardSnapshot(raw)
+            updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
+            updatedSnapshot.downloadSpeed = snapshot.downloadSpeed
+            snapshot = updatedSnapshot
             lastUpdated = Date()
             cachedAt = nil
             usingCachedData = false
@@ -448,7 +457,85 @@ final class DashboardViewModel: ObservableObject {
             }
         }
         guard !Task.isCancelled else { return }
-        await loadAuthorization(appState)
+        async let authorizationLoad: Void = loadAuthorization(appState)
+        async let downloaderLoad: Void = loadDownloaderSpeeds(appState)
+        _ = await (authorizationLoad, downloaderLoad)
+    }
+
+    func startDownloaderSpeedMonitoring(_ appState: AppState) {
+        downloaderSpeedMonitoring = true
+        guard downloaderSpeedTask == nil || downloaderSpeedTask?.isCancelled == true else { return }
+        downloaderSpeedTask = Task { [weak self] in
+            await self?.watchDownloaderSpeeds(appState)
+        }
+    }
+
+    func stopDownloaderSpeedMonitoring() {
+        downloaderSpeedMonitoring = false
+        downloaderSpeedTask?.cancel()
+        downloaderSpeedTask = nil
+    }
+
+    private func loadDownloaderSpeeds(_ appState: AppState) async {
+        do {
+            let raw = try await appState.api(APIPath.downloaders, query: ["with_status": true])
+            guard !Task.isCancelled else { return }
+            downloaders = jsonRows(raw).map(DownloaderItem.init)
+            applyDownloaderSpeeds()
+        } catch {
+            guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { return }
+            recordAppLog(.warning, "仪表盘读取下载器速度失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func watchDownloaderSpeeds(_ appState: AppState) async {
+        while downloaderSpeedMonitoring, !Task.isCancelled {
+            do {
+                let stream = APIClient.shared.streamWebSocket(
+                    baseURL: appState.baseURL,
+                    path: APIPath.downloaderSpeed,
+                    token: appState.accessToken,
+                    subscription: ["interval": 5]
+                )
+                for try await event in stream {
+                    guard downloaderSpeedMonitoring, !Task.isCancelled else { return }
+                    let data = (event["data"] as? [String: Any]) ?? jsonPayloadDictionary(event) ?? [:]
+                    guard !data.isEmpty else { continue }
+                    var liveByKey: [String: [String: Any]] = [:]
+                    for (key, value) in data {
+                        if let value = value as? [String: Any] {
+                            liveByKey[key.lowercased()] = value
+                        }
+                    }
+                    var updated = downloaders
+                    var changed = false
+                    for index in updated.indices {
+                        let downloader = updated[index]
+                        let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
+                        guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
+                        var merged = downloader.raw
+                        merged["status"] = live
+                        updated[index] = DownloaderItem(merged)
+                        changed = true
+                    }
+                    guard changed else { continue }
+                    downloaders = updated
+                    applyDownloaderSpeeds()
+                }
+            } catch {
+                guard downloaderSpeedMonitoring, !Task.isCancelled else { return }
+            }
+            do { try await Task.sleep(for: .seconds(3)) }
+            catch { return }
+        }
+    }
+
+    private func applyDownloaderSpeeds() {
+        let enabledDownloaders = downloaders.filter(\.enabled)
+        var updatedSnapshot = snapshot
+        updatedSnapshot.uploadSpeed = enabledDownloaders.reduce(0) { $0 + max(0, $1.uploadSpeed) }
+        updatedSnapshot.downloadSpeed = enabledDownloaders.reduce(0) { $0 + max(0, $1.downloadSpeed) }
+        snapshot = updatedSnapshot
     }
 
     private func loadAuthorization(_ appState: AppState) async {
@@ -560,9 +647,9 @@ final class DashboardViewModel: ObservableObject {
                     var updatedSnapshot = snapshot
                     updatedSnapshot.cpu = cpu?.double("percent") ?? updatedSnapshot.cpu
                     updatedSnapshot.memory = memory?.double("percent") ?? updatedSnapshot.memory
-                    updatedSnapshot.uploadSpeed = network?.double("uploadSpeed", "upload_speed") ?? updatedSnapshot.uploadSpeed
-                    updatedSnapshot.downloadSpeed = network?.double("downloadSpeed", "download_speed") ?? updatedSnapshot.downloadSpeed
                     snapshot = updatedSnapshot
+                    let serverUploadSpeed = network?.double("uploadSpeed", "upload_speed") ?? 0
+                    let serverDownloadSpeed = network?.double("downloadSpeed", "download_speed") ?? 0
                     var updatedHistory = serverHistory
                     updatedHistory.append(DashboardServerPoint(
                         date: parseDate(payload.string("timestamp", "time", "created_at")) ?? Date(),
@@ -574,8 +661,8 @@ final class DashboardViewModel: ObservableObject {
                         memoryUsage: memory?.double("usage") ?? 0,
                         memoryWorkingSet: memory?.double("workingSet", "working_set") ?? 0,
                         memoryLimit: memory?.double("limit", "total") ?? 0,
-                        uploadSpeed: updatedSnapshot.uploadSpeed,
-                        downloadSpeed: updatedSnapshot.downloadSpeed,
+                        uploadSpeed: serverUploadSpeed,
+                        downloadSpeed: serverDownloadSpeed,
                         bytesSent: network?.double("bytesSent", "bytes_sent") ?? 0,
                         bytesReceived: network?.double("bytesRecv", "bytes_recv", "bytesReceived", "bytes_received") ?? 0
                     ))
@@ -836,6 +923,7 @@ private struct DashboardCacheClearSheet: View {
     @MainActor private func clearLocalScope() async {
         clearingKey = "__local_scope__"
         defer { clearingKey = nil }
+        let feedbackID = appState.beginManualTask("正在清理本机缓存")
         let defaults = UserDefaults.standard
         let keys = [
             "privacyMode",
@@ -906,6 +994,7 @@ private struct DashboardCacheClearSheet: View {
         statusMessage = "本机页面缓存与界面设置已清理"
         appState.requestAutomaticRefresh(force: true)
         await onCleared()
+        appState.finishManualTask(feedbackID, success: true, message: "本机缓存已清理")
     }
 }
 
@@ -916,7 +1005,6 @@ struct DashboardView: View {
     @AppStorage("dashboard.autoRefresh") private var autoRefresh = true
     @AppStorage("dashboard.refreshInterval") private var refreshInterval = 300
     @AppStorage("dashboard.chartHeight") private var chartHeight = DashboardChartDefaults.height
-    @AppStorage("dashboard.itemLimit") private var itemLimit = DashboardChartDefaults.itemCount
     @AppStorage("dashboard.serverResource.autoStart") private var serverResourceAutoStart = DashboardServerRefreshDefaults.autoStart
     @AppStorage("dashboard.serverResource.interval") private var serverResourceInterval = DashboardServerRefreshDefaults.interval
     @AppStorage("dashboard.serverResource.duration") private var serverResourceDuration = DashboardServerRefreshDefaults.duration
@@ -950,17 +1038,6 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 14) {
-                HStack {
-                    Spacer()
-                    Button { showSettings = true } label: {
-                        Label("卡片设置", systemImage: "slider.horizontal.3")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(HarvestTheme.blue)
-                    .accessibilityLabel("仪表盘卡片设置")
-                }
-
                 if model.isLoading {
                     LoadingState()
                 } else {
@@ -985,8 +1062,28 @@ struct DashboardView: View {
             .padding(16)
         }
         .background(Color(uiColor: .systemGroupedBackground))
+        .overlay(alignment: .topTrailing) {
+            Button { showSettings = true } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(HarvestTheme.blue)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .background(.regularMaterial, in: Circle())
+            .overlay {
+                Circle()
+                    .stroke(Color.white.opacity(0.58), lineWidth: 0.8)
+            }
+            .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
+            .padding(.top, 10)
+            .padding(.trailing, 16)
+            .accessibilityLabel("仪表盘卡片设置")
+        }
         .refreshable { await model.load(appState, days: trendDays) }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
+            model.startDownloaderSpeedMonitoring(appState)
             await model.load(appState, days: trendDays)
             guard autoRefresh else { return }
             while !Task.isCancelled {
@@ -1003,7 +1100,10 @@ struct DashboardView: View {
                 duration: serverResourceDuration
             )
         }
-        .onDisappear { model.stopServerMonitoring() }
+        .onDisappear {
+            model.stopServerMonitoring()
+            model.stopDownloaderSpeedMonitoring()
+        }
         .navigationTitle("仪表盘")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -1018,8 +1118,6 @@ struct DashboardView: View {
                     showShare = shareImage != nil
                 } label: { Image(systemName: "square.and.arrow.up") }
                     .accessibilityLabel("分享仪表盘长图")
-                Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                    .accessibilityLabel("仪表盘卡片设置")
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -1031,7 +1129,6 @@ struct DashboardView: View {
                 serverResourceInterval: $serverResourceInterval,
                 serverResourceDuration: $serverResourceDuration,
                 chartHeight: $chartHeight,
-                itemLimit: $itemLimit,
                 moduleOrderRaw: $moduleOrderRaw,
                 moduleVisibilityBindings: moduleVisibilityBindings
             )
@@ -1103,7 +1200,7 @@ struct DashboardView: View {
                     }
                     .chartYAxis { AxisMarks(position: .leading) { value in
                         AxisGridLine().foregroundStyle(.quaternary)
-                        AxisValueLabel { if let number = value.as(Double.self) { Text(formatBytes(number)).font(.caption2) } }
+                        AxisValueLabel { if let number = value.as(Double.self) { Text(dashboardCompactBytes(number)).font(.caption2) } }
                     } }
                     .frame(height: CGFloat(chartHeight))
                 }
@@ -1111,7 +1208,7 @@ struct DashboardView: View {
             }
         case .siteStatus:
             if showSiteStatus && !model.snapshot.siteStatuses.isEmpty {
-                DashboardSiteStatusView(items: model.snapshot.siteStatuses, limit: itemLimit, privacy: appState.privacyMode)
+                DashboardSiteStatusView(items: model.snapshot.siteStatuses, privacy: appState.privacyMode)
             }
         case .serverResources:
             if showServerResources {
@@ -1164,24 +1261,24 @@ struct DashboardView: View {
                     ResourceRow(label: "内存", value: model.snapshot.memory, color: HarvestTheme.amber)
                     if let latest = model.latestServerPoint {
                         HStack {
-                            Text("工作集 \(formatBytes(latest.memoryWorkingSet))")
+                            Text("工作集 \(dashboardCompactBytes(latest.memoryWorkingSet))")
                             Spacer()
-                            Text("上限 \(formatBytes(latest.memoryLimit))")
+                            Text("上限 \(dashboardCompactBytes(latest.memoryLimit))")
                         }
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                     }
                     HStack {
-                        Label(formatSpeed(model.snapshot.downloadSpeed), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
+                        Label(formatSpeed(model.latestServerPoint?.downloadSpeed ?? 0), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
                         Spacer()
-                        Label(formatSpeed(model.snapshot.uploadSpeed), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
+                        Label(formatSpeed(model.latestServerPoint?.uploadSpeed ?? 0), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
                     }
                     .font(.caption.monospacedDigit())
                     if let latest = model.latestServerPoint {
                         HStack {
-                            Text("累计下载 \(formatBytes(latest.bytesReceived))")
+                            Text("累计下载 \(dashboardCompactBytes(latest.bytesReceived))")
                             Spacer()
-                            Text("累计上传 \(formatBytes(latest.bytesSent))")
+                            Text("累计上传 \(dashboardCompactBytes(latest.bytesSent))")
                         }
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -1240,32 +1337,31 @@ struct DashboardView: View {
             }
         case .usernameDistribution:
             if showUsernameDistribution && !model.snapshot.usernameDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.usernameDistribution, limit: itemLimit, privacy: appState.privacyMode)
+                DistributionView(title: module.title, items: model.snapshot.usernameDistribution, metric: .count, privacy: appState.privacyMode)
             }
         case .emailDistribution:
             if showEmailDistribution && !model.snapshot.emailDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.emailDistribution, limit: itemLimit, privacy: appState.privacyMode)
+                DistributionView(title: module.title, items: model.snapshot.emailDistribution, metric: .count, privacy: appState.privacyMode)
             }
         case .siteUploadDistribution:
             if showSiteUploadDistribution && !model.snapshot.siteUploadDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.siteUploadDistribution, limit: itemLimit, privacy: appState.privacyMode)
+                DistributionView(title: module.title, items: model.snapshot.siteUploadDistribution, metric: .bytes(.upload), privacy: appState.privacyMode)
             }
         case .siteDownloadDistribution:
             if showSiteDownloadDistribution && !model.snapshot.siteDownloadDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.siteDownloadDistribution, limit: itemLimit, privacy: appState.privacyMode)
+                DistributionView(title: module.title, items: model.snapshot.siteDownloadDistribution, metric: .bytes(.download), privacy: appState.privacyMode)
             }
         case .todayIncrement:
             if showTodayIncrement {
                 DashboardIncrementRankingView(
                     items: model.snapshot.siteIncrements(days: trendDays),
                     days: trendDays,
-                    limit: itemLimit,
                     privacy: appState.privacyMode
                 )
             }
         case .seedDistribution:
             if showSeedDistribution && !model.snapshot.seedDistribution.isEmpty {
-                DistributionView(title: module.title, items: model.snapshot.seedDistribution, limit: itemLimit, privacy: appState.privacyMode)
+                DistributionView(title: module.title, items: model.snapshot.seedDistribution, metric: .bytes(.seed), privacy: appState.privacyMode)
             }
         case .monthlyUpload:
             if showMonthlyUpload && !model.snapshot.monthlyHistory.isEmpty {
@@ -1365,7 +1461,15 @@ struct DashboardView: View {
 
     @MainActor private func runGlobal(_ path: String) async {
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
-        if await appState.perform(endpoint, method: .get) { await model.load(appState, days: trendDays) }
+        let signing = path == APIPath.siteSign
+        _ = await appState.runManualTask(
+            title: signing ? "正在为全部站点签到" : "正在刷新全部站点",
+            successMessage: signing ? "全部站点签到完成" : "全部站点数据已更新"
+        ) {
+            guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return false }
+            await model.load(appState, days: trendDays)
+            return appState.presentedError == nil
+        }
     }
 
     @MainActor private func runQuickAction(_ action: DashboardQuickAction) async {
@@ -1376,7 +1480,9 @@ struct DashboardView: View {
         case .refreshSites:
             await runGlobal(APIPath.siteStatus)
         case .refreshDashboard:
-            await model.load(appState, days: trendDays)
+            await appState.runManualRefresh(title: "正在刷新仪表盘", successMessage: "仪表盘已更新") {
+                await model.load(appState, days: trendDays)
+            }
         case .signSites:
             await runGlobal(APIPath.siteSign)
         }
@@ -1390,7 +1496,6 @@ struct DashboardView: View {
             authorizationError: model.authorizationError,
             serverPoint: model.latestServerPoint,
             rangeDays: trendDays,
-            itemLimit: itemLimit,
             privacy: appState.privacyMode
         ))
         renderer.scale = UIScreen.main.scale
@@ -1433,11 +1538,11 @@ private struct DashboardHeroView: View {
                 StatusPill(label: statusLabel, color: statusColor)
             }
 
-            HStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 0) {
                 heroMetric(
                     label: "站点",
                     value: "\(snapshot.siteCount)",
-                    detail: "\(snapshot.unread) 条未读",
+                    detail: snapshot.unread > 0 ? "\(snapshot.unread) 条未读" : nil,
                     color: HarvestTheme.coral
                 )
                 Divider().frame(height: 46)
@@ -1467,7 +1572,7 @@ private struct DashboardHeroView: View {
         }
     }
 
-    private func heroMetric(label: String, value: String, detail: String, color: Color) -> some View {
+    private func heroMetric(label: String, value: String, detail: String?, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
                 .font(.caption.weight(.semibold))
@@ -1477,10 +1582,12 @@ private struct DashboardHeroView: View {
                 .foregroundStyle(color)
                 .lineLimit(1)
                 .minimumScaleFactor(0.65)
-            Text(detail)
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
@@ -1501,16 +1608,14 @@ private struct DashboardOverviewView: View {
             HStack(spacing: 0) {
                 overviewPrimaryMetric(
                     label: "总上传",
-                    value: privateValue(formatBytes(snapshot.uploaded)),
-                    detail: formatSpeed(snapshot.uploadSpeed),
+                    value: privateValue(dashboardCompactBytes(snapshot.uploaded)),
                     icon: "arrow.up",
                     color: HarvestTheme.green
                 )
-                Divider().frame(height: 54)
+                Divider().frame(height: 46)
                 overviewPrimaryMetric(
                     label: "总下载",
-                    value: privateValue(formatBytes(snapshot.downloaded)),
-                    detail: formatSpeed(snapshot.downloadSpeed),
+                    value: privateValue(dashboardCompactBytes(snapshot.downloaded)),
                     icon: "arrow.down",
                     color: HarvestTheme.blue
                 )
@@ -1533,19 +1638,19 @@ private struct DashboardOverviewView: View {
                 )
                 DashboardStatLine(
                     label: "今日上传",
-                    value: privateValue(formatBytes(snapshot.todayUploaded)),
+                    value: privateValue(dashboardCompactBytes(snapshot.todayUploaded)),
                     icon: "arrow.up.right",
                     color: HarvestTheme.green
                 )
                 DashboardStatLine(
                     label: "今日下载",
-                    value: privateValue(formatBytes(snapshot.todayDownloaded)),
+                    value: privateValue(dashboardCompactBytes(snapshot.todayDownloaded)),
                     icon: "arrow.down.right",
                     color: HarvestTheme.blue
                 )
                 DashboardStatLine(
                     label: "做种体积",
-                    value: privateValue(formatBytes(snapshot.seedVolume)),
+                    value: privateValue(dashboardCompactBytes(snapshot.seedVolume)),
                     icon: "externaldrive.fill.badge.checkmark",
                     color: HarvestTheme.amber
                 )
@@ -1577,7 +1682,7 @@ private struct DashboardOverviewView: View {
         .cardSurface()
     }
 
-    private func overviewPrimaryMetric(label: String, value: String, detail: String, icon: String, color: Color) -> some View {
+    private func overviewPrimaryMetric(label: String, value: String, detail: String? = nil, icon: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Label(label, systemImage: icon)
                 .font(.caption.weight(.semibold))
@@ -1586,10 +1691,12 @@ private struct DashboardOverviewView: View {
                 .font(.title2.weight(.bold).monospacedDigit())
                 .lineLimit(1)
                 .minimumScaleFactor(0.62)
-            Text(detail)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
@@ -1857,82 +1964,99 @@ private struct DashboardQuickActionsView: View {
 
 private struct DashboardSiteStatusView: View {
     let items: [DashboardSiteStatusItem]
-    let limit: Int
     let privacy: Bool
 
-    private var visibleItems: [DashboardSiteStatusItem] { Array(items.prefix(max(1, limit))) }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "站点状态", subtitle: "按累计上传排序")
-            ForEach(visibleItems) { item in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(privacy ? "••••" : item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
-                        Spacer()
-                        if item.published > 0 {
-                            Label(formatCompactNumber(item.published), systemImage: "paperplane")
-                                .font(.caption2)
-                                .foregroundStyle(HarvestTheme.coral)
+        DashboardScrollableModule(
+            title: "站点状态",
+            subtitle: "按累计上传排序",
+            itemCount: items.count,
+            rowHeight: DashboardListLayout.siteRowHeight
+        ) {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 10) {
+                            Text(privacy ? "••••" : item.name)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            if item.published > 0 {
+                                Label(formatCompactNumber(item.published), systemImage: "paperplane")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(HarvestTheme.coral)
+                                    .fixedSize(horizontal: true, vertical: false)
+                            }
+                        }
+                        HStack(spacing: 12) {
+                            dashboardCapacityLabel(item.uploaded, icon: "arrow.up", color: HarvestTheme.green)
+                            dashboardCapacityLabel(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue)
                         }
                     }
-                    HStack {
-                        Label(formatBytes(item.uploaded), systemImage: "arrow.up")
-                            .foregroundStyle(HarvestTheme.green)
-                        Spacer()
-                        Label(formatBytes(item.downloaded), systemImage: "arrow.down")
-                            .foregroundStyle(HarvestTheme.blue)
+                    .padding(.horizontal, 10)
+                    .frame(height: DashboardListLayout.siteRowHeight)
+                    .overlay(alignment: .bottom) {
+                        if index < items.count - 1 { Divider().padding(.leading, 10) }
                     }
-                    .font(.caption.monospacedDigit())
                 }
-                if item.id != visibleItems.last?.id { Divider() }
             }
         }
-        .cardSurface()
+    }
+
+    private func dashboardCapacityLabel(_ value: Double, icon: String, color: Color) -> some View {
+        Label(dashboardCompactBytes(value), systemImage: icon)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .frame(maxWidth: .infinity, alignment: icon == "arrow.up" ? .leading : .trailing)
     }
 }
 
 private struct DashboardIncrementRankingView: View {
     let items: [DashboardSiteIncrementItem]
     let days: Int
-    let limit: Int
     let privacy: Bool
-
-    private var visibleItems: [DashboardSiteIncrementItem] { Array(items.prefix(max(1, limit))) }
-    private var maximum: Double {
-        max(visibleItems.map { max($0.uploaded, $0.downloaded) }.max() ?? 1, 1)
-    }
 
     private var rangeLabel: String {
         days == 1 ? "当日增量排行" : "近 \(days) 天增量排行"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            SectionHeader(title: rangeLabel, subtitle: "上传与下载前 \(visibleItems.count) 个站点")
-            if visibleItems.isEmpty {
-                Text("暂无增量数据").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 72)
-            } else {
-                ForEach(visibleItems) { item in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(privacy ? "••••" : item.name).font(.caption.weight(.semibold)).lineLimit(1)
-                        dashboardIncrementBar(label: "上传", value: item.uploaded, color: HarvestTheme.green)
-                        dashboardIncrementBar(label: "下载", value: item.downloaded, color: HarvestTheme.blue)
+        DashboardScrollableModule(
+            title: rangeLabel,
+            subtitle: "按上传与下载总量排序",
+            itemCount: items.count,
+            rowHeight: DashboardListLayout.incrementRowHeight
+        ) {
+            LazyVStack(spacing: 0) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(privacy ? "••••" : item.name)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        HStack(spacing: 12) {
+                            incrementMetric(item.uploaded, icon: "arrow.up", color: HarvestTheme.green, alignment: .leading)
+                            incrementMetric(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue, alignment: .trailing)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: DashboardListLayout.incrementRowHeight)
+                    .overlay(alignment: .bottom) {
+                        if index < items.count - 1 { Divider().padding(.leading, 10) }
                     }
                 }
             }
         }
-        .cardSurface()
     }
 
-    private func dashboardIncrementBar(label: String, value: Double, color: Color) -> some View {
-        HStack(spacing: 8) {
-            Text(label).frame(width: 28, alignment: .leading)
-            ProgressView(value: value, total: maximum).tint(color)
-            Text(formatBytes(value)).monospacedDigit().frame(minWidth: 72, alignment: .trailing)
-        }
-        .font(.caption2)
-        .foregroundStyle(.secondary)
+    private func incrementMetric(_ value: Double, icon: String, color: Color, alignment: Alignment) -> some View {
+        Label(dashboardCompactBytes(value), systemImage: icon)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .frame(maxWidth: .infinity, alignment: alignment)
     }
 }
 
@@ -1967,7 +2091,7 @@ private enum DashboardMonthlyMetric: Equatable {
 
     func format(_ value: Double) -> String {
         switch self {
-        case .upload, .download: formatBytes(value)
+        case .upload, .download: dashboardCompactBytes(value)
         case .publish: "\(formatCompactNumber(value)) 个"
         }
     }
@@ -2003,7 +2127,7 @@ private struct DashboardMonthlyMetricView: View {
                     AxisGridLine().foregroundStyle(.quaternary)
                     AxisValueLabel {
                         if let number = value.as(Double.self) {
-                            Text(metric == .publish ? formatCompactNumber(number) : formatBytes(number)).font(.caption2)
+                            Text(metric == .publish ? formatCompactNumber(number) : dashboardCompactBytes(number)).font(.caption2)
                         }
                     }
                 }
@@ -2027,25 +2151,162 @@ private struct DashboardMonthlyMetricView: View {
     }
 }
 
-struct DistributionView: View {
+private enum DashboardDistributionMetric {
+    case count
+    case bytes(DashboardDistributionByteKind)
+
+    var color: Color {
+        switch self {
+        case .count: HarvestTheme.coral
+        case .bytes(.upload): HarvestTheme.green
+        case .bytes(.download): HarvestTheme.blue
+        case .bytes(.seed): HarvestTheme.amber
+        }
+    }
+
+    var icon: String? {
+        switch self {
+        case .count: nil
+        case .bytes(.upload): "arrow.up"
+        case .bytes(.download): "arrow.down"
+        case .bytes(.seed): "externaldrive.fill"
+        }
+    }
+
+    func format(_ value: Double) -> String {
+        switch self {
+        case .count: formatCompactNumber(value)
+        case .bytes: dashboardCompactBytes(value)
+        }
+    }
+}
+
+private enum DashboardDistributionByteKind {
+    case upload
+    case download
+    case seed
+}
+
+private struct DistributionView: View {
     let title: String
     let items: [DashboardDistributionItem]
-    let limit: Int
+    let metric: DashboardDistributionMetric
     let privacy: Bool
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: title, subtitle: "前 \(min(max(1, limit), items.count)) 项")
+        DashboardScrollableModule(
+            title: title,
+            subtitle: "按数值从高到低排序",
+            itemCount: items.count,
+            rowHeight: DashboardListLayout.distributionRowHeight
+        ) {
             let maximum = max(items.map(\.value).max() ?? 1, 1)
-            ForEach(items.prefix(max(1, limit))) { item in
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack { Text(privacy ? "••••" : item.name).lineLimit(1); Spacer(); Text(formatCompactNumber(item.value)).monospacedDigit() }
-                        .font(.caption)
-                    ProgressView(value: item.value, total: maximum).tint(HarvestTheme.green)
+            LazyVStack(spacing: 0) {
+                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 10) {
+                            Text(privacy ? "••••" : item.name)
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            HStack(spacing: 4) {
+                                if let icon = metric.icon { Image(systemName: icon) }
+                                Text(metric.format(item.value))
+                            }
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(metric.color)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.68)
+                            .frame(width: 104, alignment: .trailing)
+                        }
+                        ProgressView(value: item.value, total: maximum)
+                            .tint(metric.color)
+                            .scaleEffect(x: 1, y: 0.72, anchor: .center)
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: DashboardListLayout.distributionRowHeight)
+                    .overlay(alignment: .bottom) {
+                        if index < items.count - 1 { Divider().padding(.leading, 10) }
+                    }
                 }
+            }
+        }
+    }
+}
+
+private struct DashboardScrollableModule<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let itemCount: Int
+    let rowHeight: CGFloat
+    let content: Content
+
+    init(
+        title: String,
+        subtitle: String,
+        itemCount: Int,
+        rowHeight: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.itemCount = itemCount
+        self.rowHeight = rowHeight
+        self.content = content()
+    }
+
+    private var visibleRowCount: Int { min(max(itemCount, 1), DashboardListLayout.visibleRows) }
+    private var viewportHeight: CGFloat { CGFloat(visibleRowCount) * rowHeight }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.title3.weight(.bold))
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                }
+                Spacer(minLength: 4)
+                Text("\(itemCount) 项")
+                    .font(.caption2.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.primary.opacity(0.06), in: Capsule())
+            }
+
+            ScrollView(.vertical) {
+                content
+            }
+            .frame(height: viewportHeight)
+            .scrollDisabled(itemCount <= DashboardListLayout.visibleRows)
+            .scrollIndicators(itemCount > DashboardListLayout.visibleRows ? .visible : .hidden)
+            .scrollBounceBehavior(.basedOnSize)
+            .background(Color(uiColor: .tertiarySystemGroupedBackground).opacity(0.66))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06))
             }
         }
         .cardSurface()
     }
+}
+
+private func dashboardCompactBytes(_ bytes: Double) -> String {
+    guard bytes.isFinite, bytes > 0 else { return "0 KB" }
+    let units = ["KB", "MB", "GB", "TB", "PB", "EB"]
+    var value = max(bytes, 0) / 1_024
+    var unitIndex = 0
+    while value >= 1_024, unitIndex < units.count - 1 {
+        value /= 1_024
+        unitIndex += 1
+    }
+    let format = value >= 100 ? "%.0f %@" : value >= 10 ? "%.1f %@" : "%.2f %@"
+    return String(format: format, value, units[unitIndex])
 }
 
 private struct DashboardSettingsSheet: View {
@@ -2057,7 +2318,6 @@ private struct DashboardSettingsSheet: View {
     @Binding var serverResourceInterval: Int
     @Binding var serverResourceDuration: Int
     @Binding var chartHeight: Double
-    @Binding var itemLimit: Int
     @Binding var moduleOrderRaw: String
     let moduleVisibilityBindings: [DashboardModule: Binding<Bool>]
     @State private var modules: [DashboardModule]
@@ -2069,7 +2329,12 @@ private struct DashboardSettingsSheet: View {
     @State private var draftServerResourceInterval: Int
     @State private var draftServerResourceDuration: Int
     @State private var draftChartHeight: Double
-    @State private var draftItemLimit: Int
+    @State private var isEditingModules = false
+
+    private let moduleColumns = [
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8)
+    ]
 
     init(
         trendDays: Binding<Int>,
@@ -2079,7 +2344,6 @@ private struct DashboardSettingsSheet: View {
         serverResourceInterval: Binding<Int>,
         serverResourceDuration: Binding<Int>,
         chartHeight: Binding<Double>,
-        itemLimit: Binding<Int>,
         moduleOrderRaw: Binding<String>,
         moduleVisibilityBindings: [DashboardModule: Binding<Bool>]
     ) {
@@ -2090,7 +2354,6 @@ private struct DashboardSettingsSheet: View {
         _serverResourceInterval = serverResourceInterval
         _serverResourceDuration = serverResourceDuration
         _chartHeight = chartHeight
-        _itemLimit = itemLimit
         _moduleOrderRaw = moduleOrderRaw
         self.moduleVisibilityBindings = moduleVisibilityBindings
         _modules = State(initialValue: DashboardModule.decode(moduleOrderRaw.wrappedValue))
@@ -2102,7 +2365,6 @@ private struct DashboardSettingsSheet: View {
         _draftServerResourceInterval = State(initialValue: serverResourceInterval.wrappedValue)
         _draftServerResourceDuration = State(initialValue: serverResourceDuration.wrappedValue)
         _draftChartHeight = State(initialValue: chartHeight.wrappedValue)
-        _draftItemLimit = State(initialValue: itemLimit.wrappedValue)
     }
 
     var body: some View {
@@ -2111,7 +2373,7 @@ private struct DashboardSettingsSheet: View {
                 Section("趋势") {
                     Picker("数据天数", selection: $draftTrendDays) { ForEach([1, 7, 14, 30, 60, 90, 180], id: \.self) { Text($0 == 1 ? "今日" : "\($0) 天").tag($0) } }
                 }
-                Section("图表尺寸") {
+                Section("图表与列表") {
                     LabeledContent("图表高度", value: "\(Int(draftChartHeight)) pt")
                     Slider(value: $draftChartHeight, in: DashboardChartDefaults.heightRange, step: 20) {
                         Text("图表高度")
@@ -2120,11 +2382,7 @@ private struct DashboardSettingsSheet: View {
                     } maximumValueLabel: {
                         Text("480").font(.caption2)
                     }
-                    Stepper(
-                        "站点显示数量：\(draftItemLimit)",
-                        value: $draftItemLimit,
-                        in: DashboardChartDefaults.itemCountRange
-                    )
+                    LabeledContent("列表可视行数", value: "10")
                     Button { resetChartSizing() } label: {
                         Label("恢复默认尺寸", systemImage: "arrow.counterclockwise")
                     }
@@ -2161,18 +2419,27 @@ private struct DashboardSettingsSheet: View {
                 Section("卡片顺序与显示") {
                     LabeledContent("已显示", value: "\(visibleModuleCount) / \(modules.count)")
                         .foregroundStyle(.secondary)
-                    ForEach(modules) { module in
-                        Toggle(isOn: visibilityBinding(for: module)) {
-                            Label(module.title, systemImage: module.icon)
+                    LazyVGrid(columns: moduleColumns, spacing: 8) {
+                        ForEach(Array(modules.enumerated()), id: \.element.id) { index, module in
+                            moduleTile(module, at: index)
                         }
                     }
-                    .onMove(perform: moveModules)
-                    HStack(spacing: 12) {
-                        Button("全部显示") { setAllModulesVisible(true) }
-                            .frame(maxWidth: .infinity)
-                        Divider()
-                        Button("全部隐藏") { setAllModulesVisible(false) }
-                            .frame(maxWidth: .infinity)
+                    .padding(.vertical, 4)
+                    HStack(spacing: 8) {
+                        Button {
+                            setAllModulesVisible(true)
+                        } label: {
+                            Label("全部显示", systemImage: "eye")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        Button {
+                            setAllModulesVisible(false)
+                        } label: {
+                            Label("全部隐藏", systemImage: "eye.slash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
                     }
                     Button {
                         resetModules()
@@ -2185,11 +2452,78 @@ private struct DashboardSettingsSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItemGroup(placement: .confirmationAction) {
-                    EditButton()
+                    Button(isEditingModules ? "完成" : "编辑") {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isEditingModules.toggle()
+                        }
+                    }
                     Button("保存") { save() }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func moduleTile(_ module: DashboardModule, at index: Int) -> some View {
+        if isEditingModules {
+            HStack(spacing: 7) {
+                moduleLabel(module)
+                Spacer(minLength: 2)
+                VStack(spacing: 2) {
+                    moduleMoveButton(systemImage: "chevron.up", module: module, index: index, offset: -1)
+                    moduleMoveButton(systemImage: "chevron.down", module: module, index: index, offset: 1)
+                }
+            }
+            .dashboardModuleTileSurface()
+        } else {
+            Button {
+                moduleVisibility[module] = !(moduleVisibility[module] ?? true)
+            } label: {
+                HStack(spacing: 7) {
+                    moduleLabel(module)
+                    Spacer(minLength: 2)
+                    Image(systemName: (moduleVisibility[module] ?? true) ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle((moduleVisibility[module] ?? true) ? Color.accentColor : Color.secondary)
+                }
+                .dashboardModuleTileSurface()
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(module.title)
+            .accessibilityValue((moduleVisibility[module] ?? true) ? "显示" : "隐藏")
+        }
+    }
+
+    private func moduleLabel(_ module: DashboardModule) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: module.icon)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 18)
+            Text(module.title)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func moduleMoveButton(
+        systemImage: String,
+        module: DashboardModule,
+        index: Int,
+        offset: Int
+    ) -> some View {
+        Button {
+            moveModule(at: index, by: offset)
+        } label: {
+            Image(systemName: systemImage)
+                .font(.system(size: 11, weight: .bold))
+                .frame(width: 24, height: 20)
+        }
+        .buttonStyle(.borderless)
+        .disabled(index + offset < modules.startIndex || index + offset >= modules.endIndex)
+        .accessibilityLabel("将\(module.title)\(offset < 0 ? "前移" : "后移")")
     }
 
     private func visibilityBinding(for module: DashboardModule) -> Binding<Bool> {
@@ -2199,8 +2533,12 @@ private struct DashboardSettingsSheet: View {
         )
     }
 
-    private func moveModules(from source: IndexSet, to destination: Int) {
-        modules.move(fromOffsets: source, toOffset: destination)
+    private func moveModule(at index: Int, by offset: Int) {
+        let destination = index + offset
+        guard modules.indices.contains(index), modules.indices.contains(destination) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            modules.swapAt(index, destination)
+        }
     }
 
     private func resetModules() {
@@ -2226,7 +2564,6 @@ private struct DashboardSettingsSheet: View {
 
     private func resetChartSizing() {
         draftChartHeight = DashboardChartDefaults.height
-        draftItemLimit = DashboardChartDefaults.itemCount
     }
 
     private func save() {
@@ -2237,12 +2574,29 @@ private struct DashboardSettingsSheet: View {
         serverResourceInterval = draftServerResourceInterval
         serverResourceDuration = draftServerResourceDuration
         chartHeight = draftChartHeight
-        itemLimit = draftItemLimit
         moduleOrderRaw = DashboardModule.encode(modules)
         for (module, binding) in moduleVisibilityBindings {
             binding.wrappedValue = moduleVisibility[module] ?? true
         }
         dismiss()
+    }
+}
+
+private extension View {
+    func dashboardModuleTileSurface() -> some View {
+        self
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                Color(uiColor: .secondarySystemGroupedBackground),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(Color.primary.opacity(0.07), lineWidth: 0.5)
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
@@ -2253,10 +2607,9 @@ private struct DashboardShareContent: View {
     let authorizationError: String?
     let serverPoint: DashboardServerPoint?
     let rangeDays: Int
-    let itemLimit: Int
     let privacy: Bool
 
-    private var shareItemLimit: Int { min(max(itemLimit, 1), 15) }
+    private let shareItemLimit = DashboardListLayout.visibleRows
 
     private var username: String {
         guard let profile else { return "未登录" }
@@ -2298,12 +2651,12 @@ private struct DashboardShareContent: View {
                 shareMetric("称号进度", designation, HarvestTheme.coral, detail: "\(snapshot.siteCount) 个站点接入")
             }
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
-                shareMetric("总上传", privacy ? "••••" : formatBytes(snapshot.uploaded), HarvestTheme.green)
-                shareMetric("总下载", privacy ? "••••" : formatBytes(snapshot.downloaded), HarvestTheme.blue)
-                shareMetric("做种体积", privacy ? "••••" : formatBytes(snapshot.seedVolume), HarvestTheme.amber)
+                shareMetric("总上传", privacy ? "••••" : dashboardCompactBytes(snapshot.uploaded), HarvestTheme.green)
+                shareMetric("总下载", privacy ? "••••" : dashboardCompactBytes(snapshot.downloaded), HarvestTheme.blue)
+                shareMetric("做种体积", privacy ? "••••" : dashboardCompactBytes(snapshot.seedVolume), HarvestTheme.amber)
                 shareMetric("站点", "\(snapshot.siteCount)", HarvestTheme.coral)
-                shareMetric("今日上传", privacy ? "••••" : formatBytes(snapshot.todayUploaded), HarvestTheme.green)
-                shareMetric("今日下载", privacy ? "••••" : formatBytes(snapshot.todayDownloaded), HarvestTheme.blue)
+                shareMetric("今日上传", privacy ? "••••" : dashboardCompactBytes(snapshot.todayUploaded), HarvestTheme.green)
+                shareMetric("今日下载", privacy ? "••••" : dashboardCompactBytes(snapshot.todayDownloaded), HarvestTheme.blue)
                 shareMetric("做种数", "\(snapshot.seeding)", HarvestTheme.amber)
                 shareMetric("发种 / 下载中", "\(snapshot.published) / \(snapshot.leeching)", HarvestTheme.coral)
             }
@@ -2326,7 +2679,7 @@ private struct DashboardShareContent: View {
                     AxisMarks(position: .leading) { value in
                         AxisGridLine().foregroundStyle(.quaternary)
                         AxisValueLabel {
-                            if let number = value.as(Double.self) { Text(formatBytes(number)).font(.caption2) }
+                            if let number = value.as(Double.self) { Text(dashboardCompactBytes(number)).font(.caption2) }
                         }
                     }
                 }
@@ -2341,8 +2694,8 @@ private struct DashboardShareContent: View {
                         HStack(spacing: 16) {
                             Text(privacy ? "••••" : item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
                             Spacer()
-                            Label(formatBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
-                            Label(formatBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
+                            Label(dashboardCompactBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green)
+                            Label(dashboardCompactBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue)
                             Label(formatCompactNumber(item.published), systemImage: "paperplane").foregroundStyle(HarvestTheme.coral)
                         }
                         .font(.caption.monospacedDigit())
@@ -2360,7 +2713,7 @@ private struct DashboardShareContent: View {
                     ForEach(increments.prefix(shareItemLimit)) { item in
                         VStack(alignment: .leading, spacing: 7) {
                             Text(privacy ? "••••" : item.name).font(.subheadline.weight(.semibold)).lineLimit(1)
-                            HStack { Label(formatBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green); Spacer(); Label(formatBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue) }
+                            HStack { Label(dashboardCompactBytes(item.uploaded), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green); Spacer(); Label(dashboardCompactBytes(item.downloaded), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue) }
                                 .font(.caption.monospacedDigit())
                         }
                         .padding(14)
@@ -2368,19 +2721,19 @@ private struct DashboardShareContent: View {
                     }
                 }
             }
-            let distributions: [(String, [DashboardDistributionItem], Color)] = [
-                ("站点上传分布", snapshot.siteUploadDistribution, HarvestTheme.green),
-                ("站点下载分布", snapshot.siteDownloadDistribution, HarvestTheme.blue),
-                ("做种分布", snapshot.seedDistribution, HarvestTheme.amber),
-                ("用户名分布", snapshot.usernameDistribution, HarvestTheme.coral),
-                ("邮箱分布", snapshot.emailDistribution, HarvestTheme.blue)
+            let distributions: [(String, [DashboardDistributionItem], DashboardDistributionMetric)] = [
+                ("站点上传分布", snapshot.siteUploadDistribution, .bytes(.upload)),
+                ("站点下载分布", snapshot.siteDownloadDistribution, .bytes(.download)),
+                ("做种分布", snapshot.seedDistribution, .bytes(.seed)),
+                ("用户名分布", snapshot.usernameDistribution, .count),
+                ("邮箱分布", snapshot.emailDistribution, .count)
             ]
             if distributions.contains(where: { !$0.1.isEmpty }) {
                 shareSectionTitle("数据分布", subtitle: "各项前 \(shareItemLimit) 名")
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
                     ForEach(Array(distributions.enumerated()), id: \.offset) { _, distribution in
                         if !distribution.1.isEmpty {
-                            shareDistribution(distribution.0, items: distribution.1, color: distribution.2)
+                            shareDistribution(distribution.0, items: distribution.1, metric: distribution.2)
                         }
                     }
                 }
@@ -2421,15 +2774,19 @@ private struct DashboardShareContent: View {
         shareMetric(label, value, color, detail: detail)
     }
 
-    private func shareDistribution(_ title: String, items: [DashboardDistributionItem], color: Color) -> some View {
+    private func shareDistribution(
+        _ title: String,
+        items: [DashboardDistributionItem],
+        metric: DashboardDistributionMetric
+    ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.headline)
             let maximum = max(items.map(\.value).max() ?? 1, 1)
             ForEach(items.prefix(shareItemLimit)) { item in
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack { Text(privacy ? "••••" : item.name).lineLimit(1); Spacer(); Text(formatCompactNumber(item.value)).monospacedDigit() }
+                    HStack { Text(privacy ? "••••" : item.name).lineLimit(1); Spacer(); Text(metric.format(item.value)).monospacedDigit() }
                         .font(.caption)
-                    ProgressView(value: item.value, total: maximum).tint(color)
+                    ProgressView(value: item.value, total: maximum).tint(metric.color)
                 }
             }
         }
@@ -2457,7 +2814,7 @@ private struct DashboardShareContent: View {
                     AxisGridLine().foregroundStyle(.quaternary)
                     AxisValueLabel {
                         if let number = value.as(Double.self) {
-                            Text(metric == .publish ? formatCompactNumber(number) : formatBytes(number)).font(.caption2)
+                            Text(metric == .publish ? formatCompactNumber(number) : dashboardCompactBytes(number)).font(.caption2)
                         }
                     }
                 }

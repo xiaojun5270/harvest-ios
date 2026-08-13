@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import ImageIO
 import SwiftUI
 import UIKit
@@ -8,6 +9,7 @@ actor RemoteImageDataCache {
 
     private let memoryCache: NSCache<NSString, NSData>
     private let diskCache: URLCache
+    private let persistentImageDirectory: URL?
     private let session: URLSession
     private let privateSession: URLSession
     private var inFlight: [String: Task<Data, Error>] = [:]
@@ -39,13 +41,27 @@ actor RemoteImageDataCache {
         privateConfiguration.waitsForConnectivity = true
         privateConfiguration.httpShouldSetCookies = false
         privateConfiguration.httpCookieStorage = nil
+        let persistentDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("HarvestPersistentImages", isDirectory: true)
+        if let persistentDirectory {
+            try? FileManager.default.createDirectory(
+                at: persistentDirectory,
+                withIntermediateDirectories: true
+            )
+        }
         memoryCache = memory
         diskCache = cache
+        persistentImageDirectory = persistentDirectory
         session = publicSession
         privateSession = URLSession(configuration: privateConfiguration)
     }
 
-    func data(for url: URL, headers: [String: String] = [:]) async throws -> Data {
+    func data(
+        for url: URL,
+        headers: [String: String] = [:],
+        persistentCacheID: String? = nil
+    ) async throws -> Data {
         guard let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else {
             throw APIError(statusCode: 0, message: "图片地址无效")
         }
@@ -53,7 +69,14 @@ actor RemoteImageDataCache {
         let key = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
         let cacheKey = key as NSString
         if let cached = memoryCache.object(forKey: cacheKey) {
+            if let persistentCacheID {
+                storePersistentData(cached as Data, for: persistentCacheID)
+            }
             return cached as Data
+        }
+        if let persistentCacheID, let cached = persistentData(for: persistentCacheID) {
+            memoryCache.setObject(cached as NSData, forKey: cacheKey, cost: cached.count)
+            return cached
         }
 
         let persistToDisk = isPublicCacheURL(normalizedURL) && !hasSensitiveImageHeaders(effectiveHeaders)
@@ -69,12 +92,21 @@ actor RemoteImageDataCache {
             } ?? true
             let isNotHTML = !((cached.response.mimeType ?? "").lowercased().contains("html"))
             if isSuccessful, isNotHTML, !cached.data.isEmpty {
+                if let persistentCacheID {
+                    storePersistentData(cached.data, for: persistentCacheID)
+                }
                 memoryCache.setObject(cached.data as NSData, forKey: cacheKey, cost: cached.data.count)
                 return cached.data
             }
             request.cachePolicy = .reloadIgnoringLocalCacheData
         }
-        if let task = inFlight[key] { return try await task.value }
+        if let task = inFlight[key] {
+            let data = try await task.value
+            if let persistentCacheID {
+                storePersistentData(data, for: persistentCacheID)
+            }
+            return data
+        }
 
         let task = Task<Data, Error> {
             let activeSession = persistToDisk ? session : privateSession
@@ -92,6 +124,9 @@ actor RemoteImageDataCache {
             if persistToDisk {
                 let cached = CachedURLResponse(response: response, data: data, storagePolicy: .allowed)
                 diskCache.storeCachedResponse(cached, for: request)
+            }
+            if let persistentCacheID {
+                storePersistentData(data, for: persistentCacheID)
             }
             memoryCache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
             return data
@@ -112,8 +147,41 @@ actor RemoteImageDataCache {
         inFlight.removeAll()
         memoryCache.removeAllObjects()
         diskCache.removeAllCachedResponses()
+        if let persistentImageDirectory {
+            try? FileManager.default.removeItem(at: persistentImageDirectory)
+            try? FileManager.default.createDirectory(
+                at: persistentImageDirectory,
+                withIntermediateDirectories: true
+            )
+        }
         RemoteDecodedImageCache.shared.removeAll()
         RemoteAnimatedImageCache.shared.removeAll()
+    }
+
+    func persistentData(for cacheID: String) -> Data? {
+        guard let url = persistentFileURL(for: cacheID),
+              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              data.count <= 20 * 1_024 * 1_024 else { return nil }
+        return data
+    }
+
+    func removePersistentData(for cacheID: String) {
+        guard let url = persistentFileURL(for: cacheID) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func storePersistentData(_ data: Data, for cacheID: String) {
+        guard let url = persistentFileURL(for: cacheID) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func persistentFileURL(for cacheID: String) -> URL? {
+        guard !cacheID.isEmpty, let persistentImageDirectory else { return nil }
+        let digest = SHA256.hash(data: Data(cacheID.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return persistentImageDirectory.appendingPathComponent(digest, isDirectory: false)
     }
 
     private func isPublicCacheURL(_ url: URL) -> Bool {
@@ -440,10 +508,16 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
 struct RemoteImageCandidate: Identifiable {
     let url: URL
     let headers: [String: String]
+    let persistentCacheID: String?
 
-    init(url: URL, headers: [String: String] = [:]) {
+    init(
+        url: URL,
+        headers: [String: String] = [:],
+        persistentCacheID: String? = nil
+    ) {
         self.url = url
         self.headers = headers
+        self.persistentCacheID = persistentCacheID
     }
 
     var id: String {
@@ -534,6 +608,11 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
     @MainActor private func loadCurrentCandidate() async {
         loadedImage = nil
         guard candidateIndex < candidates.count else { return }
+
+        if candidateIndex == 0, await loadFirstPersistedCandidate() {
+            return
+        }
+
         let candidate = candidates[candidateIndex]
         guard let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
             advanceCandidate()
@@ -548,7 +627,11 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
         }
 
         do {
-            let data = try await RemoteImageDataCache.shared.data(for: normalizedURL, headers: effectiveHeaders)
+            let data = try await RemoteImageDataCache.shared.data(
+                for: normalizedURL,
+                headers: effectiveHeaders,
+                persistentCacheID: candidate.persistentCacheID
+            )
             guard !Task.isCancelled else { return }
             let pixelSize = maximumPixelSize
             let decoded = await Task.detached(priority: .utility) {
@@ -568,6 +651,36 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
 
     private func advanceCandidate() {
         candidateIndex = min(candidateIndex + 1, candidates.count)
+    }
+
+    @MainActor private func loadFirstPersistedCandidate() async -> Bool {
+        for candidate in candidates {
+            guard let persistentCacheID = candidate.persistentCacheID,
+                  let data = await RemoteImageDataCache.shared.persistentData(for: persistentCacheID),
+                  let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
+                continue
+            }
+            let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
+            let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+            let decodedCacheKey = "\(dataCacheKey)|animated|\(Int(maximumPixelSize.rounded(.up)))"
+            if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
+                loadedImage = cached
+                return true
+            }
+            let pixelSize = maximumPixelSize
+            let decoded = await Task.detached(priority: .utility) {
+                RemoteAnimatedImage(data: data, cacheKey: decodedCacheKey, maximumPixelSize: pixelSize)
+            }.value
+            guard !Task.isCancelled else { return false }
+            guard let decoded else {
+                await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
+                continue
+            }
+            RemoteAnimatedImageCache.shared.insert(decoded, for: decodedCacheKey)
+            loadedImage = decoded
+            return true
+        }
+        return false
     }
 }
 
@@ -1015,11 +1128,22 @@ struct MainShellView: View {
     @State private var showingAppUpdate = false
     @State private var availableAppUpdate: String?
     @State private var handledNoticePresentation = 0
+    @State private var lastNonSearchTab = 2
+
+    private var showsNewsTab: Bool {
+        appState.mediaTMDBEnabled || appState.mediaDoubanEnabled
+    }
+
+    private var defaultContentTab: Int {
+        appState.profile?.isSuperuser == true ? 2 : 3
+    }
 
     var body: some View {
         NavigationStack {
             TabView(selection: $appState.selectedTab) {
-                NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
+                if showsNewsTab {
+                    NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
+                }
                 if appState.profile?.isSuperuser == true {
                     SitesView().tabItem { Label("站点", systemImage: "globe.asia.australia.fill") }.tag(1)
                     DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
@@ -1028,10 +1152,16 @@ struct MainShellView: View {
                 if appState.profile?.isSuperuser == true {
                     TasksView().tabItem { Label("任务", systemImage: "checklist") }.tag(4)
                 }
-                SearchView().tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }.tag(5)
+                SearchView {
+                    appState.selectedTab = lastNonSearchTab
+                }
+                .tabItem { Label("搜索", systemImage: "magnifyingglass.circle.fill") }
+                .tag(5)
             }
             .harvestNavigationChrome()
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
+            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .tabBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     BrandMark(size: 28)
@@ -1122,12 +1252,99 @@ struct MainShellView: View {
         .onChange(of: appState.noticePresentationGeneration) { _, _ in
             presentPendingNoticeIfNeeded()
         }
+        .onChange(of: showsNewsTab) { _, isVisible in
+            guard !isVisible else { return }
+            if appState.selectedTab == 0 {
+                appState.selectedTab = defaultContentTab
+            }
+            if lastNonSearchTab == 0 {
+                lastNonSearchTab = defaultContentTab
+            }
+        }
+        .onChange(of: appState.selectedTab) { oldValue, newValue in
+            if newValue == 5, oldValue != 5 {
+                lastNonSearchTab = oldValue == 0 && !showsNewsTab ? defaultContentTab : oldValue
+            } else if newValue != 5 {
+                lastNonSearchTab = newValue
+            }
+        }
     }
 
     private func presentPendingNoticeIfNeeded() {
         guard appState.noticePresentationGeneration != handledNoticePresentation else { return }
         handledNoticePresentation = appState.noticePresentationGeneration
         showingNotices = true
+    }
+}
+
+struct ManualTaskFeedbackOverlay: View {
+    let feedback: ManualTaskFeedback
+
+    private var color: Color {
+        switch feedback.phase {
+        case .running: HarvestTheme.blue
+        case .success: HarvestTheme.green
+        case .failure: HarvestTheme.coral
+        case .cancelled: .secondary
+        }
+    }
+
+    private var icon: String {
+        switch feedback.phase {
+        case .running: "arrow.triangle.2.circlepath"
+        case .success: "checkmark"
+        case .failure: "exclamationmark"
+        case .cancelled: "xmark"
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.16)
+                .ignoresSafeArea()
+
+            VStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(color.opacity(0.13))
+                        .frame(width: 58, height: 58)
+                    if feedback.phase == .running {
+                        ProgressView()
+                            .controlSize(.large)
+                            .tint(color)
+                    }
+                    if feedback.phase != .running {
+                        Image(systemName: icon)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundStyle(color)
+                    }
+                }
+
+                VStack(spacing: 5) {
+                    Text(feedback.title)
+                        .font(.headline)
+                        .multilineTextAlignment(.center)
+                    if let message = feedback.message, !message.isEmpty {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                }
+            }
+            .frame(minWidth: 172, maxWidth: 260)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 22)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08))
+            }
+            .shadow(color: .black.opacity(0.16), radius: 24, y: 10)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(feedback.phase == .running ? .updatesFrequently : [])
+        }
+        .allowsHitTesting(feedback.phase == .running)
     }
 }
 

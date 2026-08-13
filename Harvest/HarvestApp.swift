@@ -89,6 +89,12 @@ struct RootView: View {
             UserDefaults.standard.removeObject(forKey: "notifications.openPending")
             appState.noticePresentationGeneration &+= 1
         }
+        .onAppear {
+            ManualTaskFeedbackWindow.shared.update(appState.manualTaskFeedback)
+        }
+        .onChange(of: appState.manualTaskFeedback) { _, feedback in
+            ManualTaskFeedbackWindow.shared.update(feedback)
+        }
         .alert("请求失败", isPresented: Binding(
             get: { appState.presentedError != nil },
             set: { if !$0 { appState.presentedError = nil } }
@@ -97,6 +103,42 @@ struct RootView: View {
         } message: {
             Text(appState.presentedError ?? "未知错误")
         }
+    }
+}
+
+@MainActor
+private final class ManualTaskFeedbackWindow {
+    static let shared = ManualTaskFeedbackWindow()
+
+    private var window: UIWindow?
+    private var hostingController: UIHostingController<ManualTaskFeedbackOverlay>?
+
+    func update(_ feedback: ManualTaskFeedback?) {
+        guard let feedback else {
+            window?.isHidden = true
+            hostingController = nil
+            window = nil
+            return
+        }
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })
+            ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else {
+            return
+        }
+
+        let controller = UIHostingController(rootView: ManualTaskFeedbackOverlay(feedback: feedback))
+        controller.view.backgroundColor = .clear
+        if window?.windowScene !== scene {
+            let overlayWindow = UIWindow(windowScene: scene)
+            overlayWindow.windowLevel = .alert + 1
+            overlayWindow.backgroundColor = .clear
+            window = overlayWindow
+        }
+        hostingController = controller
+        window?.rootViewController = controller
+        window?.isUserInteractionEnabled = feedback.phase == .running
+        window?.isHidden = false
     }
 }
 

@@ -231,7 +231,7 @@ private enum SiteFilterStorageKey {
     static let ascending = "site.filter.ascending"
 }
 
-private enum SiteLevelMilestone {
+enum SiteLevelMilestone {
     case keepAccount
     case graduation
 }
@@ -409,9 +409,9 @@ final class SitesViewModel: ObservableObject {
             .filter { !$0.isEmpty }
             .sorted()
     }
-    var filteredActiveSiteCount: Int { filtered.lazy.filter(\.enabled).count }
-    var filteredPendingSignInCount: Int { filtered.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
-    var filteredUnreadCount: Int { filtered.reduce(0) { $0 + $1.unread } }
+    var activeSiteCount: Int { sites.lazy.filter(\.enabled).count }
+    var pendingSignInCount: Int { sites.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
+    var unreadCount: Int { sites.reduce(0) { $0 + $1.unread } }
     var activeFilterCount: Int {
         var count = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 1
         if availability != .alive { count += 1 }
@@ -450,6 +450,32 @@ final class SitesViewModel: ObservableObject {
         }
         sortField = field
         ascending = field.defaultAscending
+    }
+
+    func showActiveSites() {
+        clearSummaryConflictingFilters()
+        availability = .alive
+        condition = .all
+    }
+
+    func showPendingSignInSites() {
+        clearSummaryConflictingFilters()
+        availability = .alive
+        condition = .unsigned
+    }
+
+    func showUnreadSites() {
+        clearSummaryConflictingFilters()
+        availability = .all
+        condition = .hasNewNotification
+    }
+
+    private func clearSummaryConflictingFilters() {
+        query = ""
+        selectedTags = []
+        selectedTypes = []
+        selectedUsername = ""
+        selectedEmail = ""
     }
 
     func levelRules(for site: SiteItem) -> Any? {
@@ -498,8 +524,24 @@ final class SitesViewModel: ObservableObject {
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
-        if await appState.perform(path + "\(site.id)", method: .get) {
+        let title: String
+        let successMessage: String
+        if path == APIPath.siteSign {
+            title = "正在为\(site.name)签到"
+            successMessage = "\(site.name)签到完成"
+        } else if path == APIPath.siteRepeat {
+            title = "正在为\(site.name)辅种"
+            successMessage = "\(site.name)辅种任务已提交"
+        } else {
+            title = "正在刷新\(site.name)"
+            successMessage = "\(site.name)数据已更新"
+        }
+        _ = await appState.runManualTask(title: title, successMessage: successMessage) {
+            guard await appState.perform(path + "\(site.id)", method: .get, showsFeedback: false) else {
+                return false
+            }
             await load(appState, cached: false)
+            return appState.presentedError == nil
         }
     }
 
@@ -563,13 +605,20 @@ final class SitesViewModel: ObservableObject {
                 let relative = "local/icons/\(urlPathSegment(siteName)).\(fileExtension)"
                 guard let url = URL(string: relative, relativeTo: serverURL)?.absoluteURL else { continue }
                 if seen.insert(url.absoluteString).inserted {
-                    candidates.append(RemoteImageCandidate(url: url, headers: headers))
+                    candidates.append(RemoteImageCandidate(
+                        url: url,
+                        headers: headers,
+                        persistentCacheID: "site-icon|\(url.absoluteString)"
+                    ))
                 }
             }
         }
 
         if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
-            candidates.append(RemoteImageCandidate(url: url))
+            candidates.append(RemoteImageCandidate(
+                url: url,
+                persistentCacheID: "site-icon|\(url.absoluteString)"
+            ))
         }
         return candidates
     }
@@ -602,7 +651,7 @@ final class SitesViewModel: ObservableObject {
         return nil
     }
 
-    private func milestone(for site: SiteItem) -> SiteLevelMilestone? {
+    func milestone(for site: SiteItem) -> SiteLevelMilestone? {
         guard let levels = config(for: site)?["level"] as? [String: Any] else { return nil }
         let parsed = levels.compactMap { key, value -> SiteLevelRequirement? in
             guard let row = value as? [String: Any] else { return nil }
@@ -632,6 +681,7 @@ struct SitesView: View {
     @State private var selectedSite: SiteItem?
     @State private var browserTarget: SiteBrowserTarget?
     @State private var levelSite: SiteItem?
+    @State private var signInSite: SiteItem?
     @State private var editingSite: SiteItem?
     @State private var deletingSite: SiteItem?
     @State private var repeatingSite: SiteItem?
@@ -662,9 +712,12 @@ struct SitesView: View {
                     SiteListSummaryBar(
                         visibleCount: model.filtered.count,
                         totalCount: model.sites.count,
-                        activeCount: model.filteredActiveSiteCount,
-                        pendingSignInCount: model.filteredPendingSignInCount,
-                        unreadCount: model.filteredUnreadCount
+                        activeCount: model.activeSiteCount,
+                        pendingSignInCount: model.pendingSignInCount,
+                        unreadCount: model.unreadCount,
+                        showActiveSites: model.showActiveSites,
+                        showPendingSignInSites: model.showPendingSignInSites,
+                        showUnreadSites: model.showUnreadSites
                     )
                     List {
                         ForEach(model.filtered) { site in
@@ -672,9 +725,11 @@ struct SitesView: View {
                                 site: site,
                                 privacy: appState.privacyMode,
                                 iconCandidates: model.logoCandidates(for: site, appState: appState),
+                                milestone: model.milestone(for: site),
                                 onOpenDetails: { selectedSite = site },
                                 onOpenBrowser: { openBrowser(for: site) },
-                                onOpenLevel: { levelSite = site }
+                                onOpenLevel: { levelSite = site },
+                                onOpenSignIn: { signInSite = site }
                             )
                                 .contextMenu { SiteActions(site: site, model: model) }
                                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -745,6 +800,11 @@ struct SitesView: View {
         .sheet(isPresented: $showTimeline) { SiteTimelineView(model: model).environmentObject(appState) }
         .sheet(item: $editingSite) { site in SiteEditorSheet(site: site, onSaved: { await model.load(appState, cached: false) }).environmentObject(appState) }
         .sheet(item: $selectedSite) { site in SiteDetailView(site: site, model: model).environmentObject(appState).presentationDetents([.large]) }
+        .sheet(item: $signInSite) { site in
+            SiteSignInDetailView(site: site, model: model)
+                .environmentObject(appState)
+                .presentationDetents([.large])
+        }
         .sheet(item: $levelSite) { site in
             NavigationStack {
                 SiteLevelProgressView(site: site, levels: parseSiteLevels(model.levelRules(for: site)))
@@ -825,8 +885,14 @@ struct SitesView: View {
         isRunningGlobalAction = true
         defer { isRunningGlobalAction = false }
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
-        if await appState.perform(endpoint, method: .get) {
+        let signing = path == APIPath.siteSign
+        _ = await appState.runManualTask(
+            title: signing ? "正在为全部站点签到" : "正在刷新全部站点",
+            successMessage: signing ? "全部站点签到完成" : "全部站点数据已更新"
+        ) {
+            guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return false }
             await model.load(appState, cached: false)
+            return appState.presentedError == nil
         }
     }
 }
@@ -841,10 +907,11 @@ private struct SiteSearchFilterBar: View {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                    TextField("搜索站点、镜像、账号、标签", text: $model.query)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .submitLabel(.search)
+                    SiteSearchTextField(
+                        text: $model.query,
+                        placeholder: "搜索站点、镜像、账号、标签"
+                    )
+                    .frame(minHeight: 24)
                     if !model.query.isEmpty {
                         Button { model.query = "" } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -931,6 +998,97 @@ private struct SiteSearchFilterBar: View {
         .controlSize(.small)
         .tint(HarvestTheme.blue)
         .accessibilityLabel("移除筛选：\(title)")
+    }
+}
+
+private struct SiteSearchTextField: UIViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeUIView(context: Context) -> UITextField {
+        let textField = UITextField(frame: .zero)
+        textField.delegate = context.coordinator
+        textField.placeholder = placeholder
+        textField.font = .preferredFont(forTextStyle: .body)
+        textField.textColor = .label
+        textField.tintColor = UIColor(HarvestTheme.blue)
+        textField.backgroundColor = .clear
+        textField.borderStyle = .none
+        textField.autocorrectionType = .no
+        textField.autocapitalizationType = .none
+        textField.spellCheckingType = .no
+        textField.smartQuotesType = .no
+        textField.smartDashesType = .no
+        textField.returnKeyType = .search
+        textField.clearButtonMode = .never
+        textField.adjustsFontForContentSizeCategory = true
+        textField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textField.addTarget(context.coordinator, action: #selector(Coordinator.textChanged(_:)), for: .editingChanged)
+        textField.text = text
+        return textField
+    }
+
+    func updateUIView(_ textField: UITextField, context: Context) {
+        context.coordinator.text = $text
+        textField.placeholder = placeholder
+        guard textField.markedTextRange == nil, textField.text != text else { return }
+        textField.text = text
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        var text: Binding<String>
+        private var compositionGeneration = 0
+
+        init(text: Binding<String>) {
+            self.text = text
+        }
+
+        @objc func textChanged(_ textField: UITextField) {
+            compositionGeneration &+= 1
+            if textField.markedTextRange == nil {
+                commit(textField.text ?? "")
+                return
+            }
+            commitAfterCompositionEnds(textField, generation: compositionGeneration)
+        }
+
+        func textFieldDidChangeSelection(_ textField: UITextField) {
+            guard textField.markedTextRange == nil else { return }
+            compositionGeneration &+= 1
+            commit(textField.text ?? "")
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            compositionGeneration &+= 1
+            if textField.markedTextRange == nil {
+                commit(textField.text ?? "")
+            }
+            textField.resignFirstResponder()
+            return true
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            compositionGeneration &+= 1
+            commit(textField.text ?? "")
+        }
+
+        private func commit(_ value: String) {
+            guard text.wrappedValue != value else { return }
+            text.wrappedValue = value
+        }
+
+        private func commitAfterCompositionEnds(_ textField: UITextField, generation: Int) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self, weak textField] in
+                guard let self, let textField,
+                      generation == self.compositionGeneration,
+                      textField.markedTextRange == nil else { return }
+                self.commit(textField.text ?? "")
+            }
+        }
     }
 }
 
@@ -1231,9 +1389,11 @@ struct SiteFilterSheet: View {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass")
                             .foregroundStyle(.secondary)
-                        TextField("搜索站点、镜像、账号、标签", text: $model.query)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        SiteSearchTextField(
+                            text: $model.query,
+                            placeholder: "搜索站点、镜像、账号、标签"
+                        )
+                        .frame(minHeight: 24)
                         if !model.query.isEmpty {
                             Button { model.query = "" } label: {
                                 Image(systemName: "xmark.circle.fill")
@@ -2129,24 +2289,30 @@ struct SiteRow: View {
     let site: SiteItem
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
+    let milestone: SiteLevelMilestone?
     let onOpenDetails: () -> Void
     let onOpenBrowser: () -> Void
     let onOpenLevel: () -> Void
+    let onOpenSignIn: () -> Void
 
     init(
         site: SiteItem,
         privacy: Bool,
         iconCandidates: [RemoteImageCandidate] = [],
+        milestone: SiteLevelMilestone? = nil,
         onOpenDetails: @escaping () -> Void = {},
         onOpenBrowser: @escaping () -> Void = {},
-        onOpenLevel: @escaping () -> Void = {}
+        onOpenLevel: @escaping () -> Void = {},
+        onOpenSignIn: @escaping () -> Void = {}
     ) {
         self.site = site
         self.privacy = privacy
         self.iconCandidates = iconCandidates
+        self.milestone = milestone
         self.onOpenDetails = onOpenDetails
         self.onOpenBrowser = onOpenBrowser
         self.onOpenLevel = onOpenLevel
+        self.onOpenSignIn = onOpenSignIn
     }
 
     var body: some View {
@@ -2231,8 +2397,15 @@ struct SiteRow: View {
                     }
                     .buttonStyle(.plain)
                     Spacer(minLength: 4)
+                    if let milestoneStatus {
+                        Button(action: onOpenLevel) {
+                            SiteInlineStatus(status: milestoneStatus)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("查看\(site.name)\(milestoneStatus.label)详情")
+                    }
                     if let signStatus {
-                        Button(action: onOpenDetails) {
+                        Button(action: onOpenSignIn) {
                             SiteInlineStatus(status: signStatus)
                         }
                         .buttonStyle(.plain)
@@ -2359,7 +2532,6 @@ struct SiteRow: View {
     }
 
     private func siteLogo(size: CGFloat) -> some View {
-        let imageSize = floor(size * 0.70)
         return ZStack {
             Circle()
                 .fill(Color.white)
@@ -2371,7 +2543,7 @@ struct SiteRow: View {
                     .font(.system(size: size * 0.38, weight: .semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .frame(width: imageSize, height: imageSize)
+            .frame(width: size, height: size)
             .clipShape(Circle())
             .opacity(site.enabled ? 1 : 0.62)
         }
@@ -2405,6 +2577,27 @@ struct SiteRow: View {
         let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !level.isEmpty else { return nil }
         return SiteStatusDescriptor(id: "level", label: level, icon: "medal.fill", color: HarvestTheme.blue)
+    }
+
+    private var milestoneStatus: SiteStatusDescriptor? {
+        switch milestone {
+        case .graduation:
+            return SiteStatusDescriptor(
+                id: "graduation",
+                label: "已毕业",
+                icon: "graduationcap.fill",
+                color: HarvestTheme.amber
+            )
+        case .keepAccount:
+            return SiteStatusDescriptor(
+                id: "keep-account",
+                label: "已保号",
+                icon: "checkmark.shield.fill",
+                color: HarvestTheme.green
+            )
+        case nil:
+            return nil
+        }
     }
 
     private func dailyDeltaText(_ value: Double) -> String {
@@ -2629,6 +2822,9 @@ private struct SiteListSummaryBar: View {
     let activeCount: Int
     let pendingSignInCount: Int
     let unreadCount: Int
+    let showActiveSites: () -> Void
+    let showPendingSignInSites: () -> Void
+    let showUnreadSites: () -> Void
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -2654,19 +2850,48 @@ private struct SiteListSummaryBar: View {
             .accessibilityLabel("显示 \(visibleCount)，共 \(totalCount) 个站点")
             Spacer(minLength: 4)
             if showActive {
-                summaryMetric("可用", value: activeCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
+                summaryMetric(
+                    "可用",
+                    value: activeCount,
+                    icon: "checkmark.circle.fill",
+                    color: HarvestTheme.green,
+                    action: showActiveSites
+                )
             }
-            summaryMetric("未签到", value: pendingSignInCount, icon: "checkmark.seal", color: HarvestTheme.amber)
-            summaryMetric("未读", value: unreadCount, icon: "bell.badge.fill", color: HarvestTheme.coral)
+            summaryMetric(
+                "未签到",
+                value: pendingSignInCount,
+                icon: "checkmark.seal",
+                color: HarvestTheme.amber,
+                action: showPendingSignInSites
+            )
+            summaryMetric(
+                "未读",
+                value: unreadCount,
+                icon: "bell.badge.fill",
+                color: HarvestTheme.coral,
+                action: showUnreadSites
+            )
         }
     }
 
-    private func summaryMetric(_ label: String, value: Int, icon: String, color: Color) -> some View {
-        Label("\(label) \(value)", systemImage: icon)
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(color)
-            .lineLimit(1)
-            .accessibilityLabel("\(label) \(value)")
+    private func summaryMetric(
+        _ label: String,
+        value: Int,
+        icon: String,
+        color: Color,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Label("\(label) \(value)", systemImage: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .padding(.vertical, 5)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("筛选\(label)站点，共 \(value)")
     }
 }
 
@@ -3628,6 +3853,358 @@ private struct SitePageShortcut: Identifiable {
     let icon: String
     let path: String
     var id: String { key + path }
+}
+
+private struct SiteSignInDetailView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+    let site: SiteItem
+    @ObservedObject var model: SitesViewModel
+    @State private var latestSite: SiteItem?
+    @State private var isLoading = false
+    @State private var isOperating = false
+    @State private var savingFlag: SiteFeatureFlag?
+
+    private var current: SiteItem { latestSite ?? site }
+    private var logoCandidates: [RemoteImageCandidate] {
+        model.logoCandidates(for: current, appState: appState)
+    }
+    private var featureColumns: [GridItem] {
+        [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    accountSummary
+                    featureSection
+                    basicInformationSection
+                    signInSection
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .refreshable { await loadDetail() }
+            .overlay {
+                if isLoading, latestSite == nil {
+                    ProgressView()
+                        .controlSize(.large)
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+            }
+            .navigationTitle("签到信息")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button { Task { await loadDetail() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(isLoading || isOperating || savingFlag != nil)
+                    .accessibilityLabel("刷新签到信息")
+                }
+            }
+            .task { await loadDetail() }
+        }
+    }
+
+    private var accountSummary: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack(spacing: 13) {
+                SiteDetailIcon(site: current, iconCandidates: logoCandidates)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(current.name)
+                        .font(.title3.weight(.bold))
+                        .lineLimit(1)
+                    Text(accountSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    HStack(spacing: 7) {
+                        signInPill
+                        if current.unread > 0 {
+                            Label("\(current.unread)", systemImage: "bell.badge.fill")
+                                .foregroundStyle(HarvestTheme.coral)
+                        }
+                        if !current.level.isEmpty {
+                            Label(current.level, systemImage: "medal.fill")
+                                .foregroundStyle(HarvestTheme.blue)
+                        }
+                    }
+                    .font(.caption2.weight(.semibold))
+                }
+                Spacer(minLength: 0)
+            }
+            Divider()
+            HStack(spacing: 12) {
+                summaryFootnote("注册", value: registeredSummary, icon: "calendar")
+                Spacer(minLength: 4)
+                summaryFootnote("最近活动", value: recentActivityText, icon: "clock")
+            }
+        }
+        .cardSurface()
+    }
+
+    private var featureSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("功能开关", icon: "switch.2")
+            LazyVGrid(columns: featureColumns, spacing: 8) {
+                ForEach(SiteFeatureFlag.allCases) { flag in
+                    Button {
+                        Task { await updateFlag(flag, value: !flag.value(in: current)) }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: flag.icon)
+                                .font(.system(size: 14, weight: .semibold))
+                                .frame(width: 18)
+                            Text(flag.title)
+                                .font(.subheadline.weight(.medium))
+                                .lineLimit(1)
+                            Spacer(minLength: 2)
+                            if savingFlag == flag {
+                                ProgressView().controlSize(.mini)
+                            } else {
+                                Image(systemName: flag.value(in: current) ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 14, weight: .semibold))
+                            }
+                        }
+                        .foregroundStyle(flag.value(in: current) ? HarvestTheme.blue : Color.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .background(
+                            (flag.value(in: current) ? HarvestTheme.blue.opacity(0.09) : Color.primary.opacity(0.035)),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(flag.value(in: current) ? HarvestTheme.blue.opacity(0.18) : Color.primary.opacity(0.07))
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(savingFlag != nil || isOperating)
+                    .accessibilityValue(flag.value(in: current) ? "已开启" : "已关闭")
+                }
+            }
+        }
+    }
+
+    private var basicInformationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("基础信息", icon: "info.circle")
+            VStack(spacing: 0) {
+                informationRow("站点名称", value: current.siteKey.isEmpty ? current.name : current.siteKey)
+                informationRow("昵称", value: current.name)
+                informationRow("排序 ID", value: "\(current.sortID)")
+                if !current.siteType.isEmpty { informationRow("站点类型", value: current.siteType) }
+                if !current.username.isEmpty { informationRow("用户名", value: privateText(current.username)) }
+                if !current.email.isEmpty { informationRow("邮箱", value: privateText(current.email)) }
+                if !current.userID.isEmpty { informationRow("用户 ID", value: privateText(current.userID)) }
+                informationRow("注册时间", value: registeredDetail)
+                if !current.latestActive.isEmpty { informationRow("最后活动", value: current.latestActive) }
+                informationRow("最后同步", value: current.updatedAt.isEmpty ? "未知" : current.updatedAt, drawsDivider: false)
+            }
+            .cardSurface()
+        }
+    }
+
+    private var signInSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("签到记录", icon: "checkmark.seal")
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Image(systemName: current.signed ? "checkmark.seal.fill" : "checkmark.seal")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(current.signed ? HarvestTheme.green : HarvestTheme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(current.signed ? "今日已签到" : "今日未签到")
+                            .font(.headline)
+                        Text(latestSignInSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                            .textSelection(.enabled)
+                    }
+                    Spacer(minLength: 0)
+                    if !current.signed {
+                        Button {
+                            Task { await signIn() }
+                        } label: {
+                            if isOperating {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Text("立即签到")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(HarvestTheme.green)
+                        .disabled(!current.signIn || isOperating || savingFlag != nil)
+                    }
+                }
+
+                if !current.signIn {
+                    Label("该站点未开启自动签到", systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if !current.signHistory.isEmpty {
+                    Divider()
+                    ForEach(Array(current.signHistory.prefix(12).enumerated()), id: \.offset) { index, row in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text(row.string("date") ?? "未知日期")
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                if let time = row.string("updated_at", "created_at", "time"), !time.isEmpty {
+                                    Text(time)
+                                        .font(.caption2.monospacedDigit())
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            Text(signHistoryText(row))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                        if index < min(current.signHistory.count, 12) - 1 { Divider() }
+                    }
+                }
+            }
+            .cardSurface()
+        }
+    }
+
+    private var signInPill: some View {
+        Label(current.signed ? "已签到" : "未签到", systemImage: current.signed ? "checkmark.seal.fill" : "checkmark.seal")
+            .foregroundStyle(current.signed ? HarvestTheme.green : HarvestTheme.amber)
+    }
+
+    private var accountSubtitle: String {
+        let values = [current.username, current.email].filter { !$0.isEmpty }
+        return values.isEmpty ? (current.siteKey.isEmpty ? "站点账号" : current.siteKey) : privateText(values.joined(separator: " · "))
+    }
+
+    private var registeredSummary: String {
+        guard let joined = parseDate(current.joinedAt) else { return current.joinedAt.isEmpty ? "未登记" : current.joinedAt }
+        let days = max(0, Calendar.current.dateComponents([.day], from: joined, to: Date()).day ?? 0)
+        return "\(days / 7)周\(days % 7)天"
+    }
+
+    private var registeredDetail: String {
+        guard let joined = parseDate(current.joinedAt) else { return current.joinedAt.isEmpty ? "未登记" : current.joinedAt }
+        return "\(joined.formatted(date: .numeric, time: .omitted)) · \(registeredSummary)"
+    }
+
+    private var recentActivityText: String {
+        let dates = [parseDate(current.latestActive), parseDate(current.updatedAt)].compactMap { $0 }
+        guard let latest = dates.max() else { return "未知" }
+        let elapsed = max(0, Date().timeIntervalSince(latest))
+        if elapsed < 60 { return "刚刚" }
+        let minutes = Int(elapsed / 60)
+        if minutes < 60 { return "\(minutes)分钟前" }
+        let hours = Int(elapsed / 3_600)
+        if hours < 24 { return "\(hours)小时前" }
+        let days = Int(elapsed / 86_400)
+        if days < 7 { return "\(days)天前" }
+        if days < 30 { return "\(days / 7)周前" }
+        if days < 365 { return "\(days / 30)个月前" }
+        return "\(days / 365)年前"
+    }
+
+    private var latestSignInSummary: String {
+        guard let row = current.signHistory.first else {
+            return current.signed ? "签到已完成，暂无返回详情" : "暂无今日签到记录"
+        }
+        return signHistoryText(row)
+    }
+
+    private func sectionTitle(_ title: String, icon: String) -> some View {
+        Label(title, systemImage: icon)
+            .font(.headline)
+            .foregroundStyle(.primary)
+    }
+
+    private func summaryFootnote(_ label: String, value: String, icon: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(label, systemImage: icon)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .lineLimit(1)
+        }
+    }
+
+    private func informationRow(_ label: String, value: String, drawsDivider: Bool = true) -> some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(label)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 72, alignment: .leading)
+                Text(value.isEmpty ? "-" : value)
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            .padding(.vertical, 10)
+            if drawsDivider { Divider() }
+        }
+    }
+
+    private func signHistoryText(_ row: [String: Any]) -> String {
+        let text = row.string("info", "message", "content") ?? prettyJSON(row)
+        if let range = text.range(of: "签到返回信息：") {
+            return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    private func privateText(_ value: String) -> String {
+        appState.privacyMode ? "••••" : value
+    }
+
+    @MainActor private func loadDetail() async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let payload = try await appState.api("\(APIPath.sites)/\(site.id)")
+            if let row = jsonPayloadDictionary(payload) { latestSite = SiteItem(row) }
+        } catch {
+            await AppLogStore.shared.append(.warning, "签到详情加载失败：\(error.localizedDescription)")
+        }
+    }
+
+    @MainActor private func updateFlag(_ flag: SiteFeatureFlag, value: Bool) async {
+        guard savingFlag == nil, flag.value(in: current) != value else { return }
+        let previous = current
+        var body = current.raw
+        body[flag.apiKey] = value
+        latestSite = SiteItem(body)
+        savingFlag = flag
+        defer { savingFlag = nil }
+
+        guard await appState.perform("\(APIPath.sites)/\(current.id)", method: .put, body: body) else {
+            latestSite = previous
+            return
+        }
+        await model.load(appState, cached: false)
+        latestSite = model.sites.first(where: { $0.id == current.id }) ?? SiteItem(body)
+    }
+
+    @MainActor private func signIn() async {
+        guard !isOperating else { return }
+        isOperating = true
+        defer { isOperating = false }
+        await model.operate(appState, site: current, path: APIPath.siteSign)
+        await loadDetail()
+    }
 }
 
 struct SiteDetailView: View {
@@ -5251,7 +5828,6 @@ private struct SiteDetailIcon: View {
     let iconCandidates: [RemoteImageCandidate]
     var body: some View {
         let size: CGFloat = 64
-        let imageSize = floor(size * 0.68)
         ZStack {
             Circle().fill(Color.white)
             CachedAnimatedRemoteImageCandidates(
@@ -5262,7 +5838,7 @@ private struct SiteDetailIcon: View {
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(site.enabled ? HarvestTheme.blue : Color.secondary)
             }
-            .frame(width: imageSize, height: imageSize)
+            .frame(width: size, height: size)
             .clipShape(Circle())
             .opacity(site.enabled ? 1 : 0.62)
         }

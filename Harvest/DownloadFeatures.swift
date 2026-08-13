@@ -950,8 +950,24 @@ final class DownloadsViewModel: ObservableObject {
         trCommand: String,
         qbExtra: [String: Any] = [:],
         trExtra: [String: Any] = [:],
-        reload: Bool = true
+        reload: Bool = true,
+        showsFeedback: Bool = true
     ) async -> Bool {
+        if showsFeedback {
+            let labels = downloadCommandLabels(qbCommand: qbCommand, trCommand: trCommand)
+            return await appState.runManualTask(title: labels.title, successMessage: labels.success) {
+                await self.execute(
+                    appState,
+                    torrents: selected,
+                    qbCommand: qbCommand,
+                    trCommand: trCommand,
+                    qbExtra: qbExtra,
+                    trExtra: trExtra,
+                    reload: reload,
+                    showsFeedback: false
+                )
+            }
+        }
         let grouped = Dictionary(grouping: selected) { $0.downloaderID }
         var succeeded = true
         for (downloaderID, items) in grouped where downloaderID > 0 {
@@ -960,11 +976,16 @@ final class DownloadsViewModel: ObservableObject {
                 ? ["command": trCommand, "ids": items.map(\.torrentHash)]
                 : ["command": qbCommand, "torrent_hashes": items.map(\.torrentHash)]
             for (key, value) in (isTransmission ? trExtra : qbExtra) { body[key] = value }
-            let ok = await appState.perform(APIPath.downloaderControl + "\(downloaderID)", method: .post, body: body)
+            let ok = await appState.perform(
+                APIPath.downloaderControl + "\(downloaderID)",
+                method: .post,
+                body: body,
+                showsFeedback: false
+            )
             succeeded = succeeded && ok
         }
         if succeeded && reload { await load(appState) }
-        return succeeded
+        return succeeded && appState.presentedError == nil
     }
 
     func deleteTorrents(
@@ -972,6 +993,25 @@ final class DownloadsViewModel: ObservableObject {
         torrents selected: [TorrentItem],
         deleteFilesWhenUnpreserved: Bool
     ) async {
+        _ = await appState.runManualTask(
+            title: "正在删除下载任务",
+            successMessage: "下载任务已删除"
+        ) {
+            await self.deleteTorrents(
+                appState,
+                torrents: selected,
+                deleteFilesWhenUnpreserved: deleteFilesWhenUnpreserved,
+                showsFeedback: false
+            )
+        }
+    }
+
+    private func deleteTorrents(
+        _ appState: AppState,
+        torrents selected: [TorrentItem],
+        deleteFilesWhenUnpreserved: Bool,
+        showsFeedback _: Bool
+    ) async -> Bool {
         let deletingIDs = Set(selected.map(\.id))
         let withFiles = selected.filter {
             deleteFilesWhenUnpreserved && !hasOtherPreservingSameContent($0, deletingIDs: deletingIDs)
@@ -987,7 +1027,8 @@ final class DownloadsViewModel: ObservableObject {
                 trCommand: "remove_torrent",
                 qbExtra: ["delete_files": false],
                 trExtra: ["delete_data": false],
-                reload: false
+                reload: false,
+                showsFeedback: false
             )
             succeeded = succeeded && result
         }
@@ -999,11 +1040,13 @@ final class DownloadsViewModel: ObservableObject {
                 trCommand: "remove_torrent",
                 qbExtra: ["delete_files": true],
                 trExtra: ["delete_data": true],
-                reload: false
+                reload: false,
+                showsFeedback: false
             )
             succeeded = succeeded && result
         }
         if succeeded { await load(appState) }
+        return succeeded && appState.presentedError == nil
     }
 
     private func hasOtherPreservingSameContent(_ target: TorrentItem, deletingIDs: Set<String>) -> Bool {
@@ -1025,18 +1068,46 @@ final class DownloadsViewModel: ObservableObject {
         return normalized.lowercased()
     }
 
-    func replaceTrackers(_ appState: AppState, torrents selected: [TorrentItem], tracker: String) async {
+    @discardableResult
+    func replaceTrackers(
+        _ appState: AppState,
+        torrents selected: [TorrentItem],
+        tracker: String,
+        showsFeedback: Bool = true
+    ) async -> Bool {
+        if showsFeedback {
+            return await appState.runManualTask(title: "正在替换 Tracker", successMessage: "Tracker 已替换") {
+                await self.replaceTrackers(
+                    appState,
+                    torrents: selected,
+                    tracker: tracker,
+                    showsFeedback: false
+                )
+            }
+        }
         let grouped = Dictionary(grouping: selected.filter { !$0.downloaderCategory.lowercased().contains("tr") }) { $0.downloaderID }
         var succeeded = true
         for (downloaderID, items) in grouped where downloaderID > 0 {
             let ok = await appState.perform(
                 APIPath.downloaderReplaceTrackers + "\(downloaderID)",
                 method: .put,
-                body: ["torrent_hashes": items.map(\.torrentHash), "new_tracker": tracker]
+                body: ["torrent_hashes": items.map(\.torrentHash), "new_tracker": tracker],
+                showsFeedback: false
             )
             succeeded = succeeded && ok
         }
         if succeeded { await load(appState) }
+        return succeeded && appState.presentedError == nil
+    }
+
+    private func downloadCommandLabels(qbCommand: String, trCommand: String) -> (title: String, success: String) {
+        let command = "\(qbCommand) \(trCommand)".lowercased()
+        if command.contains("resume") || command.contains("start") { return ("正在开始下载任务", "下载任务已开始") }
+        if command.contains("pause") || command.contains("stop") { return ("正在暂停下载任务", "下载任务已暂停") }
+        if command.contains("delete") || command.contains("remove") { return ("正在删除下载任务", "下载任务已删除") }
+        if command.contains("recheck") || command.contains("verify") { return ("正在校验下载任务", "校验任务已提交") }
+        if command.contains("announce") || command.contains("reannounce") { return ("正在汇报 Tracker", "汇报任务已提交") }
+        return ("正在执行下载任务", "下载任务已完成")
     }
 
     func toggle(_ appState: AppState, downloader: DownloaderItem) async {
@@ -1413,7 +1484,7 @@ struct DownloadsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button { Task { await model.load(appState) } } label: {
+                Button { Task { await refreshDownloaders() } } label: {
                     Image(systemName: "arrow.clockwise")
                         .symbolRenderingMode(.hierarchical)
                 }
@@ -1511,6 +1582,12 @@ struct DownloadsView: View {
             interval: refreshInterval,
             duration: refreshDuration
         )
+    }
+
+    @MainActor private func refreshDownloaders() async {
+        await appState.runManualRefresh(title: "正在刷新下载器", successMessage: "下载器已更新") {
+            await model.load(appState)
+        }
     }
 }
 
@@ -1913,7 +1990,7 @@ struct TorrentListView: View {
                         Image(systemName: activeUserFilterCount > 0 ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
                     }
                     .accessibilityLabel("筛选与排序")
-                    Button { Task { await model.load(appState) } } label: {
+                    Button { Task { await refreshTorrents() } } label: {
                         Image(systemName: "arrow.clockwise")
                     }
                     .accessibilityLabel("刷新种子列表")
@@ -1990,6 +2067,12 @@ struct TorrentListView: View {
         }
         .sheet(item: $exportedTorrent) { file in
             ActivityShareSheet(items: [file.url])
+        }
+    }
+
+    @MainActor private func refreshTorrents() async {
+        await appState.runManualRefresh(title: "正在刷新种子列表", successMessage: "种子列表已更新") {
+            await model.load(appState)
         }
     }
 
@@ -2549,13 +2632,30 @@ struct TorrentAdvancedActionsSheet: View {
         let values = splitValues(tracker)
         guard let primary = values.first else { return }
         isWorking = true
+        defer { isWorking = false }
         let qbItems = torrents.filter { !$0.downloaderCategory.lowercased().contains("tr") }
         let trItems = torrents.filter { $0.downloaderCategory.lowercased().contains("tr") }
-        if !qbItems.isEmpty { await model.replaceTrackers(appState, torrents: qbItems, tracker: primary) }
-        if !trItems.isEmpty {
-            await model.execute(appState, torrents: trItems, qbCommand: "set_tracker", trCommand: "change_torrent", trExtra: ["tracker_list": values])
+        _ = await appState.runManualTask(title: "正在替换 Tracker", successMessage: "Tracker 已替换") {
+            if !qbItems.isEmpty {
+                guard await model.replaceTrackers(
+                    appState,
+                    torrents: qbItems,
+                    tracker: primary,
+                    showsFeedback: false
+                ) else { return false }
+            }
+            if !trItems.isEmpty {
+                guard await model.execute(
+                    appState,
+                    torrents: trItems,
+                    qbCommand: "set_tracker",
+                    trCommand: "change_torrent",
+                    trExtra: ["tracker_list": values],
+                    showsFeedback: false
+                ) else { return false }
+            }
+            return true
         }
-        isWorking = false
     }
 }
 
@@ -2635,7 +2735,7 @@ struct TorrentDetailSheet: View {
             .navigationTitle(item.name).navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button { Task { await load() } } label: { Image(systemName: "arrow.clockwise") }
+                    Button { Task { await refreshDetail() } } label: { Image(systemName: "arrow.clockwise") }
                         .disabled(isLoading)
                         .accessibilityLabel("刷新种子详情")
                 }
@@ -2684,6 +2784,13 @@ struct TorrentDetailSheet: View {
             ))
         } catch {
             loadError = "加载详情失败：\(error.localizedDescription)"
+        }
+    }
+
+    @MainActor private func refreshDetail() async {
+        await appState.runManualRefresh(title: "正在刷新种子详情", successMessage: "种子详情已更新") {
+            await load()
+            if !loadError.isEmpty { appState.presentedError = loadError }
         }
     }
 }

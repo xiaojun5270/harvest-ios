@@ -1437,7 +1437,7 @@ struct AppUpdatePromptView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { Task { await model.load(appState) } } label: { Image(systemName: "arrow.clockwise") }
+                    Button { Task { await refreshAppUpdates() } } label: { Image(systemName: "arrow.clockwise") }
                         .disabled(model.isLoading)
                         .accessibilityLabel("检查更新")
                 }
@@ -1446,6 +1446,13 @@ struct AppUpdatePromptView: View {
         .task { await model.load(appState) }
         .onDisappear { model.cancelDownload() }
         .sheet(item: $model.completedPackage) { package in ActivityShareSheet(items: [package.url]) }
+    }
+
+    @MainActor private func refreshAppUpdates() async {
+        await appState.runManualRefresh(title: "正在检查 APP 更新", successMessage: "更新检查完成") {
+            await model.load(appState)
+            if !model.errorMessage.isEmpty { appState.presentedError = model.errorMessage }
+        }
     }
 }
 
@@ -1879,7 +1886,7 @@ struct UpdateMaintenanceView: View {
                         isLoading: serverUpdater.loadingTargets.contains(target),
                         anyUpdating: serverUpdater.updatingAction != nil,
                         isUpdating: serverUpdater.updatingAction == target.action,
-                        onRefresh: { Task { await serverUpdater.refresh(target, appState: appState) } },
+                        onRefresh: { Task { await refreshServerUpdate(target) } },
                         onUpdate: { selectedUpgrade = target.action }
                     )
                 }
@@ -1922,7 +1929,7 @@ struct UpdateMaintenanceView: View {
             Button("确认执行") {
                 guard let action = selectedUpgrade else { return }
                 selectedUpgrade = nil
-                Task { _ = await serverUpdater.run(action, appState: appState) }
+                Task { await runServerUpdate(action) }
             }
             Button("取消", role: .cancel) { selectedUpgrade = nil }
         } message: {
@@ -1952,6 +1959,31 @@ struct UpdateMaintenanceView: View {
             let raw = try await appState.api(APIPath.speedTest)
             networkMessage = jsonMessage(raw) ?? "测速任务已提交"
         } catch { appState.presentedError = error.localizedDescription }
+    }
+
+    @MainActor private func refreshServerUpdate(_ target: ServerUpdateTarget) async {
+        await appState.runManualRefresh(
+            title: "正在检查\(target.title)",
+            successMessage: "\(target.title)检查完成"
+        ) {
+            await serverUpdater.refresh(target, appState: appState)
+            if !serverUpdater.errorMessage.isEmpty {
+                appState.presentedError = serverUpdater.errorMessage
+            }
+        }
+    }
+
+    @MainActor private func runServerUpdate(_ action: ServerUpgradeAction) async {
+        _ = await appState.runManualTask(
+            title: "正在执行\(action.label)",
+            successMessage: "\(action.label)任务已完成"
+        ) {
+            let succeeded = await serverUpdater.run(action, appState: appState)
+            if !succeeded, !serverUpdater.errorMessage.isEmpty {
+                appState.presentedError = serverUpdater.errorMessage
+            }
+            return succeeded
+        }
     }
 }
 

@@ -1197,7 +1197,13 @@ final class SearchViewModel: ObservableObject {
 
     func loadSites(_ appState: AppState) async {
         do {
-            sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init).filter { $0.enabled && $0.searchTorrents }
+            sites = jsonRows(try await appState.api(APIPath.sites))
+                .map(SiteItem.init)
+                .filter { $0.enabled && $0.searchTorrents }
+                .sorted {
+                    if $0.sortID != $1.sortID { return $0.sortID < $1.sortID }
+                    return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }
             let available = Set(sites.map(\.id))
             selectedSiteIDs = selectedSiteIDs.intersection(available)
         } catch {
@@ -1506,70 +1512,115 @@ struct SearchView: View {
     @State private var selectedMedia: MediaItem?
     @State private var selectedResource: ResourceSelection?
     @State private var showSettings = false
-    @State private var showResourceFilters = false
     @State private var activeSearchTask: Task<Void, Never>?
+    @FocusState private var searchFieldFocused: Bool
+    let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void = {}) {
+        self.onClose = onClose
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker(
-                "搜索类型",
-                selection: Binding(
-                    get: { model.mode },
-                    set: { value in
-                        stopSearch()
-                        model.mode = value
-                    }
-                )
-            ) {
-                Text("影视").tag("影视")
-                Text("资源").tag("资源")
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            if model.mode == "资源" && !model.resources.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        if model.isLoading {
-                            ProgressView().controlSize(.small)
-                            Text(model.statusMessage.isEmpty ? "搜索中" : model.statusMessage)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        Menu {
-                            ForEach(ResourceSearchSortField.allCases) { field in
-                                Button {
-                                    model.selectResourceSort(field)
-                                } label: {
-                                    Label(field.rawValue, systemImage: model.resourceSortField == field ? "checkmark" : "arrow.up.arrow.down")
-                                }
-                            }
-                        } label: {
-                            Label(model.resourceSortField.rawValue, systemImage: "arrow.up.arrow.down")
-                        }
-                        Button {
-                            model.resourceSortAscending.toggle()
-                        } label: {
-                            Image(systemName: model.resourceSortAscending ? "arrow.up" : "arrow.down")
-                        }
-                        .accessibilityLabel(model.resourceSortAscending ? "升序" : "降序")
-                        Button { showResourceFilters = true } label: {
-                            Label(model.resourceFilterCount == 0 ? "筛选" : "筛选 \(model.resourceFilterCount)", systemImage: "line.3.horizontal.decrease.circle")
-                        }
-                        Text("\(model.displayedResources.count) 条")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.bordered)
+            HStack(spacing: 12) {
+                Button {
+                    stopSearch()
+                    onClose()
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 20, weight: .semibold))
+                        .frame(width: 38, height: 44)
                 }
-                .contentMargins(.horizontal, 16, for: .scrollContent)
-                .padding(.top, 10)
+                .accessibilityLabel("返回")
+
+                HStack(spacing: 9) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    TextField(searchPlaceholder, text: $model.query)
+                        .focused($searchFieldFocused)
+                        .submitLabel(.search)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .onSubmit { startSearch() }
+                    if !model.query.isEmpty {
+                        Button {
+                            model.query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("清空搜索")
+                    }
+                    if model.isLoading {
+                        Button { stopSearch() } label: {
+                            Image(systemName: "stop.circle")
+                                .foregroundStyle(HarvestTheme.coral)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("停止搜索")
+                    }
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 44)
+                .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
+                .overlay(Capsule().stroke(Color.primary.opacity(0.10)))
+
+                Button { showSettings = true } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 21, weight: .medium))
+                        .frame(width: 38, height: 44)
+                }
+                .accessibilityLabel("搜索设置")
             }
-            if model.isLoading && (model.mode == "影视" || model.resources.isEmpty) { LoadingState() }
-            else if model.mode == "影视" && model.media.isEmpty { EmptyState(icon: "magnifyingglass", title: "搜索影视信息", detail: "输入电影、剧集或演员名称开始搜索") }
-            else if model.mode == "资源" && model.resources.isEmpty { EmptyState(icon: "rectangle.stack", title: "搜索站点资源", detail: "输入关键词获取可推送的种子资源") }
-            else {
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 16)
+
+            HStack(spacing: 8) {
+                ForEach(["影视", "资源"], id: \.self) { mode in
+                    Button {
+                        guard model.mode != mode else { return }
+                        stopSearch()
+                        model.mode = mode
+                    } label: {
+                        Text(mode)
+                            .font(.system(size: 16, weight: model.mode == mode ? .semibold : .regular))
+                            .foregroundStyle(model.mode == mode ? Color.white : Color.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 44)
+                            .background(
+                                model.mode == mode ? HarvestTheme.blue : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 14)
+
+            Divider().opacity(0.45)
+
+            if model.isLoading && currentResultsAreEmpty {
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.large).tint(HarvestTheme.blue)
+                    Text(model.statusMessage.isEmpty ? "正在搜索" : model.statusMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if currentResultsAreEmpty {
+                VStack(spacing: 18) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 64, weight: .ultraLight))
+                        .foregroundStyle(Color.secondary.opacity(0.22))
+                    Text(emptyMessage)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
                 List {
                     if model.mode == "影视" {
                         ForEach(model.media) { item in
@@ -1584,48 +1635,19 @@ struct SearchView: View {
                                 .buttonStyle(.plain)
                         }
                     }
-                }.listStyle(.plain)
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
             }
         }
-        .background(Color(uiColor: .systemGroupedBackground))
-        .searchable(text: $model.query, prompt: model.mode == "影视" ? "电影、剧集、演员" : "片名、发布组、站点")
-        .searchSuggestions {
-            if !model.query.isEmpty {
-                ForEach(model.history.filter { $0.localizedCaseInsensitiveContains(model.query) }.prefix(8), id: \.self) { keyword in
-                    Button {
-                        model.query = keyword
-                        startSearch()
-                    } label: { Label(keyword, systemImage: "clock.arrow.circlepath") }
-                }
-            } else {
-                ForEach(model.history.prefix(12), id: \.self) { keyword in
-                    Button {
-                        model.query = keyword
-                        startSearch()
-                    } label: { Label(keyword, systemImage: "clock") }
-                }
-            }
-        }
-        .onSubmit(of: .search) { startSearch() }
-        .navigationTitle("搜索").navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if model.isLoading {
-                    Button { stopSearch() } label: { Image(systemName: "stop.circle") }
-                        .accessibilityLabel("停止搜索")
-                }
-                Menu {
-                    Button { showSettings = true } label: { Label("搜索设置", systemImage: "slider.horizontal.3") }
-                    if !model.history.isEmpty { Button(role: .destructive) { model.clearHistory() } label: { Label("清空搜索历史", systemImage: "trash") } }
-                } label: { Image(systemName: "ellipsis.circle") }
-            }
-        }
+        .background(Color(uiColor: .systemBackground))
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedResource) { selection in ResourcePushSheet(item: selection.value).environmentObject(appState) }
-        .sheet(isPresented: $showSettings) { SearchSettingsSheet(model: model) }
-        .sheet(isPresented: $showResourceFilters) {
-            ResourceFilterSheet(model: model)
-                .presentationDetents([.large])
+        .sheet(isPresented: $showSettings) {
+            SearchSettingsSheet(model: model) {
+                await model.loadSites(appState)
+            }
+            .presentationDetents([.large])
         }
         .task { await model.loadSites(appState); consumePendingResourceSearch() }
         .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
@@ -1637,6 +1659,18 @@ struct SearchView: View {
             model.resetLocalSettings()
         }
         .onDisappear { stopSearch() }
+    }
+
+    private var searchPlaceholder: String {
+        model.mode == "影视" ? "搜索电影、剧集..." : "搜索种子资源..."
+    }
+
+    private var currentResultsAreEmpty: Bool {
+        model.mode == "影视" ? model.media.isEmpty : model.resources.isEmpty
+    }
+
+    private var emptyMessage: String {
+        model.mode == "影视" ? "输入影视名称开始搜索" : "输入资源关键词开始搜索"
     }
 
     private func consumePendingResourceSearch() {
@@ -1743,62 +1777,224 @@ private struct ResourceFilterValuesSection: View {
 struct SearchSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var model: SearchViewModel
+    let onReload: () async -> Void
+    @State private var maxCount: Int
+    @State private var sitesEnabled: Bool
+    @State private var selectedSiteIDs: Set<Int>
+    @State private var isReloading = false
+    @State private var didSave = false
+
+    init(model: SearchViewModel, onReload: @escaping () async -> Void) {
+        self.model = model
+        self.onReload = onReload
+        _maxCount = State(initialValue: model.maxCount)
+        _sitesEnabled = State(initialValue: model.sitesEnabled)
+        _selectedSiteIDs = State(initialValue: model.selectedSiteIDs)
+    }
+
+    private var allSitesSelected: Bool {
+        !model.sites.isEmpty && selectedSiteIDs.count == model.sites.count
+    }
+
+    private let siteColumns = [
+        GridItem(.adaptive(minimum: 86, maximum: 150), spacing: 8, alignment: .leading)
+    ]
 
     var body: some View {
         NavigationStack {
-            Form {
-                Section("搜索范围") {
-                    Stepper(value: $model.maxCount, in: 0...50) {
-                        LabeledContent("最大站点数", value: model.maxCount == 0 ? "全部" : "\(model.maxCount)")
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("最大站点数").font(.headline)
+                            Text("从多少个站点搜索，默认 5，0 表示全部")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 8)
+                        Button("不限") { maxCount = 0 }
+                            .buttonStyle(.bordered)
+                            .tint(HarvestTheme.green)
+                        HStack(spacing: 4) {
+                            Button { maxCount = max(0, maxCount - 1) } label: {
+                                Image(systemName: "minus").frame(width: 30, height: 34)
+                            }
+                            .disabled(maxCount == 0)
+                            Text(maxCount == 0 ? "全部" : "\(maxCount)")
+                                .font(.headline.monospacedDigit())
+                                .frame(minWidth: 36)
+                            Button { maxCount = min(50, maxCount + 1) } label: {
+                                Image(systemName: "plus").frame(width: 30, height: 34)
+                            }
+                            .disabled(maxCount >= 50)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 5)
+                        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
                     }
-                    Toggle("指定搜索站点", isOn: $model.sitesEnabled)
-                }
-                if model.sitesEnabled {
-                    Section("站点") {
+
+                    VStack(alignment: .leading, spacing: 14) {
                         HStack {
-                            Button("全选") { model.selectedSiteIDs = Set(model.sites.map(\.id)) }
-                            Spacer()
-                            Button("随机选择") {
-                                let count = model.maxCount == 0 ? model.sites.count : min(model.maxCount, model.sites.count)
-                                model.selectedSiteIDs = Set(model.sites.shuffled().prefix(count).map(\.id))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("指定站点").font(.headline)
+                                Text(sitesEnabled ? "仅显示存活且可搜索的站点" : "已关闭，搜索时不指定站点")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("清空") { model.selectedSiteIDs = [] }
+                            Text(sitesEnabled ? "\(selectedSiteIDs.count) 个站点" : "关闭")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(HarvestTheme.blue)
+                            Toggle("", isOn: $sitesEnabled).labelsHidden()
                         }
-                        ForEach(model.sites) { site in
-                            Button {
-                                if model.selectedSiteIDs.contains(site.id) { model.selectedSiteIDs.remove(site.id) }
-                                else { model.selectedSiteIDs.insert(site.id) }
-                            } label: {
-                                HStack {
-                                    Text(site.name).foregroundStyle(.primary)
-                                    Spacer()
-                                    if model.selectedSiteIDs.contains(site.id) { Image(systemName: "checkmark.circle.fill").foregroundStyle(HarvestTheme.green) }
+
+                        HStack(spacing: 8) {
+                            SearchSettingsActionButton(
+                                title: "加载",
+                                icon: "arrow.clockwise",
+                                color: HarvestTheme.amber,
+                                isLoading: isReloading
+                            ) { reloadSites() }
+                            SearchSettingsActionButton(
+                                title: allSitesSelected ? "取消" : "全部",
+                                icon: allSitesSelected ? "square" : "checkmark.square",
+                                color: HarvestTheme.green
+                            ) { toggleAllSites() }
+                            SearchSettingsActionButton(
+                                title: "随机",
+                                icon: "dice",
+                                color: HarvestTheme.green
+                            ) { selectRandomSites() }
+                            SearchSettingsActionButton(
+                                title: didSave ? "已保存" : "保存",
+                                icon: didSave ? "checkmark" : "square.and.arrow.down",
+                                color: HarvestTheme.blue
+                            ) { persistDraft() }
+                        }
+
+                        if model.sites.isEmpty {
+                            Text(isReloading ? "正在加载站点" : "没有可搜索的存活站点")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 100)
+                        } else {
+                            LazyVGrid(columns: siteColumns, alignment: .leading, spacing: 8) {
+                                ForEach(model.sites) { site in
+                                    Button {
+                                        sitesEnabled = true
+                                        if selectedSiteIDs.contains(site.id) {
+                                            selectedSiteIDs.remove(site.id)
+                                        } else {
+                                            selectedSiteIDs.insert(site.id)
+                                        }
+                                        didSave = false
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            Text(site.name)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.75)
+                                            if selectedSiteIDs.contains(site.id) {
+                                                Image(systemName: "checkmark")
+                                                    .font(.caption2.weight(.bold))
+                                            }
+                                        }
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(selectedSiteIDs.contains(site.id) ? HarvestTheme.blue : Color.primary)
+                                        .frame(maxWidth: .infinity, minHeight: 36)
+                                        .padding(.horizontal, 8)
+                                        .background(
+                                            selectedSiteIDs.contains(site.id)
+                                                ? HarvestTheme.blue.opacity(0.10)
+                                                : Color(uiColor: .systemBackground),
+                                            in: RoundedRectangle(cornerRadius: 7)
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 7)
+                                                .stroke(selectedSiteIDs.contains(site.id) ? HarvestTheme.blue.opacity(0.45) : Color.primary.opacity(0.08))
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
                     }
+                    .padding(14)
+                    .background(Color(uiColor: .secondarySystemBackground).opacity(0.72), in: RoundedRectangle(cornerRadius: 8))
                 }
-                if !model.history.isEmpty {
-                    Section("搜索历史") {
-                        ForEach(model.history, id: \.self) { keyword in
-                            HStack {
-                                Text(keyword)
-                                Spacer()
-                                Button(role: .destructive) { model.removeHistory(keyword) } label: { Image(systemName: "xmark.circle") }.buttonStyle(.plain)
-                            }
-                        }
-                        Button("清空历史", role: .destructive) { model.clearHistory() }
-                    }
-                }
+                .padding(16)
             }
             .navigationTitle("搜索设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("保存") { model.saveSettings(); dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") {
+                        persistDraft()
+                        dismiss()
+                    }
+                }
             }
+            .onChange(of: maxCount) { _, _ in didSave = false }
+            .onChange(of: sitesEnabled) { _, _ in didSave = false }
         }
+    }
+
+    private func reloadSites() {
+        guard !isReloading else { return }
+        isReloading = true
+        Task {
+            await onReload()
+            selectedSiteIDs = model.selectedSiteIDs
+            sitesEnabled = model.sitesEnabled
+            isReloading = false
+            didSave = false
+        }
+    }
+
+    private func toggleAllSites() {
+        sitesEnabled = true
+        selectedSiteIDs = allSitesSelected ? [] : Set(model.sites.map(\.id))
+        didSave = false
+    }
+
+    private func selectRandomSites() {
+        sitesEnabled = true
+        let count = maxCount == 0 ? model.sites.count : min(maxCount, model.sites.count)
+        selectedSiteIDs = Set(model.sites.shuffled().prefix(count).map(\.id))
+        didSave = false
+    }
+
+    private func persistDraft() {
+        model.maxCount = maxCount
+        model.sitesEnabled = sitesEnabled
+        model.selectedSiteIDs = selectedSiteIDs
+        model.saveSettings()
+        didSave = true
+    }
+}
+
+private struct SearchSettingsActionButton: View {
+    let title: String
+    let icon: String
+    let color: Color
+    var isLoading = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if isLoading { ProgressView().controlSize(.small).tint(color) }
+                else { Image(systemName: icon) }
+                Text(title).lineLimit(1).minimumScaleFactor(0.75)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(color)
+            .frame(maxWidth: .infinity, minHeight: 38)
+            .background(color.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(color.opacity(0.30)))
+        }
+        .buttonStyle(.plain)
+        .disabled(isLoading)
     }
 }
 
@@ -2459,8 +2655,16 @@ struct ResourcePushSheet: View {
 private struct MediaCollection: Identifiable {
     let cacheKey: String
     let title: String
+    let source: String
     let items: [MediaItem]
     var id: String { cacheKey }
+}
+
+private enum NewsMediaSource: String, CaseIterable, Identifiable {
+    case tmdb = "TMDB"
+    case douban = "豆瓣"
+
+    var id: String { rawValue }
 }
 
 private struct MediaCatalogDefinition {
@@ -2490,12 +2694,45 @@ struct NewsView: View {
     @State private var selectedMedia: MediaItem?
     @State private var selectedCollection: MediaCollection?
     @State private var showNotices = false
+    @State private var selectedSource: NewsMediaSource = .tmdb
+
+    private var enabledSources: [NewsMediaSource] {
+        var sources: [NewsMediaSource] = []
+        if appState.mediaTMDBEnabled { sources.append(.tmdb) }
+        if appState.mediaDoubanEnabled { sources.append(.douban) }
+        return sources
+    }
+
+    private var activeSource: NewsMediaSource? {
+        enabledSources.contains(selectedSource) ? selectedSource : enabledSources.first
+    }
+
+    private var visibleCollections: [MediaCollection] {
+        guard let activeSource else { return [] }
+        return collections.filter { collection in
+            activeSource == .douban
+                ? isDoubanSource(collection.source)
+                : collection.source.caseInsensitiveCompare(NewsMediaSource.tmdb.rawValue) == .orderedSame
+        }
+    }
 
     var body: some View {
         ScrollView {
             if isLoading { LoadingState() }
             else {
                 LazyVStack(alignment: .leading, spacing: 20) {
+                    if enabledSources.count > 1 {
+                        HStack {
+                            Picker("影视来源", selection: $selectedSource) {
+                                ForEach(enabledSources) { source in
+                                    Text(source.rawValue).tag(source)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 148)
+                            Spacer(minLength: 0)
+                        }
+                    }
                     if usingCachedData {
                         SessionCacheBanner(cachedAt: cachedAt)
                     }
@@ -2509,7 +2746,7 @@ struct NewsView: View {
                         }
                         .frame(maxWidth: .infinity, minHeight: 240)
                     }
-                    ForEach(collections) { collection in
+                    ForEach(visibleCollections) { collection in
                         MediaCarousel(
                             title: collection.title,
                             items: collection.items,
@@ -2517,6 +2754,7 @@ struct NewsView: View {
                             onShowAll: { selectedCollection = collection }
                         )
                     }
+                    .animation(.easeInOut(duration: 0.2), value: selectedSource)
                     Button { showNotices = true } label: {
                         NewsLinkRow(title: "消息动态", subtitle: "查看站点公告、任务结果和系统提醒", icon: "antenna.radiowaves.left.and.right", color: HarvestTheme.green)
                     }
@@ -2529,7 +2767,7 @@ struct NewsView: View {
         .refreshable { await load() }
         .navigationTitle("资讯").navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            if appState.mediaDoubanEnabled && doubanTags.count > 1 {
+            if activeSource == .douban && doubanTags.count > 1 {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Picker("豆瓣标签", selection: $selectedDoubanTag) {
@@ -2542,11 +2780,20 @@ struct NewsView: View {
                 }
             }
         }
-        .task { if isLoading { await load() } }
+        .task {
+            selectOnlyEnabledSource()
+            if isLoading { await load() }
+        }
         .onChange(of: appState.refreshGeneration) { _, _ in Task { await load() } }
         .onChange(of: selectedDoubanTag) { _, _ in Task { await load() } }
-        .onChange(of: appState.mediaTMDBEnabled) { _, _ in Task { await load() } }
-        .onChange(of: appState.mediaDoubanEnabled) { _, _ in Task { await load() } }
+        .onChange(of: appState.mediaTMDBEnabled) { _, _ in
+            selectOnlyEnabledSource()
+            Task { await load() }
+        }
+        .onChange(of: appState.mediaDoubanEnabled) { _, _ in
+            selectOnlyEnabledSource()
+            Task { await load() }
+        }
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedCollection) { collection in MediaCollectionSheet(collection: collection).environmentObject(appState) }
         .sheet(isPresented: $showNotices) { NoticeView().environmentObject(appState).presentationDetents([.large]) }
@@ -2650,6 +2897,14 @@ struct NewsView: View {
         }
     }
 
+    private func selectOnlyEnabledSource() {
+        if appState.mediaTMDBEnabled && !appState.mediaDoubanEnabled {
+            selectedSource = .tmdb
+        } else if appState.mediaDoubanEnabled && !appState.mediaTMDBEnabled {
+            selectedSource = .douban
+        }
+    }
+
     private func cachedCollection(
         _ definition: MediaCatalogDefinition
     ) async -> (collection: MediaCollection, cachedAt: Date)? {
@@ -2658,7 +2913,7 @@ struct NewsView: View {
             MediaItem($0, source: definition.source, mediaType: definition.mediaType)
         }
         return (
-            MediaCollection(cacheKey: definition.cacheKey, title: definition.title, items: items),
+            MediaCollection(cacheKey: definition.cacheKey, title: definition.title, source: definition.source, items: items),
             cached.cachedAt
         )
     }
@@ -2678,7 +2933,7 @@ struct NewsView: View {
                 MediaItem($0, source: definition.source, mediaType: definition.mediaType)
             }
             return (
-                MediaCollection(cacheKey: definition.cacheKey, title: definition.title, items: items),
+                MediaCollection(cacheKey: definition.cacheKey, title: definition.title, source: definition.source, items: items),
                 raw
             )
         } catch {

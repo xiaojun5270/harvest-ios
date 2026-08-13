@@ -1151,6 +1151,20 @@ struct HarvestSetupStatus {
     }
 }
 
+struct ManualTaskFeedback: Identifiable, Equatable {
+    enum Phase: Equatable {
+        case running
+        case success
+        case failure
+        case cancelled
+    }
+
+    let id: UUID
+    var title: String
+    var message: String?
+    var phase: Phase
+}
+
 @MainActor
 final class AppState: ObservableObject {
     @Published var isRestoringSession = true
@@ -1161,6 +1175,7 @@ final class AppState: ObservableObject {
     @Published var selectedTab = 2
     @Published var pendingResourceSearch: String?
     @Published var presentedError: String?
+    @Published private(set) var manualTaskFeedback: ManualTaskFeedback?
     @Published var appearance: AppAppearance
     @Published var accent: AppAccent
     @Published var interfaceDensity: AppInterfaceDensity
@@ -1179,6 +1194,8 @@ final class AppState: ObservableObject {
     private(set) var refreshToken: String
     private var lastAutomaticRefresh = Date.distantPast
     private var loginAttemptID: UUID?
+    private var manualTasks: [UUID: ManualTaskFeedback] = [:]
+    private var manualTaskOrder: [UUID] = []
 
     var colorScheme: ColorScheme? { appearance.scheme }
     var loginHistory: [LoginRecord] { loadLoginHistory() }
@@ -1401,6 +1418,9 @@ final class AppState: ObservableObject {
         selectedTab = 2
         pendingResourceSearch = nil
         presentedError = nil
+        manualTaskFeedback = nil
+        manualTasks.removeAll()
+        manualTaskOrder.removeAll()
         appearance = .system
         privacyMode = false
         mediaTMDBEnabled = false
@@ -1600,6 +1620,9 @@ final class AppState: ObservableObject {
         recordAppLog(.info, "账号已退出登录")
         loginAttemptID = nil
         isBusy = false
+        manualTaskFeedback = nil
+        manualTasks.removeAll()
+        manualTaskOrder.removeAll()
         clearSession()
         Task { await updateUnreadNoticeCount(0) }
     }
@@ -1738,18 +1761,188 @@ final class AppState: ObservableObject {
         }
     }
 
+    @discardableResult
+    func beginManualTask(_ title: String, detail: String? = nil) -> UUID {
+        let id = UUID()
+        let feedback = ManualTaskFeedback(id: id, title: title, message: detail, phase: .running)
+        manualTasks[id] = feedback
+        manualTaskOrder.append(id)
+        manualTaskFeedback = feedback
+        return id
+    }
+
+    func finishManualTask(
+        _ id: UUID,
+        success: Bool,
+        message: String? = nil
+    ) {
+        finishManualTask(id, phase: success ? .success : .failure, message: message)
+    }
+
+    func cancelManualTask(_ id: UUID, message: String = "操作已取消") {
+        finishManualTask(id, phase: .cancelled, message: message)
+    }
+
+    @discardableResult
+    func runManualTask(
+        title: String,
+        successMessage: String,
+        operation: () async -> Bool
+    ) async -> Bool {
+        presentedError = nil
+        let id = beginManualTask(title)
+        let succeeded = await operation()
+        if Task.isCancelled {
+            cancelManualTask(id)
+            return false
+        }
+        finishManualTask(
+            id,
+            success: succeeded,
+            message: succeeded ? successMessage : "操作失败，请查看错误详情"
+        )
+        return succeeded
+    }
+
+    func runManualRefresh(
+        title: String,
+        successMessage: String = "刷新完成",
+        operation: () async -> Void
+    ) async {
+        presentedError = nil
+        let id = beginManualTask(title)
+        await operation()
+        if Task.isCancelled {
+            cancelManualTask(id)
+            return
+        }
+        let newError = presentedError
+        finishManualTask(
+            id,
+            success: newError == nil,
+            message: newError == nil ? successMessage : "刷新失败，请查看错误详情"
+        )
+    }
+
     func perform(
         _ path: String,
         method: HTTPMethod = .post,
         query: [String: Any] = [:],
-        body: Any? = nil
+        body: Any? = nil,
+        showsFeedback: Bool = true,
+        feedbackTitle: String? = nil,
+        successMessage: String? = nil
     ) async -> Bool {
+        let labels = manualTaskLabels(for: path, method: method, body: body)
+        let feedbackID = showsFeedback
+            ? beginManualTask(feedbackTitle ?? labels.title)
+            : nil
         do {
             _ = try await api(path, method: method, query: query, body: body)
+            if let feedbackID {
+                finishManualTask(feedbackID, success: true, message: successMessage ?? labels.success)
+            }
             return true
         } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                if let feedbackID { cancelManualTask(feedbackID) }
+                return false
+            }
+            if let feedbackID {
+                finishManualTask(feedbackID, success: false, message: "操作失败，请查看错误详情")
+            }
             presentedError = error.localizedDescription
             return false
+        }
+    }
+
+    private func finishManualTask(
+        _ id: UUID,
+        phase: ManualTaskFeedback.Phase,
+        message: String?
+    ) {
+        guard var feedback = manualTasks[id] else { return }
+        feedback.phase = phase
+        switch phase {
+        case .running:
+            feedback.message = message
+        case .success:
+            feedback.title = message ?? "操作完成"
+            feedback.message = nil
+        case .failure:
+            feedback.title = "操作失败"
+            feedback.message = message
+        case .cancelled:
+            feedback.title = "操作已取消"
+            feedback.message = nil
+        }
+        manualTasks[id] = feedback
+
+        guard manualTaskFeedback?.id == id else {
+            removeManualTask(id)
+            return
+        }
+        manualTaskFeedback = feedback
+        let delay: Duration = phase == .failure ? .milliseconds(1_500) : .milliseconds(1_050)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            self?.removeManualTask(id)
+        }
+    }
+
+    private func removeManualTask(_ id: UUID) {
+        manualTasks[id] = nil
+        manualTaskOrder.removeAll { $0 == id }
+        guard manualTaskFeedback?.id == id else { return }
+        manualTaskFeedback = manualTaskOrder.reversed().compactMap { manualTasks[$0] }.first
+    }
+
+    private func manualTaskLabels(
+        for path: String,
+        method: HTTPMethod,
+        body: Any?
+    ) -> (title: String, success: String) {
+        let normalized = path.lowercased()
+        if normalized.contains(APIPath.siteSign.lowercased()) {
+            return ("正在签到", "签到任务已完成")
+        }
+        if normalized.contains(APIPath.siteStatus.lowercased()) {
+            return ("正在刷新站点", "站点数据已更新")
+        }
+        if normalized.contains(APIPath.siteRepeat.lowercased())
+            || normalized.contains(APIPath.downloaderRepeat.lowercased()) {
+            return ("正在执行辅种", "辅种任务已提交")
+        }
+        if normalized.contains(APIPath.taskExecute.lowercased()) {
+            return ("正在运行任务", "任务已开始执行")
+        }
+        if normalized.contains(APIPath.downloaderControl.lowercased()) {
+            let command = (body as? [String: Any])?.string("command")?.lowercased() ?? ""
+            if command.contains("start") || command == "resume" { return ("正在开始下载任务", "下载任务已开始") }
+            if command.contains("stop") || command == "pause" { return ("正在暂停下载任务", "下载任务已暂停") }
+            if command.contains("remove") || command == "delete" { return ("正在删除下载任务", "下载任务已删除") }
+            if command.contains("recheck") || command.contains("verify") { return ("正在校验下载任务", "校验任务已提交") }
+            return ("正在执行下载任务", "下载任务已完成")
+        }
+        if normalized.contains(APIPath.cacheClear.lowercased()) || normalized.contains("cache/clear") {
+            return ("正在清理缓存", "缓存已清理")
+        }
+        if normalized.contains(APIPath.noticesRead.lowercased()) || normalized.contains("/notice") {
+            return ("正在更新消息", "消息已更新")
+        }
+        if normalized.contains("notify/test") { return ("正在发送测试通知", "测试通知已发送") }
+        if normalized.contains("restart") { return ("正在重启服务", "重启任务已提交") }
+        if normalized.contains("push") { return ("正在推送任务", "推送任务已提交") }
+
+        switch method {
+        case .delete:
+            return ("正在删除", "删除完成")
+        case .put, .patch:
+            return ("正在保存更改", "更改已保存")
+        case .post:
+            return ("正在提交", "提交完成")
+        case .get:
+            return ("正在加载", "加载完成")
         }
     }
 
