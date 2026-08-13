@@ -1646,7 +1646,6 @@ struct SearchView: View {
             }
         }
         .background(Color(uiColor: .systemBackground))
-        .toolbar(.hidden, for: .navigationBar)
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedResource) { selection in ResourcePushSheet(item: selection.value).environmentObject(appState) }
         .sheet(isPresented: $showSettings) {

@@ -1149,6 +1149,7 @@ struct MainShellView: View {
             }
             .harvestNavigationChrome()
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     BrandMark(size: 28)
