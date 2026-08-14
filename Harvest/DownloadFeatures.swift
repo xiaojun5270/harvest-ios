@@ -921,16 +921,14 @@ final class DownloadsViewModel: ObservableObject {
                             timeoutInterval: 8
                         )
                         guard JSONSerialization.isValidJSONObject(value),
-                              let data = try? JSONSerialization.data(withJSONObject: value) else {
+                              let data = try? JSONSerialization.data(withJSONObject: value),
+                              let decoded = try? JSONSerialization.jsonObject(
+                                  with: data,
+                                  options: [.fragmentsAllowed]
+                              ) else {
                             return (id, nil)
                         }
-                        let summary = await Task.detached(priority: .utility) {
-                            guard let decoded = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
-                                return nil as DownloaderTorrentSummary?
-                            }
-                            return downloaderTorrentSummary(decoded, category: category)
-                        }.value
-                        return (id, summary)
+                        return (id, downloaderTorrentSummary(decoded, category: category))
                     } catch {
                         recordAppLog(.warning, "下载器 \(id) 种子统计读取失败：\(error.localizedDescription)")
                         return (id, nil)

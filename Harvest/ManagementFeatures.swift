@@ -4213,12 +4213,14 @@ final class BrowserSessionModel: ObservableObject {
                 let y = CGFloat(piece.offset * pointScale)
                 guard y < outputHeight else { continue }
                 let height = min(piece.image.size.height, outputHeight - y)
+                context.cgContext.saveGState()
+                context.cgContext.clip(to: CGRect(x: 0, y: y, width: first.image.size.width, height: height))
                 piece.image.draw(
-                    in: CGRect(x: 0, y: y, width: first.image.size.width, height: height),
-                    from: CGRect(x: 0, y: 0, width: piece.image.size.width, height: height),
+                    in: CGRect(x: 0, y: y, width: first.image.size.width, height: piece.image.size.height),
                     blendMode: .copy,
                     alpha: 1
                 )
+                context.cgContext.restoreGState()
             }
         }
     }
