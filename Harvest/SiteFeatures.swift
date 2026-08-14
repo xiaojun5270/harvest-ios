@@ -1040,7 +1040,7 @@ private struct SiteSearchFilterBar: View {
             .padding(.vertical, 8)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 7) {
+                HStack(spacing: 7) {
                     Menu {
                         ForEach(SiteSortField.allCases) { field in
                             Button {
