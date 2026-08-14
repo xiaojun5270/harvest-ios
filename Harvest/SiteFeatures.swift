@@ -251,6 +251,7 @@ private enum SiteFilterStorageKey {
     static let availability = "site.filter.availability"
     static let condition = "site.filter.condition"
     static let selectedTags = "site.filter.selectedTags"
+    static let activeTags = "site.filter.activeTags"
     static let selectedTypes = "site.filter.selectedTypes"
     static let selectedUsername = "site.filter.selectedUsername"
     static let selectedEmail = "site.filter.selectedEmail"
@@ -310,7 +311,17 @@ final class SitesViewModel: ObservableObject {
     }
     @Published var selectedTags: Set<String> = [] {
         didSet {
+            let validActiveTags = activeTags.intersection(selectedTags)
+            if validActiveTags != activeTags {
+                activeTags = validActiveTags
+            }
             UserDefaults.standard.set(selectedTags.sorted(), forKey: SiteFilterStorageKey.selectedTags)
+            rebuildFilteredSites()
+        }
+    }
+    @Published var activeTags: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(activeTags.sorted(), forKey: SiteFilterStorageKey.activeTags)
             rebuildFilteredSites()
         }
     }
@@ -353,6 +364,8 @@ final class SitesViewModel: ObservableObject {
             }
         }
         selectedTags = Set(defaults.stringArray(forKey: SiteFilterStorageKey.selectedTags) ?? [])
+        activeTags = Set(defaults.stringArray(forKey: SiteFilterStorageKey.activeTags) ?? [])
+            .intersection(selectedTags)
         selectedTypes = Set(defaults.stringArray(forKey: SiteFilterStorageKey.selectedTypes) ?? [])
         selectedUsername = defaults.string(forKey: SiteFilterStorageKey.selectedUsername) ?? ""
         selectedEmail = defaults.string(forKey: SiteFilterStorageKey.selectedEmail) ?? ""
@@ -419,7 +432,7 @@ final class SitesViewModel: ObservableObject {
             case .downloading: if site.leeching <= 0 { return false }
             case .lowRatio: if site.statusHistory.isEmpty || site.ratio >= 1 { return false }
             }
-            if !selectedTags.isEmpty && selectedTags.isDisjoint(with: site.tags) { return false }
+            if !activeTags.isEmpty && activeTags.isDisjoint(with: site.tags) { return false }
             if !selectedTypes.isEmpty && !selectedTypes.contains(resolvedSiteType(for: site)) { return false }
             if !selectedUsername.isEmpty
                 && normalizedSiteIdentity(site.username) != normalizedSiteIdentity(selectedUsername) { return false }
@@ -474,7 +487,8 @@ final class SitesViewModel: ObservableObject {
         var count = 0
         if availability != .alive { count += 1 }
         if condition != .all { count += 1 }
-        count += selectedTags.count + selectedTypes.count
+        count += activeTags.count
+        count += selectedTypes.count
         if !selectedUsername.isEmpty { count += 1 }
         if !selectedEmail.isEmpty { count += 1 }
         return count
@@ -486,6 +500,7 @@ final class SitesViewModel: ObservableObject {
     func clearFilters() {
         availability = .alive
         condition = .all
+        activeTags = []
         selectedTags = []
         selectedTypes = []
         selectedUsername = ""
@@ -494,6 +509,7 @@ final class SitesViewModel: ObservableObject {
         defaults.removeObject(forKey: SiteFilterStorageKey.availability)
         defaults.removeObject(forKey: SiteFilterStorageKey.condition)
         defaults.removeObject(forKey: SiteFilterStorageKey.selectedTags)
+        defaults.removeObject(forKey: SiteFilterStorageKey.activeTags)
         defaults.removeObject(forKey: SiteFilterStorageKey.selectedTypes)
         defaults.removeObject(forKey: SiteFilterStorageKey.selectedUsername)
         defaults.removeObject(forKey: SiteFilterStorageKey.selectedEmail)
@@ -523,6 +539,15 @@ final class SitesViewModel: ObservableObject {
         ascending = field.defaultAscending
     }
 
+    func selectTag(_ tag: String) {
+        guard selectedTags.contains(tag) else { return }
+        if activeTags.contains(tag) {
+            activeTags.remove(tag)
+        } else {
+            activeTags.insert(tag)
+        }
+    }
+
     func showActiveSites() {
         clearSummaryConflictingFilters()
         availability = .alive
@@ -543,6 +568,7 @@ final class SitesViewModel: ObservableObject {
 
     private func clearSummaryConflictingFilters() {
         query = ""
+        activeTags = []
         selectedTags = []
         selectedTypes = []
         selectedUsername = ""
@@ -1014,7 +1040,7 @@ private struct SiteSearchFilterBar: View {
             .padding(.vertical, 8)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 7) {
+                LazyHStack(spacing: 7) {
                     Menu {
                         ForEach(SiteSortField.allCases) { field in
                             Button {
@@ -1058,8 +1084,15 @@ private struct SiteSearchFilterBar: View {
                     ForEach(model.selectedTypes.sorted(), id: \.self) { type in
                         filterToken(type)
                     }
+                    if !model.selectedTags.isEmpty {
+                        selectableTagToken("全部", isSelected: model.activeTags.isEmpty) {
+                            model.activeTags = []
+                        }
+                    }
                     ForEach(model.selectedTags.sorted(), id: \.self) { tag in
-                        filterToken(tag)
+                        selectableTagToken(tag, isSelected: model.activeTags.contains(tag)) {
+                            model.selectTag(tag)
+                        }
                     }
                     if !model.selectedUsername.isEmpty {
                         filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode))
@@ -1086,6 +1119,35 @@ private struct SiteSearchFilterBar: View {
             .background(HarvestTheme.blue.opacity(0.11), in: Capsule())
             .overlay { Capsule().stroke(HarvestTheme.blue.opacity(0.18), lineWidth: 0.75) }
             .accessibilityLabel("当前筛选：\(title)")
+    }
+
+    private func selectableTagToken(
+        _ title: String,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                Text(title).lineLimit(1)
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 10)
+            .frame(minHeight: 28)
+            .foregroundStyle(isSelected ? Color.white : HarvestTheme.blue)
+            .background(
+                isSelected ? HarvestTheme.blue : HarvestTheme.blue.opacity(0.08),
+                in: Capsule()
+            )
+            .overlay {
+                Capsule().stroke(HarvestTheme.blue.opacity(isSelected ? 0 : 0.22), lineWidth: 0.75)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("标签筛选：\(title)，\(isSelected ? "已选择" : "未选择")")
     }
 }
 
@@ -1525,7 +1587,7 @@ struct SiteFilterSheet: View {
                             Toggle(tag, isOn: tagBinding(tag))
                         }
                     } header: {
-                        filterSectionHeader("标签", selectedCount: model.selectedTags.count) {
+                        filterSectionHeader("快捷标签", selectedCount: model.selectedTags.count) {
                             model.selectedTags.removeAll()
                         }
                     }
@@ -2615,7 +2677,7 @@ struct SiteRow: View {
             SiteCardMetric(icon: "bolt.fill", label: "魔力", value: wanMetricText(site.magic), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "diamond.fill", label: "积分", value: wanMetricText(site.score), color: HarvestTheme.coral, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "timer", label: "时魔", value: percentageMetricText(site.bonusHour), color: HarvestTheme.purple, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "timer", label: "时魔", value: integerMetricText(site.bonusHour), color: HarvestTheme.purple, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.orange, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.indigo, glowRotation: metricGlowRotation)
         }
@@ -2756,20 +2818,15 @@ struct SiteRow: View {
         return "\(days / 365)年前"
     }
 
-    private var ratioText: String { percentageMetricText(site.ratio) }
+    private var ratioText: String { "\(integerMetricText(site.ratio))%" }
     private var ratioColor: Color { site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.teal }
     private func wanMetricText(_ value: Double) -> String {
-        guard abs(value) >= 10_000 else { return metricDecimalText(value) }
-        return "\(metricDecimalText(value / 10_000))w"
+        guard abs(value) >= 10_000 else { return integerMetricText(value) }
+        return "\(integerMetricText(value / 10_000))w"
     }
 
-    private func percentageMetricText(_ value: Double) -> String {
-        "\(metricDecimalText(value))%"
-    }
-
-    private func metricDecimalText(_ value: Double) -> String {
-        String(format: "%.2f", value)
-            .replacingOccurrences(of: #"\.?0+$"#, with: "", options: .regularExpression)
+    private func integerMetricText(_ value: Double) -> String {
+        String(format: "%.0f", value)
     }
 
     private var hrText: String {

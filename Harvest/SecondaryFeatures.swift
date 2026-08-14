@@ -982,8 +982,18 @@ struct MediaItem: Identifiable {
 private func mediaPosterURL(_ value: String, source: String) -> String {
     var normalized = normalizedRemoteImageURL(value)
     guard !normalized.isEmpty else { return "" }
-    if source == "TMDB", normalized.hasPrefix("/") {
-        normalized = "https://image.tmdb.org/t/p/w500\(normalized)"
+    if source == "TMDB" {
+        if normalized.hasPrefix("/") {
+            normalized = "https://image.tmdb.org/t/p/w342\(normalized)"
+        } else if normalized.lowercased().contains("image.tmdb.org/t/p/") {
+            for size in ["original", "w500", "w780", "w1280"] {
+                normalized = normalized.replacingOccurrences(
+                    of: "/t/p/\(size)/",
+                    with: "/t/p/w342/",
+                    options: [.caseInsensitive]
+                )
+            }
+        }
     }
     if isDoubanSource(source), normalized.hasPrefix("/") {
         normalized = "https://movie.douban.com\(normalized)"
@@ -1004,6 +1014,17 @@ enum ResourceSearchSortField: String, CaseIterable, Identifiable {
 
 @MainActor
 final class SearchViewModel: ObservableObject {
+    private struct MediaSearchResult: @unchecked Sendable {
+        let source: String
+        let items: [MediaItem]
+        let errorMessage: String?
+    }
+
+    private struct MediaSearchCacheEntry {
+        let items: [MediaItem]
+        let cachedAt: Date
+    }
+
     @Published var query = ""
     @Published var mode = "影视"
     @Published var media: [MediaItem] = []
@@ -1029,6 +1050,8 @@ final class SearchViewModel: ObservableObject {
     @Published var resourceFilterMinSizeGB = 0.0
     @Published var resourceFilterMaxSizeGB = 100.0
     private var searchGeneration = 0
+    private var mediaSearchCache: [String: MediaSearchCacheEntry] = [:]
+    private let mediaSearchCacheLifetime: TimeInterval = 5 * 60
 
     init() {
         let defaults = UserDefaults.standard
@@ -1103,29 +1126,71 @@ final class SearchViewModel: ObservableObject {
         }
         do {
             if searchMode == "影视" {
-                async let tmdbResult = fetchMedia(
-                    appState,
-                    path: "\(APIPath.tmdbSearch)/\(urlPathSegment(term))",
-                    source: "TMDB"
-                )
-                async let doubanResult = fetchMedia(
-                    appState,
-                    path: APIPath.doubanSearch,
-                    source: "豆瓣",
-                    query: ["q": term]
-                )
-                let (tmdb, douban) = await (tmdbResult, doubanResult)
-                guard searchGeneration == generation else { return }
-                media = uniqueMediaItems(tmdb.items + douban.items)
-                statusMessage = "找到 \(media.count) 条影视信息"
-                if tmdb.errorMessage != nil, douban.errorMessage != nil {
-                    appState.presentedError = [tmdb.errorMessage, douban.errorMessage]
+                let cacheKey = normalizedMediaSearchCacheKey(term)
+                let cachedEntry = mediaSearchCache[cacheKey].flatMap { entry in
+                    Date().timeIntervalSince(entry.cachedAt) <= mediaSearchCacheLifetime ? entry : nil
+                }
+                if let cachedEntry {
+                    media = cachedEntry.items
+                    statusMessage = "已显示 \(media.count) 条缓存结果，正在更新"
+                } else {
+                    mediaSearchCache[cacheKey] = nil
+                    media = []
+                }
+
+                var sourceItems = Dictionary(grouping: media, by: \.source)
+                var errors: [String: String] = [:]
+                var receivedFreshResult = false
+                await withTaskGroup(of: MediaSearchResult.self) { group in
+                    group.addTask {
+                        await Self.fetchMedia(
+                            appState,
+                            path: "\(APIPath.tmdbSearch)/\(urlPathSegment(term))",
+                            source: "TMDB"
+                        )
+                    }
+                    group.addTask {
+                        await Self.fetchMedia(
+                            appState,
+                            path: APIPath.doubanSearch,
+                            source: "豆瓣",
+                            query: ["q": term]
+                        )
+                    }
+
+                    for await result in group {
+                        guard searchGeneration == generation, !Task.isCancelled else {
+                            group.cancelAll()
+                            return
+                        }
+                        if let errorMessage = result.errorMessage {
+                            errors[result.source] = errorMessage
+                        } else {
+                            sourceItems[result.source] = result.items
+                            receivedFreshResult = true
+                        }
+                        media = uniqueMediaItems(
+                            (sourceItems["TMDB"] ?? []) + (sourceItems["豆瓣"] ?? [])
+                        )
+                        statusMessage = media.isEmpty ? "正在搜索影视信息" : "已找到 \(media.count) 条影视信息"
+                    }
+                }
+
+                guard searchGeneration == generation, !Task.isCancelled else { return }
+                if receivedFreshResult, !media.isEmpty {
+                    mediaSearchCache[cacheKey] = MediaSearchCacheEntry(items: media, cachedAt: Date())
+                    trimMediaSearchCache()
+                }
+                if errors.count == 2, media.isEmpty {
+                    appState.presentedError = [errors["TMDB"], errors["豆瓣"]]
                         .compactMap { $0 }
                         .joined(separator: "\n")
-                } else if douban.errorMessage != nil {
+                } else if errors["豆瓣"] != nil {
                     statusMessage += " · 豆瓣搜索暂不可用"
-                } else if tmdb.errorMessage != nil {
+                } else if errors["TMDB"] != nil {
                     statusMessage += " · TMDB 搜索暂不可用"
+                } else if media.isEmpty {
+                    statusMessage = "未找到相关影视信息"
                 }
             } else {
                 for try await event in APIClient.shared.streamSSE(
@@ -1174,25 +1239,43 @@ final class SearchViewModel: ObservableObject {
         }
     }
 
-    private func fetchMedia(
+    private static func fetchMedia(
         _ appState: AppState,
         path: String,
         source: String,
         query: [String: Any] = [:]
-    ) async -> (items: [MediaItem], errorMessage: String?) {
+    ) async -> MediaSearchResult {
         do {
-            let raw = try await appState.api(path, query: query)
+            let raw = try await appState.api(path, query: query, timeoutInterval: 12)
             let rows = mediaRows(raw)
             if rows.isEmpty {
                 await AppLogStore.shared.append(.warning, "\(source) 返回空或未知的数据结构")
             } else {
                 await AppLogStore.shared.append(.info, "\(source) 解析到 \(rows.count) 条影视数据")
             }
-            return (rows.map { MediaItem($0, source: source) }, nil)
+            return MediaSearchResult(source: source, items: rows.map { MediaItem($0, source: source) }, errorMessage: nil)
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                return MediaSearchResult(source: source, items: [], errorMessage: nil)
+            }
             await AppLogStore.shared.append(.error, "\(source) 影视接口失败：\(error.localizedDescription)")
-            return ([], "\(source)：\(error.localizedDescription)")
+            return MediaSearchResult(source: source, items: [], errorMessage: "\(source)：\(error.localizedDescription)")
         }
+    }
+
+    private func normalizedMediaSearchCacheKey(_ value: String) -> String {
+        value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private func trimMediaSearchCache() {
+        guard mediaSearchCache.count > 20 else { return }
+        let staleKeys = mediaSearchCache
+            .sorted { $0.value.cachedAt < $1.value.cachedAt }
+            .prefix(mediaSearchCache.count - 20)
+            .map(\.key)
+        staleKeys.forEach { mediaSearchCache[$0] = nil }
     }
 
     func loadSites(_ appState: AppState) async {
@@ -2339,7 +2422,6 @@ struct MediaDetailSheet: View {
     }
 
     private func load() async {
-        defer { isLoading = false }
         let path: String
         if isDoubanSource(item.source) {
             path = APIPath.doubanSubject + urlPathSegment(item.remoteID)
@@ -2347,11 +2429,31 @@ struct MediaDetailSheet: View {
             switch item.mediaType.lowercased() {
             case "tv": path = APIPath.tmdbTV + urlPathSegment(item.remoteID)
             case "person": path = APIPath.tmdbPerson + urlPathSegment(item.remoteID)
-            default: path = APIPath.tmdbMovie + urlPathSegment(item.remoteID)
+                default: path = APIPath.tmdbMovie + urlPathSegment(item.remoteID)
             }
         }
-        do { detail = mediaPayloadDictionary(try await appState.api(path)) }
-        catch { appState.presentedError = error.localizedDescription }
+        let cacheKey = "media.detail|\(item.source)|\(item.mediaType)|\(item.remoteID)"
+        if let cached = await appState.readSessionCacheData(cacheKey),
+           let raw = try? JSONSerialization.jsonObject(with: cached.payload, options: [.fragmentsAllowed]),
+           let cachedDetail = mediaPayloadDictionary(raw) {
+            detail = cachedDetail
+            isLoading = false
+            if Date().timeIntervalSince(cached.cachedAt) < 10 * 60 { return }
+        }
+
+        defer { isLoading = false }
+        do {
+            let raw = try await appState.api(path, timeoutInterval: 12)
+            detail = mediaPayloadDictionary(raw)
+            if JSONSerialization.isValidJSONObject(raw),
+               let payload = try? JSONSerialization.data(withJSONObject: raw) {
+                await appState.writeSessionCacheData(payload, name: cacheKey)
+            }
+        } catch {
+            if detail == nil, !Task.isCancelled {
+                appState.presentedError = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -2662,7 +2764,7 @@ struct ResourcePushSheet: View {
     }
 }
 
-private struct MediaCollection: Identifiable {
+private struct MediaCollection: Identifiable, @unchecked Sendable {
     let cacheKey: String
     let title: String
     let source: String
@@ -2677,7 +2779,7 @@ private enum NewsMediaSource: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct MediaCatalogDefinition {
+private struct MediaCatalogDefinition: @unchecked Sendable {
     let title: String
     let path: String
     let source: String
@@ -2692,6 +2794,13 @@ private struct MediaCatalogDefinition {
     }
 }
 
+private struct MediaCatalogNetworkResult: @unchecked Sendable {
+    let cacheKey: String
+    let collection: MediaCollection?
+    let payload: Data?
+    let errorMessage: String?
+}
+
 struct NewsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var collections: [MediaCollection] = []
@@ -2700,7 +2809,11 @@ struct NewsView: View {
     @State private var isLoading = true
     @State private var usingCachedData = false
     @State private var cachedAt: Date?
-    @State private var catalogSignature = ""
+    @State private var restoredCatalogSignatures: Set<String> = []
+    @State private var catalogLoadedAt: [String: Date] = [:]
+    @State private var cachedCatalogSignatures: Set<String> = []
+    @State private var catalogCacheDates: [String: Date] = [:]
+    @State private var loadGeneration = 0
     @State private var selectedMedia: MediaItem?
     @State private var selectedCollection: MediaCollection?
     @State private var showNotices = false
@@ -2773,7 +2886,7 @@ struct NewsView: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .refreshable { await load() }
+        .refreshable { await load(forceRefresh: true) }
         .navigationTitle("资讯").navigationBarTitleDisplayMode(.inline)
         .toolbar {
             if activeSource == .douban && doubanTags.count > 1 {
@@ -2793,26 +2906,167 @@ struct NewsView: View {
             selectOnlyEnabledSource()
             if isLoading { await load() }
         }
-        .onChange(of: appState.refreshGeneration) { _, _ in Task { await load() } }
-        .onChange(of: selectedDoubanTag) { _, _ in Task { await load() } }
-        .onChange(of: appState.mediaTMDBEnabled) { _, _ in
-            selectOnlyEnabledSource()
+        .onChange(of: appState.refreshGeneration) { _, _ in Task { await load(forceRefresh: true) } }
+        .onChange(of: selectedSource) { _, _ in
+            isLoading = visibleCollections.isEmpty
             Task { await load() }
         }
-        .onChange(of: appState.mediaDoubanEnabled) { _, _ in
+        .onChange(of: selectedDoubanTag) { _, _ in Task { await load() } }
+        .onChange(of: appState.mediaTMDBEnabled) { _, _ in
+            let previousSource = selectedSource
             selectOnlyEnabledSource()
-            Task { await load() }
+            if previousSource == selectedSource { Task { await load() } }
+        }
+        .onChange(of: appState.mediaDoubanEnabled) { _, _ in
+            let previousSource = selectedSource
+            selectOnlyEnabledSource()
+            if previousSource == selectedSource { Task { await load() } }
         }
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
         .sheet(item: $selectedCollection) { collection in MediaCollectionSheet(collection: collection).environmentObject(appState) }
         .sheet(isPresented: $showNotices) { NoticeView().environmentObject(appState).presentationDetents([.large]) }
     }
 
-    private func load() async {
-        let tag = selectedDoubanTag
-        var definitions: [MediaCatalogDefinition] = []
-        if appState.mediaTMDBEnabled {
-            definitions.append(contentsOf: [
+    private func load(forceRefresh: Bool = false) async {
+        guard let source = activeSource else {
+            collections = []
+            isLoading = false
+            usingCachedData = false
+            cachedAt = nil
+            return
+        }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        let definitions = catalogDefinitions(for: source)
+        let signature = definitions.map(\.cacheKey).joined(separator: "\n")
+        usingCachedData = cachedCatalogSignatures.contains(signature)
+        cachedAt = catalogCacheDates[signature]
+        let definitionKeys = Set(definitions.map(\.cacheKey))
+        var previous = Dictionary(
+            uniqueKeysWithValues: collections
+                .filter { definitionKeys.contains($0.cacheKey) }
+                .map { ($0.cacheKey, $0) }
+        )
+
+        if !restoredCatalogSignatures.contains(signature) {
+            replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
+            var restored: [String: MediaCollection] = [:]
+            var newestCacheDate: Date?
+            var oldestCacheDate: Date?
+            for definition in definitions {
+                guard loadGeneration == generation, !Task.isCancelled else { return }
+                guard let cached = await cachedCollection(definition) else { continue }
+                if !cached.collection.items.isEmpty {
+                    restored[definition.cacheKey] = cached.collection
+                    previous[definition.cacheKey] = cached.collection
+                    replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
+                    isLoading = false
+                }
+                if cached.cachedAt > (newestCacheDate ?? .distantPast) {
+                    newestCacheDate = cached.cachedAt
+                }
+                if cached.cachedAt < (oldestCacheDate ?? .distantFuture) {
+                    oldestCacheDate = cached.cachedAt
+                }
+            }
+            guard loadGeneration == generation, !Task.isCancelled else { return }
+            previous.merge(restored) { _, restoredValue in restoredValue }
+            restoredCatalogSignatures.insert(signature)
+            replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
+            cachedAt = newestCacheDate
+            usingCachedData = !restored.isEmpty
+            if !restored.isEmpty {
+                cachedCatalogSignatures.insert(signature)
+                catalogCacheDates[signature] = newestCacheDate
+            }
+            if !restored.isEmpty { isLoading = false }
+
+            if restored.count == definitions.count,
+               let oldestCacheDate,
+               Date().timeIntervalSince(oldestCacheDate) < 5 * 60 {
+                catalogLoadedAt[signature] = oldestCacheDate
+            }
+        }
+
+        let currentCollections = definitions.compactMap { previous[$0.cacheKey] }
+        isLoading = currentCollections.isEmpty && !definitions.isEmpty
+        if !forceRefresh,
+           currentCollections.count == definitions.count,
+           let loadedAt = catalogLoadedAt[signature],
+           Date().timeIntervalSince(loadedAt) < 5 * 60 {
+            isLoading = false
+            if source == .douban { Task { await loadDoubanTagsIfNeeded() } }
+            return
+        }
+
+        var loadedByKey = previous
+        var failedKeys: Set<String> = []
+        var payloadsToCache: [(name: String, payload: Data)] = []
+        let maximumConcurrentRequests = source == .douban ? 3 : 4
+
+        await withTaskGroup(of: MediaCatalogNetworkResult.self) { group in
+            var iterator = definitions.makeIterator()
+            for _ in 0..<min(maximumConcurrentRequests, definitions.count) {
+                guard let definition = iterator.next() else { break }
+                group.addTask { await Self.fetchCatalog(definition, appState: appState) }
+            }
+
+            while let result = await group.next() {
+                guard loadGeneration == generation, !Task.isCancelled else {
+                    group.cancelAll()
+                    return
+                }
+                if let collection = result.collection, !collection.items.isEmpty {
+                    loadedByKey[result.cacheKey] = collection
+                    if let payload = result.payload {
+                        payloadsToCache.append((result.cacheKey, payload))
+                    }
+                } else if result.errorMessage != nil {
+                    failedKeys.insert(result.cacheKey)
+                }
+                replaceCollections(for: source, with: definitions.compactMap { loadedByKey[$0.cacheKey] })
+                if !definitions.compactMap({ loadedByKey[$0.cacheKey] }).isEmpty { isLoading = false }
+
+                if let definition = iterator.next() {
+                    group.addTask { await Self.fetchCatalog(definition, appState: appState) }
+                }
+            }
+        }
+
+        guard loadGeneration == generation, !Task.isCancelled else { return }
+        for entry in payloadsToCache {
+            await appState.writeSessionCacheData(entry.payload, name: entry.name)
+        }
+        let finalCollections = definitions.compactMap { loadedByKey[$0.cacheKey] }
+        replaceCollections(for: source, with: finalCollections)
+        usingCachedData = failedKeys.contains { previous[$0] != nil }
+        if !finalCollections.isEmpty {
+            catalogLoadedAt[signature] = Date()
+        }
+        if failedKeys.isEmpty {
+            cachedAt = nil
+            cachedCatalogSignatures.remove(signature)
+            catalogCacheDates[signature] = nil
+        } else if usingCachedData {
+            cachedCatalogSignatures.insert(signature)
+            catalogCacheDates[signature] = cachedAt
+        }
+        if finalCollections.isEmpty && !definitions.isEmpty {
+            appState.presentedError = source == .douban
+                ? "豆瓣影视暂时无法获取，请检查后端豆瓣 Cookie 与外网连接"
+                : "TMDB 影视暂时不可用，请检查 TMDB 配置与外网连接"
+        }
+        isLoading = false
+
+        if source == .douban {
+            await loadDoubanTagsIfNeeded()
+        }
+    }
+
+    private func catalogDefinitions(for source: NewsMediaSource) -> [MediaCatalogDefinition] {
+        switch source {
+        case .tmdb:
+            return [
                 MediaCatalogDefinition(title: "正在上映", path: APIPath.tmdbPlayingMovies, source: "TMDB", mediaType: "movie"),
                 MediaCatalogDefinition(title: "即将上映", path: APIPath.tmdbUpcomingMovies, source: "TMDB", mediaType: "movie"),
                 MediaCatalogDefinition(title: "TMDB 热门电影", path: APIPath.tmdbPopularMovies, source: "TMDB", mediaType: "movie"),
@@ -2821,88 +3075,16 @@ struct NewsView: View {
                 MediaCatalogDefinition(title: "正在播出", path: APIPath.tmdbOnTheAirTV, source: "TMDB", mediaType: "tv"),
                 MediaCatalogDefinition(title: "TMDB 热门剧集", path: APIPath.tmdbPopularTV, source: "TMDB", mediaType: "tv"),
                 MediaCatalogDefinition(title: "TMDB 高分剧集", path: APIPath.tmdbTopTV, source: "TMDB", mediaType: "tv")
-            ])
-        }
-        if appState.mediaDoubanEnabled {
-            definitions.append(contentsOf: [
+            ]
+        case .douban:
+            let tag = selectedDoubanTag
+            return [
                 MediaCatalogDefinition(title: "豆瓣热门电影 · \(tag)", path: APIPath.doubanHot, source: "豆瓣", mediaType: "movie", query: ["category": "movie", "tag": tag, "page_start": 0, "page_limit": 20]),
                 MediaCatalogDefinition(title: "豆瓣热门剧集 · \(tag)", path: APIPath.doubanHot, source: "豆瓣", mediaType: "tv", query: ["category": "tv", "tag": tag, "page_start": 0, "page_limit": 20]),
                 MediaCatalogDefinition(title: "豆瓣 Top250", path: APIPath.doubanTop250, source: "豆瓣", mediaType: "movie"),
                 MediaCatalogDefinition(title: "豆瓣电影榜", path: APIPath.doubanRank, source: "豆瓣", mediaType: "movie", query: ["type_id": 1, "start": 0, "limit": 100]),
                 MediaCatalogDefinition(title: "豆瓣剧集榜", path: APIPath.doubanRank, source: "豆瓣", mediaType: "tv", query: ["type_id": 2, "start": 0, "limit": 100])
-            ])
-        }
-
-        let nextSignature = definitions.map(\.cacheKey).joined(separator: "\n")
-        if catalogSignature != nextSignature {
-            catalogSignature = nextSignature
-            var restored: [MediaCollection] = []
-            var newestCacheDate: Date?
-            for definition in definitions {
-                guard let cached = await cachedCollection(definition) else { continue }
-                if !cached.collection.items.isEmpty { restored.append(cached.collection) }
-                if cached.cachedAt > (newestCacheDate ?? .distantPast) {
-                    newestCacheDate = cached.cachedAt
-                }
-            }
-            collections = restored
-            cachedAt = newestCacheDate
-            usingCachedData = !restored.isEmpty
-        }
-
-        isLoading = collections.isEmpty && !definitions.isEmpty
-        defer { isLoading = false }
-        let previous = Dictionary(uniqueKeysWithValues: collections.map { ($0.cacheKey, $0) })
-        let fetchOrder = definitions.enumerated()
-            .sorted { left, right in
-                let leftDouban = isDoubanSource(left.element.source)
-                let rightDouban = isDoubanSource(right.element.source)
-                if leftDouban != rightDouban { return leftDouban }
-                return left.offset < right.offset
-            }
-            .map { $0.element }
-        var loadedByKey: [String: MediaCollection] = [:]
-        var usedCachedFallback = false
-        var loadedDoubanCatalog = false
-        for definition in fetchOrder {
-            if let result = await fetchCollection(definition) {
-                await appState.writeSessionCache(result.raw, name: definition.cacheKey)
-                if !result.collection.items.isEmpty {
-                    loadedByKey[definition.cacheKey] = result.collection
-                    if isDoubanSource(definition.source) { loadedDoubanCatalog = true }
-                }
-            } else if let fallback = previous[definition.cacheKey] {
-                loadedByKey[definition.cacheKey] = fallback
-                usedCachedFallback = true
-                if isDoubanSource(definition.source), !fallback.items.isEmpty {
-                    loadedDoubanCatalog = true
-                }
-            }
-            collections = definitions.compactMap { loadedByKey[$0.cacheKey] ?? previous[$0.cacheKey] }
-            if !collections.isEmpty { isLoading = false }
-        }
-        let loaded = definitions.compactMap { loadedByKey[$0.cacheKey] }
-        collections = loaded
-        usingCachedData = usedCachedFallback
-        if !usedCachedFallback { cachedAt = nil }
-        if appState.mediaDoubanEnabled && !loadedDoubanCatalog {
-            appState.presentedError = "豆瓣影视暂时无法获取，请检查后端豆瓣 Cookie 与外网连接"
-        } else if loaded.isEmpty && !definitions.isEmpty {
-            appState.presentedError = "影视资讯暂时不可用，请检查 TMDB/豆瓣配置"
-        }
-        isLoading = false
-
-        // 标签接口不是目录数据的前置依赖，放到首屏目录之后读取，避免它阻塞影视内容。
-        if appState.mediaDoubanEnabled && doubanTags.count == 1 {
-            do {
-                let raw = try await appState.api(APIPath.doubanTags, query: ["category": "movie"])
-                let values = jsonStrings(raw)
-                if !values.isEmpty {
-                    doubanTags = Array(Set(["热门"] + values)).sorted()
-                }
-            } catch {
-                await AppLogStore.shared.append(.warning, "豆瓣标签接口不可用：\(error.localizedDescription)")
-            }
+            ]
         }
     }
 
@@ -2917,38 +3099,149 @@ struct NewsView: View {
     private func cachedCollection(
         _ definition: MediaCatalogDefinition
     ) async -> (collection: MediaCollection, cachedAt: Date)? {
-        guard let cached = await appState.readSessionCache(definition.cacheKey) else { return nil }
-        let items = mediaRows(cached.value).map {
-            MediaItem($0, source: definition.source, mediaType: definition.mediaType)
-        }
-        return (
-            MediaCollection(cacheKey: definition.cacheKey, title: definition.title, source: definition.source, items: items),
-            cached.cachedAt
-        )
+        guard let cached = await appState.readSessionCacheData(definition.cacheKey) else { return nil }
+        let payload = cached.payload
+        let collection = await Task.detached(priority: .utility) {
+            Self.decodeCollection(payload, definition: definition)
+        }.value
+        guard let collection else { return nil }
+        return (collection, cached.cachedAt)
     }
 
-    private func fetchCollection(
-        _ definition: MediaCatalogDefinition
-    ) async -> (collection: MediaCollection, raw: Any)? {
+    private static func fetchCatalog(
+        _ definition: MediaCatalogDefinition,
+        appState: AppState
+    ) async -> MediaCatalogNetworkResult {
         do {
-            let raw = try await appState.api(definition.path, query: definition.query)
+            let timeout: TimeInterval = isDoubanSource(definition.source) ? 15 : 12
+            let raw = try await appState.api(
+                definition.path,
+                query: definition.query,
+                timeoutInterval: timeout
+            )
             let rows = mediaRows(raw)
             if rows.isEmpty {
                 await AppLogStore.shared.append(.warning, "\(definition.source) \(definition.title) 返回空数据")
-                return nil
+                return MediaCatalogNetworkResult(
+                    cacheKey: definition.cacheKey,
+                    collection: nil,
+                    payload: nil,
+                    errorMessage: "返回空数据"
+                )
             }
             await AppLogStore.shared.append(.info, "\(definition.source) \(definition.title) 解析到 \(rows.count) 条数据")
             let items = rows.map {
                 MediaItem($0, source: definition.source, mediaType: definition.mediaType)
             }
-            return (
-                MediaCollection(cacheKey: definition.cacheKey, title: definition.title, source: definition.source, items: items),
-                raw
+            let payload: Data?
+            if JSONSerialization.isValidJSONObject(raw) {
+                payload = try? JSONSerialization.data(withJSONObject: raw)
+            } else {
+                payload = nil
+            }
+            return MediaCatalogNetworkResult(
+                cacheKey: definition.cacheKey,
+                collection: MediaCollection(
+                    cacheKey: definition.cacheKey,
+                    title: definition.title,
+                    source: definition.source,
+                    items: items
+                ),
+                payload: payload,
+                errorMessage: nil
             )
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+                return MediaCatalogNetworkResult(
+                    cacheKey: definition.cacheKey,
+                    collection: nil,
+                    payload: nil,
+                    errorMessage: nil
+                )
+            }
             await AppLogStore.shared.append(.error, "\(definition.source) \(definition.title) 加载失败：\(error.localizedDescription)")
+            return MediaCatalogNetworkResult(
+                cacheKey: definition.cacheKey,
+                collection: nil,
+                payload: nil,
+                errorMessage: error.localizedDescription
+            )
+        }
+    }
+
+    private static func decodeCollection(
+        _ payload: Data,
+        definition: MediaCatalogDefinition
+    ) -> MediaCollection? {
+        guard let raw = try? JSONSerialization.jsonObject(with: payload, options: [.fragmentsAllowed]) else {
             return nil
         }
+        let items = mediaRows(raw).map {
+            MediaItem($0, source: definition.source, mediaType: definition.mediaType)
+        }
+        guard !items.isEmpty else { return nil }
+        return MediaCollection(
+            cacheKey: definition.cacheKey,
+            title: definition.title,
+            source: definition.source,
+            items: items
+        )
+    }
+
+    private func replaceCollections(
+        for source: NewsMediaSource,
+        with sourceCollections: [MediaCollection]
+    ) {
+        let otherCollections = collections.filter { collection in
+            source == .douban
+                ? !isDoubanSource(collection.source)
+                : collection.source.caseInsensitiveCompare(NewsMediaSource.tmdb.rawValue) != .orderedSame
+        }
+        collections = source == .tmdb
+            ? sourceCollections + otherCollections
+            : otherCollections + sourceCollections
+    }
+
+    private func loadDoubanTagsIfNeeded() async {
+        guard appState.mediaDoubanEnabled else { return }
+        let cacheKey = "news.douban.tags|movie"
+        if doubanTags.count == 1,
+           let cached = await appState.readSessionCacheData(cacheKey),
+           let raw = try? JSONSerialization.jsonObject(with: cached.payload, options: [.fragmentsAllowed]) {
+            let values = normalizedDoubanTags(jsonStrings(raw))
+            if values.count > 1 { doubanTags = values }
+            if Date().timeIntervalSince(cached.cachedAt) < 24 * 60 * 60 { return }
+        } else if doubanTags.count > 1 {
+            return
+        }
+
+        do {
+            let raw = try await appState.api(
+                APIPath.doubanTags,
+                query: ["category": "movie"],
+                timeoutInterval: 10
+            )
+            let values = normalizedDoubanTags(jsonStrings(raw))
+            if values.count > 1 { doubanTags = values }
+            if JSONSerialization.isValidJSONObject(raw),
+               let payload = try? JSONSerialization.data(withJSONObject: raw) {
+                await appState.writeSessionCacheData(payload, name: cacheKey)
+            }
+        } catch {
+            if !Task.isCancelled {
+                await AppLogStore.shared.append(.warning, "豆瓣标签接口不可用：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func normalizedDoubanTags(_ values: [String]) -> [String] {
+        var seen: Set<String> = ["热门"]
+        var normalized = ["热门"]
+        for value in values {
+            let tag = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tag.isEmpty, seen.insert(tag).inserted { normalized.append(tag) }
+        }
+        return normalized
     }
 }
 
@@ -2964,7 +3257,7 @@ struct MediaCarousel: View {
                 Text("暂无内容").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 80)
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 11) {
+                    LazyHStack(spacing: 11) {
                         ForEach(items.prefix(12)) { item in
                             Button { onSelect(item) } label: {
                                 VStack(alignment: .leading, spacing: 6) {

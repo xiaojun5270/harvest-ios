@@ -1649,8 +1649,7 @@ final class AppState: ObservableObject {
     }
 
     func readSessionCache(_ name: String) async -> (value: Any, cachedAt: Date)? {
-        guard let scope = sessionCacheScope,
-              let record = await AppSessionCache.shared.read(scope: scope, name: name),
+        guard let record = await readSessionCacheData(name),
               let value = try? JSONSerialization.jsonObject(with: record.payload, options: [.fragmentsAllowed]) else {
             return nil
         }
@@ -1658,9 +1657,19 @@ final class AppState: ObservableObject {
     }
 
     func writeSessionCache(_ value: Any, name: String) async {
-        guard let scope = sessionCacheScope,
-              JSONSerialization.isValidJSONObject(value),
+        guard JSONSerialization.isValidJSONObject(value),
               let payload = try? JSONSerialization.data(withJSONObject: value) else { return }
+        await writeSessionCacheData(payload, name: name)
+    }
+
+    func readSessionCacheData(_ name: String) async -> (payload: Data, cachedAt: Date)? {
+        guard let scope = sessionCacheScope,
+              let record = await AppSessionCache.shared.read(scope: scope, name: name) else { return nil }
+        return (record.payload, record.cachedAt)
+    }
+
+    func writeSessionCacheData(_ payload: Data, name: String) async {
+        guard let scope = sessionCacheScope, !payload.isEmpty else { return }
         await AppSessionCache.shared.write(scope: scope, name: name, payload: payload)
     }
 

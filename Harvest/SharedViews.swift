@@ -221,6 +221,21 @@ private final class RemoteDecodedImageCache: @unchecked Sendable {
     func removeAll() { cache.removeAllObjects() }
 }
 
+private func decodedRemoteDisplayImage(_ data: Data, maximumPixelSize: Int = 1_200) -> UIImage? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize
+    ]
+    if let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+        return UIImage(cgImage: image)
+    }
+    guard let decoded = UIImage(data: data) else { return nil }
+    return decoded.preparingForDisplay() ?? decoded
+}
+
 private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
     let cacheKey: String
     let frames: [UIImage]
@@ -485,7 +500,11 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
             }
             do {
                 let data = try await RemoteImageDataCache.shared.data(for: normalizedURL, headers: effectiveHeaders)
-                guard !Task.isCancelled, let image = UIImage(data: data) else {
+                guard !Task.isCancelled else { return }
+                let image = await Task.detached(priority: .utility) { () -> UIImage? in
+                    decodedRemoteDisplayImage(data)
+                }.value
+                guard !Task.isCancelled, let image else {
                     if !Task.isCancelled { await MainActor.run { onFailure?() } }
                     return
                 }
