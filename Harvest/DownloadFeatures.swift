@@ -463,9 +463,12 @@ private func downloaderTorrentSummary(_ value: Any, category: String) -> Downloa
         if downloadSpeed > 0 || uploadSpeed > 0 { count += 1 }
     }
     let derivedPaused = rows.reduce(into: 0) { count, row in
-        var source = row
-        source["downloader_category"] = category
-        if torrentStatusCode(TorrentItem(source)) == 0 { count += 1 }
+        let state = row.string("state", "status")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        if category.lowercased().contains("tr") {
+            if Int(state) == 0 { count += 1 }
+        } else if state.contains("pause") || state.contains("stop") || state.contains("暂停") || state.contains("停止") {
+            count += 1
+        }
     }
     let total = max(downloaderMetricInt(root, keys: downloaderTotalCountKeys) ?? 0, rows.count)
     let active = max(downloaderMetricInt(root, keys: downloaderActiveCountKeys) ?? 0, derivedActive)
@@ -569,6 +572,7 @@ final class DownloadsViewModel: ObservableObject {
     private var torrentSnapshotSignatures: [Int: Int] = [:]
     private var countdownTask: Task<Void, Never>?
     private var cacheWriteTask: Task<Void, Never>?
+    private var compactSummaryTask: Task<Void, Never>?
     private var isViewActive = false
     private var isWatching = false
     private var restoredCache = false
@@ -745,16 +749,26 @@ final class DownloadsViewModel: ObservableObject {
             reconcileWatching(appState)
         }
         do {
-            let raw = try await appState.api(APIPath.downloaders, query: ["with_status": true])
-            downloaders = jsonRows(raw).map(DownloaderItem.init)
+            if !includesTorrentData {
+                compactSummaryTask?.cancel()
+                compactSummaryTask = nil
+            }
+            let previousDownloaders = downloaders
+            let raw = try await appState.api(
+                APIPath.downloaders,
+                query: ["with_status": includesTorrentData],
+                timeoutInterval: includesTorrentData ? nil : 10
+            )
+            downloaders = mergingDownloaderConfigurations(
+                jsonRows(raw).map(DownloaderItem.init),
+                previous: previousDownloaders
+            )
             // The compact downloads screen only needs aggregate downloader status.
             guard includesTorrentData else {
-                downloaders = await downloadersWithTorrentSummaries(appState, items: downloaders)
                 torrents = []
                 sites = []
-                usingCachedData = false
-                cachedAt = nil
                 await persistCache(appState)
+                scheduleCompactSummaryRefresh(appState)
                 return
             }
             let previousTorrents = torrents
@@ -830,61 +844,109 @@ final class DownloadsViewModel: ObservableObject {
         }
     }
 
-    private func downloadersWithTorrentSummaries(
+    private func mergingDownloaderConfigurations(
+        _ configured: [DownloaderItem],
+        previous: [DownloaderItem]
+    ) -> [DownloaderItem] {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        return configured.map { item in
+            let status = item.raw.dict("status") ?? [:]
+            guard status.isEmpty,
+                  let cached = previousByID[item.id],
+                  let cachedStatus = cached.raw["status"] else { return item }
+            var merged = item.raw
+            merged["status"] = cachedStatus
+            return DownloaderItem(merged)
+        }
+    }
+
+    private func scheduleCompactSummaryRefresh(_ appState: AppState) {
+        compactSummaryTask?.cancel()
+        compactSummaryTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(900)) }
+            catch { return }
+            guard let self, !Task.isCancelled else { return }
+            let summaries = await self.downloaderTorrentSummaries(appState, items: self.downloaders)
+            guard !Task.isCancelled else { return }
+            var changed = false
+            let refreshed = self.downloaders.map { item in
+                guard let summary = summaries[item.id] else { return item }
+                let merged = mergingDownloaderStatus([
+                    "activeTorrentCount": summary.active,
+                    "pausedTorrentCount": summary.paused,
+                    "torrentCount": summary.total
+                ], into: item.raw)
+                let next = DownloaderItem(merged)
+                if next.activeTorrentCount != item.activeTorrentCount
+                    || next.pausedTorrentCount != item.pausedTorrentCount
+                    || next.totalTorrentCount != item.totalTorrentCount {
+                    changed = true
+                }
+                return next
+            }
+            if changed {
+                self.downloaders = refreshed
+                self.usingCachedData = false
+                self.cachedAt = nil
+                await self.persistCache(appState)
+            }
+            self.compactSummaryTask = nil
+        }
+    }
+
+    private func downloaderTorrentSummaries(
         _ appState: AppState,
         items: [DownloaderItem]
-    ) async -> [DownloaderItem] {
+    ) async -> [Int: DownloaderTorrentSummary] {
         let candidates = items.filter { item in
-            let isTransmission = item.category.lowercased().contains("tr")
-            return item.enabled && !isTransmission && (
-                item.totalTorrentCount == 0
+            item.enabled && (
+                !item.hasLiveStatus
+                    || item.totalTorrentCount == 0
                     || (item.activeTorrentCount == 0 && (item.downloadSpeed > 0 || item.uploadSpeed > 0))
                     || downloaderMetricInt(item.raw, keys: downloaderTotalCountKeys) == nil
                     || downloaderMetricInt(item.raw, keys: downloaderActiveCountKeys) == nil
+                    || downloaderMetricInt(item.raw, keys: downloaderPausedCountKeys) == nil
             )
         }
-        guard !candidates.isEmpty else { return items }
+        guard !candidates.isEmpty else { return [:] }
 
-        let responses = await withTaskGroup(of: (Int, String, Data?).self) { group in
+        let responses = await withTaskGroup(of: (Int, DownloaderTorrentSummary?).self) { group in
             for downloader in candidates {
                 let id = downloader.id
                 let category = downloader.category
                 group.addTask {
                     do {
-                        let value = try await appState.api("\(APIPath.downloaderMain)\(id)")
+                        let value = try await appState.api(
+                            "\(APIPath.downloaderMain)\(id)",
+                            timeoutInterval: 8
+                        )
                         guard JSONSerialization.isValidJSONObject(value),
                               let data = try? JSONSerialization.data(withJSONObject: value) else {
-                            return (id, category, nil)
+                            return (id, nil)
                         }
-                        return (id, category, data)
+                        let summary = await Task.detached(priority: .utility) {
+                            guard let decoded = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+                                return nil as DownloaderTorrentSummary?
+                            }
+                            return downloaderTorrentSummary(decoded, category: category)
+                        }.value
+                        return (id, summary)
                     } catch {
                         recordAppLog(.warning, "下载器 \(id) 种子统计读取失败：\(error.localizedDescription)")
-                        return (id, category, nil)
+                        return (id, nil)
                     }
                 }
             }
-            var values: [(Int, String, Data?)] = []
+            var values: [(Int, DownloaderTorrentSummary?)] = []
             for await response in group { values.append(response) }
             return values
         }
 
         var summaries: [Int: DownloaderTorrentSummary] = [:]
-        for (id, category, data) in responses {
-            guard let data,
-                  let value = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { continue }
-            summaries[id] = downloaderTorrentSummary(value, category: category)
+        for (id, summary) in responses {
+            if let summary { summaries[id] = summary }
         }
-        guard !summaries.isEmpty else { return items }
-
-        return items.map { item in
-            guard let summary = summaries[item.id] else { return item }
-            let merged = mergingDownloaderStatus([
-                "activeTorrentCount": summary.active,
-                "pausedTorrentCount": summary.paused,
-                "torrentCount": summary.total
-            ], into: item.raw)
-            return DownloaderItem(merged)
-        }
+        return summaries
     }
 
     private func restoreCacheIfNeeded(_ appState: AppState) async {
@@ -1342,6 +1404,8 @@ final class DownloadsViewModel: ObservableObject {
 
     func stopWatching() {
         isViewActive = false
+        compactSummaryTask?.cancel()
+        compactSummaryTask = nil
         stopActiveWatching(clearRemaining: true)
     }
 
@@ -1499,7 +1563,14 @@ final class DownloadsViewModel: ObservableObject {
                         updated[index] = next
                         changed = true
                     }
-                    if changed { downloaders = updated }
+                    if changed {
+                        downloaders = updated
+                        if !includesTorrentData {
+                            usingCachedData = false
+                            cachedAt = nil
+                        }
+                        scheduleCachePersistence(appState)
+                    }
                 }
             } catch { }
             if isWatching && !Task.isCancelled { try? await Task.sleep(for: .seconds(3)) }
@@ -1576,6 +1647,7 @@ final class DownloadsViewModel: ObservableObject {
         hasher.combine(item.alternativeSpeedEnabled)
         hasher.combine(item.connectionStatus)
         hasher.combine(item.version)
+        hasher.combine(item.hasLiveStatus)
         return hasher.finalize()
     }
 
@@ -1634,6 +1706,7 @@ struct DownloadsView: View {
                         SessionCacheBanner(cachedAt: model.cachedAt)
                             .padding(.horizontal, 16)
                     }
+                    downloaderListHeader
                     if model.downloaders.isEmpty {
                         EmptyState(
                             icon: "externaldrive.badge.plus",
@@ -1765,6 +1838,32 @@ struct DownloadsView: View {
             }
             Button("取消", role: .cancel) { repeatingDownloader = nil }
         }
+    }
+
+    private var downloaderListHeader: some View {
+        HStack(spacing: 8) {
+            Label("下载器", systemImage: "externaldrive.fill")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.primary)
+            Spacer(minLength: 8)
+            Button { showAddDownloader = true } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(HarvestTheme.blue)
+                    .frame(width: 38, height: 38)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .background(.regularMaterial, in: Circle())
+            .overlay {
+                Circle()
+                    .stroke(Color.white.opacity(0.58), lineWidth: 0.8)
+            }
+            .shadow(color: Color.black.opacity(0.10), radius: 7, y: 2)
+            .accessibilityLabel("增加下载器")
+            .help("增加下载器")
+        }
+        .padding(.horizontal, 16)
     }
 
     private func synchronizeRefreshSettings() {
@@ -2011,7 +2110,12 @@ struct DownloaderCard: View {
                     Divider()
                     Button(action: onEdit) { Label("编辑", systemImage: "pencil") }
                     Button(action: onSettings) { Label("下载器设置", systemImage: "slider.horizontal.3") }
-                    Button(action: onTools) { Label("分类与标签", systemImage: "tag") }
+                    Button(action: onTools) {
+                        Label(
+                            item.category.lowercased().contains("tr") ? "连接检查" : "连接与分类",
+                            systemImage: item.category.lowercased().contains("tr") ? "network" : "tag"
+                        )
+                    }
                     if !item.brush {
                         Button(action: onRepeat) { Label("执行辅种", systemImage: "square.stack.3d.up") }
                     }
@@ -2333,6 +2437,11 @@ struct DownloaderToolsSheet: View {
     @State private var deletingTag: String?
     @State private var deletingCategory: String?
 
+    private var isTransmission: Bool {
+        let value = downloader.category.lowercased()
+        return value.contains("tr") || value.contains("transmission")
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -2348,7 +2457,7 @@ struct DownloaderToolsSheet: View {
                     if !testResult.isEmpty { Text(testResult).font(.caption).foregroundStyle(.secondary) }
                 }
 
-                if !downloader.category.lowercased().contains("tr") {
+                if !isTransmission {
                     Section("标签") {
                         ForEach(tags, id: \.self) { tag in
                             HStack { Label(tag, systemImage: "tag"); Spacer(); Button(role: .destructive) { deletingTag = tag } label: { Image(systemName: "trash") }.buttonStyle(.plain) }
@@ -2431,6 +2540,18 @@ struct DownloaderToolsSheet: View {
     @MainActor private func load() async {
         isLoading = true
         defer { isLoading = false }
+        if isTransmission {
+            let preferencesResult = await loadToolValue(
+                APIPath.downloaderPreferences + "\(downloader.id)",
+                query: ["with_status": true],
+                label: "Transmission 设置"
+            )
+            applySpeedMode(preferencesResult.value)
+            if let errorMessage = preferencesResult.errorMessage {
+                appState.presentedError = errorMessage
+            }
+            return
+        }
         async let tagResult = loadToolValue(APIPath.downloaderTags + "\(downloader.id)", label: "标签")
         async let categoryResult = loadToolValue(APIPath.downloaderCategories + "\(downloader.id)", label: "分类")
         async let preferencesResult = loadToolValue(
@@ -2441,12 +2562,23 @@ struct DownloaderToolsSheet: View {
         let values = await (tagResult, categoryResult, preferencesResult)
         if let tagValue = values.0.value { tags = normalizedTags(tagValue) }
         if let categoryValue = values.1.value { categories = normalizedCategories(categoryValue) }
-        if let preferencesValue = values.2.value {
-            let preferences = jsonPayloadDictionary(preferencesValue) ?? [:]
-            speedLimited = preferences.bool("use_alt_speed_limits", "alt_speed_limits_enabled", "speed_limit_mode") ?? false
-        }
+        applySpeedMode(values.2.value)
         let errors = [values.0.errorMessage, values.1.errorMessage, values.2.errorMessage].compactMap { $0 }
         if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
+    }
+
+    private func applySpeedMode(_ raw: Any?) {
+        guard let raw else { return }
+        let root = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) ?? [:]
+        let preferences = root.dict("prefs", "preferences") ?? root
+        speedLimited = preferences.bool(
+            "use_alt_speed_limits",
+            "alt_speed_limits_enabled",
+            "speed_limit_mode",
+            "alt-speed-enabled",
+            "altSpeedEnabled",
+            "alternativeSpeedEnabled"
+        ) ?? false
     }
 
     @MainActor private func setSpeedMode(_ enabled: Bool) async {

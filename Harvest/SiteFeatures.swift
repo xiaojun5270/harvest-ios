@@ -266,6 +266,7 @@ enum SiteLevelMilestone {
 private struct SiteBrowserTarget: Identifiable {
     let site: SiteItem
     let url: String
+    let config: [String: Any]
     var id: Int { site.id }
 }
 
@@ -482,10 +483,6 @@ final class SitesViewModel: ObservableObject {
         activeFilterCount > 0
     }
 
-    var hasActiveSort: Bool {
-        sortField != .updated || ascending != SiteSortField.updated.defaultAscending
-    }
-
     func clearFilters() {
         availability = .alive
         condition = .all
@@ -657,7 +654,7 @@ final class SitesViewModel: ObservableObject {
         }
     }
 
-    private func config(for site: SiteItem) -> [String: Any]? {
+    func config(for site: SiteItem) -> [String: Any]? {
         siteConfigs[site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
 
@@ -897,6 +894,7 @@ struct SitesView: View {
                     site: target.site,
                     urlString: target.url,
                     title: privacyMaskedText(target.site.name, enabled: appState.privacyMode),
+                    initialConfig: target.config,
                     onSynced: { await model.load(appState, cached: false) }
                 )
                 .toolbar {
@@ -945,7 +943,7 @@ struct SitesView: View {
             appState.presentedError = "站点地址无效，无法打开"
             return
         }
-        browserTarget = SiteBrowserTarget(site: site, url: url)
+        browserTarget = SiteBrowserTarget(site: site, url: url, config: model.config(for: site) ?? [:])
     }
 
     @ViewBuilder private func SiteActions(site: SiteItem, model: SitesViewModel) -> some View {
@@ -1030,7 +1028,7 @@ private struct SiteSearchFilterBar: View {
                             }
                         }
                     } label: {
-                        Label(model.sortField.rawValue, systemImage: model.sortField.icon)
+                        Text(model.sortField.rawValue)
                             .font(.caption.weight(.semibold))
                     }
                     .buttonStyle(.bordered)
@@ -1052,37 +1050,22 @@ private struct SiteSearchFilterBar: View {
                     .accessibilityLabel("当前\(model.ascending ? "升序" : "降序")，点击切换")
 
                     if model.availability != .alive {
-                        filterToken(model.availability.rawValue, icon: "antenna.radiowaves.left.and.right") { model.availability = .alive }
+                        filterToken(model.availability.rawValue)
                     }
                     if model.condition != .all {
-                        filterToken(model.condition.rawValue, icon: "checklist") { model.condition = .all }
+                        filterToken(model.condition.rawValue)
                     }
                     ForEach(model.selectedTypes.sorted(), id: \.self) { type in
-                        filterToken(type, icon: "square.grid.2x2") { model.selectedTypes.remove(type) }
+                        filterToken(type)
                     }
                     ForEach(model.selectedTags.sorted(), id: \.self) { tag in
-                        filterToken("#\(tag)", icon: "tag") { model.selectedTags.remove(tag) }
+                        filterToken(tag)
                     }
                     if !model.selectedUsername.isEmpty {
-                        filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode), icon: "person") { model.selectedUsername = "" }
+                        filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode))
                     }
                     if !model.selectedEmail.isEmpty {
-                        filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode), icon: "envelope") { model.selectedEmail = "" }
-                    }
-                    if model.hasFilters {
-                        Button("清空筛选") { model.clearFilters() }
-                            .font(.caption.weight(.semibold))
-                            .buttonStyle(.plain)
-                            .foregroundStyle(HarvestTheme.coral)
-                            .accessibilityLabel("清空全部筛选条件")
-                    }
-                    if model.hasActiveSort {
-                        Button("恢复默认排序") {
-                            model.setSortField(.updated)
-                        }
-                            .font(.caption.weight(.semibold))
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.secondary)
+                        filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode))
                     }
                 }
                 .padding(.horizontal, 16)
@@ -1093,21 +1076,16 @@ private struct SiteSearchFilterBar: View {
         .overlay(alignment: .bottom) { Divider() }
     }
 
-    private func filterToken(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                Text(title).lineLimit(1)
-                Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
-            }
+    private func filterToken(_ title: String) -> some View {
+        Text(title)
             .font(.caption.weight(.medium))
-        }
-        .buttonStyle(.bordered)
-        .buttonBorderShape(.capsule)
-        .controlSize(.small)
-        .tint(HarvestTheme.blue)
-        .accessibilityLabel("移除筛选：\(title)")
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 28)
+            .foregroundStyle(HarvestTheme.blue)
+            .background(HarvestTheme.blue.opacity(0.11), in: Capsule())
+            .overlay { Capsule().stroke(HarvestTheme.blue.opacity(0.18), lineWidth: 0.75) }
+            .accessibilityLabel("当前筛选：\(title)")
     }
 }
 
@@ -1480,7 +1458,8 @@ struct SiteTimelineView: View {
         SiteBrowserScreen(
             site: entry.browserSite,
             urlString: urlString,
-            title: privacyMaskedText(entry.displayName, enabled: appState.privacyMode)
+            title: privacyMaskedText(entry.displayName, enabled: appState.privacyMode),
+            initialConfig: entry.config
         ) {
             await model.load(appState, cached: false)
         }
@@ -1570,9 +1549,6 @@ struct SiteFilterSheet: View {
             .navigationTitle("筛选站点")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("清空") { model.clearFilters() }.disabled(!model.hasFilters)
-                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("应用筛选") { dismiss() }
                         .fontWeight(.semibold)
@@ -2568,9 +2544,6 @@ struct SiteRow: View {
             if site.mail > 0 {
                 SiteHeaderCompactMetric(icon: "envelope.fill", label: "邮件", value: "\(site.mail)", color: HarvestTheme.blue, breathes: true)
             }
-            if hasHRContent {
-                SiteHeaderCompactMetric(icon: "exclamationmark.triangle.fill", label: "H&R", value: hrText, color: HarvestTheme.amber)
-            }
             if site.invitations > 0 {
                 SiteHeaderCompactMetric(icon: "person.fill", label: "邀请", value: "\(site.invitations)", color: HarvestTheme.coral)
             }
@@ -2580,7 +2553,7 @@ struct SiteRow: View {
     }
 
     private var hasCompactAccountSummary: Bool {
-        site.invitations > 0 || hasHRContent || site.mail > 0 || site.notice > 0 || site.unread > 0
+        site.invitations > 0 || site.mail > 0 || site.notice > 0 || site.unread > 0
     }
 
     private var hasHRContent: Bool {
@@ -2639,12 +2612,12 @@ struct SiteRow: View {
         LazyVGrid(columns: metricColumns, spacing: 5) {
             SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: wanMetricText(site.magic), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "diamond.fill", label: "积分", value: wanMetricText(site.score), color: HarvestTheme.coral, glowRotation: metricGlowRotation)
             SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.green, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "timer", label: "时魔", value: percentageMetricText(site.bonusHour), color: HarvestTheme.purple, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.orange, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.indigo, glowRotation: metricGlowRotation)
         }
         .padding(.horizontal, 5)
         .padding(.vertical, 7)
@@ -2657,13 +2630,25 @@ struct SiteRow: View {
 
     private var activitySection: some View {
         TimelineView(.periodic(from: .now, by: 60)) { context in
-            SiteDetailLine(
-                icon: "clock.arrow.circlepath",
-                label: "最近时间",
-                value: recentTimeText(relativeTo: context.date),
-                color: HarvestTheme.green,
-                glowRotation: metricGlowRotation
-            )
+            HStack(spacing: 8) {
+                SiteDetailLine(
+                    icon: "clock.arrow.circlepath",
+                    label: "最近时间",
+                    value: recentTimeText(relativeTo: context.date),
+                    color: HarvestTheme.green,
+                    glowRotation: metricGlowRotation
+                )
+                if hasHRContent {
+                    SiteHeaderCompactMetric(
+                        icon: "exclamationmark.triangle.fill",
+                        label: "H&R",
+                        value: hrText,
+                        color: HarvestTheme.amber
+                    )
+                    .frame(maxWidth: 180, alignment: .trailing)
+                    .layoutPriority(1)
+                }
+            }
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 7)
@@ -2771,8 +2756,22 @@ struct SiteRow: View {
         return "\(days / 365)年前"
     }
 
-    private var ratioText: String { String(format: "%.2f", site.ratio) }
-    private var ratioColor: Color { site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.green }
+    private var ratioText: String { percentageMetricText(site.ratio) }
+    private var ratioColor: Color { site.downloaded > 0 && site.ratio < 1 ? HarvestTheme.coral : HarvestTheme.teal }
+    private func wanMetricText(_ value: Double) -> String {
+        guard abs(value) >= 10_000 else { return metricDecimalText(value) }
+        return "\(metricDecimalText(value / 10_000))w"
+    }
+
+    private func percentageMetricText(_ value: Double) -> String {
+        "\(metricDecimalText(value))%"
+    }
+
+    private func metricDecimalText(_ value: Double) -> String {
+        String(format: "%.2f", value)
+            .replacingOccurrences(of: #"\.?0+$"#, with: "", options: .regularExpression)
+    }
+
     private var hrText: String {
         let value = site.hr.trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? "0" : value
@@ -4581,6 +4580,7 @@ struct SiteDetailView: View {
                                     site: current,
                                     urlString: resolvedPageURL(shortcut.path),
                                     title: shortcut.label,
+                                    initialConfig: siteConfig,
                                     onSynced: {
                                         await model.load(appState, cached: false)
                                         await loadDetail()
@@ -4600,6 +4600,7 @@ struct SiteDetailView: View {
                                 site: current,
                                 urlString: current.url,
                                 title: privacyMaskedText(current.name, enabled: appState.privacyMode),
+                                initialConfig: siteConfig,
                                 onSynced: {
                                     await model.load(appState, cached: false)
                                     await loadDetail()
@@ -4741,6 +4742,10 @@ private struct BrowserExtractedTorrent: Identifiable {
     let category: String
     let posterURL: String
     let size: String
+    let fileCount: String
+    let infoHash: String
+    let doubanURL: String
+    let imdbURL: String
     let progress: String
     let promotion: String
     let promotionExpiry: String
@@ -4759,6 +4764,10 @@ private struct BrowserExtractedTorrent: Identifiable {
         category = json.string("category") ?? ""
         posterURL = json.string("poster", "posterUrl", "poster_url") ?? ""
         size = json.string("size") ?? ""
+        fileCount = json.string("fileCount", "countFiles", "file_count") ?? ""
+        infoHash = json.string("hash", "infoHash", "info_hash") ?? ""
+        doubanURL = json.string("douban", "doubanUrl", "douban_url") ?? ""
+        imdbURL = json.string("imdb", "imdbUrl", "imdb_url") ?? ""
         progress = json.string("progress") ?? ""
         promotion = json.string("sale", "promotion") ?? ""
         promotionExpiry = json.string("saleExpire", "promotion_expire") ?? ""
@@ -4799,9 +4808,10 @@ private struct BrowserBonusItem: Identifiable {
     let cost: Double
     let option: String
     let action: String
+    let method: String
     let hiddenInputs: [String: String]
     let disabled: Bool
-    var id: String { action + "#" + option }
+    var id: String { method + "#" + action + "#" + option }
 }
 
 private struct BrowserBonusPage: Identifiable {
@@ -4897,7 +4907,9 @@ private func browserTorrentExtractionScript(config: [String: Any], detail: Bool)
             "title": "detail_title_rule", "subtitle": "detail_subtitle_rule",
             "download": "detail_download_url_rule", "category": "detail_category_rule",
             "poster": "detail_poster_rule", "size": "detail_size_rule", "hr": "detail_hr_rule", "sale": "detail_free_rule",
-            "saleExpiry": "detail_free_expire_rule", "tags": "detail_tags_rule"
+            "saleExpiry": "detail_free_expire_rule", "tags": "detail_tags_rule",
+            "fileCount": "detail_count_files_rule", "hash": "detail_hash_rule",
+            "douban": "detail_douban_rule", "imdb": "detail_imdb_rule"
         ]
         : [
             "row": "torrents_rule", "title": "torrent_title_rule", "subtitle": "torrent_subtitle_rule",
@@ -4921,6 +4933,7 @@ private func browserTorrentExtractionScript(config: [String: Any], detail: Bool)
         const values = new Set([raw]);
         values.add(raw.replace(/\\/tbody(?=\\/|$)/gi, ''));
         values.add(raw.replace(/(\\/table(?:\\[[^\\]]+\\])?)(?=\\/tr(?:\\[[^\\]]+\\])?(?:\\/|$))/gi, '$1/tbody'));
+        values.add(raw.replace(/\\/tbody(?=\\/|$)/gi, '').replace(/(\\/table(?:\\[[^\\]]+\\])?)(?=\\/tr(?:\\[[^\\]]+\\])?(?:\\/|$))/gi, '$1/tbody'));
         return Array.from(values).filter(Boolean);
       };
       const clean = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
@@ -4956,12 +4969,18 @@ private func browserTorrentExtractionScript(config: [String: Any], detail: Bool)
         const list = nodes(root, rule);
         return list.length ? read(list[0]) : '';
       };
+      const joined = (root, rule) => {
+        const list = nodes(root, rule).map(read).filter(Boolean);
+        return list.length > 1 ? clean(list.join(' ')) : value(root, rule);
+      };
       const absolute = (text) => { try { return text ? new URL(text, window.location.href).href : ''; } catch (_) { return text || ''; } };
       const build = (root, isDetail) => ({
         title: value(root, rules.title), subtitle: value(root, rules.subtitle),
         detailUrl: isDetail ? window.location.href : absolute(value(root, rules.detail)),
         magnetUrl: absolute(value(root, rules.download)), category: value(root, rules.category),
-        poster: absolute(value(root, rules.poster)), size: value(root, rules.size),
+        poster: absolute(value(root, rules.poster)), size: joined(root, rules.size),
+        fileCount: value(root, rules.fileCount), hash: value(root, rules.hash),
+        douban: absolute(value(root, rules.douban)), imdb: absolute(value(root, rules.imdb)),
         progress: value(root, rules.progress), hr: value(root, rules.hr), sale: value(root, rules.sale),
         saleExpire: value(root, rules.saleExpiry), release: value(root, rules.published),
         seeders: value(root, rules.seeders), leechers: value(root, rules.leechers),
@@ -4986,47 +5005,121 @@ private func browserProfileExtractionScript(config: [String: Any]) -> String {
         ("leech", "下载中", "my_leech_rule"), ("publish", "发布数", "my_publish_rule"),
         ("hr", "HR", "my_hr_rule")
     ]
-    let specs = definitions.map { ["key": $0.0, "label": $0.1, "rule": firstConfigString(config[$0.2]) ?? ""] }
     let pageUser = firstConfigString(config["page_user"]) ?? ""
+    let specs = definitions.compactMap { definition -> [String: String]? in
+        let rule = firstConfigString(config[definition.2]) ?? ""
+        guard !rule.isEmpty || (definition.0 == "uid" && pageUser.contains("{}")) else { return nil }
+        return ["key": definition.0, "label": definition.1, "rule": rule]
+    }
     return """
     (() => {
       const specs = \(browserJavaScriptLiteral(specs));
       const pageUser = \(browserJavaScriptLiteral([pageUser])).at(0) || '';
       const clean = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
-      const read = (node) => {
+      const variants = (rule) => {
+        const raw = clean(rule);
+        if (!raw) return [];
+        const values = new Set([raw]);
+        const withoutTbody = raw.replace(/\\/tbody(?=\\/|$)/gi, '');
+        const withTbody = raw.replace(/(\\/table(?:\\[[^\\]]+\\])?)(?=\\/tr(?:\\[[^\\]]+\\])?(?:\\/|$))/gi, '$1/tbody');
+        values.add(withoutTbody);
+        values.add(withTbody);
+        values.add(withoutTbody.replace(/(\\/table(?:\\[[^\\]]+\\])?)(?=\\/tr(?:\\[[^\\]]+\\])?(?:\\/|$))/gi, '$1/tbody'));
+        return Array.from(values).filter(Boolean);
+      };
+      const read = (node, key) => {
         if (!node) return '';
-        if (node.nodeType === Node.ATTRIBUTE_NODE || node.nodeType === Node.TEXT_NODE) return clean(node.nodeValue);
-        if (node instanceof HTMLAnchorElement) return clean(node.getAttribute('href') || node.href || node.textContent);
+        if (node.nodeType === Node.ATTRIBUTE_NODE || node.nodeType === Node.TEXT_NODE || node.nodeType === Node.CDATA_SECTION_NODE) return clean(node.nodeValue);
+        if (node instanceof HTMLAnchorElement) {
+          return key === 'uid'
+            ? clean(node.getAttribute('href') || node.href || node.textContent)
+            : clean(node.textContent || node.getAttribute('href') || node.href);
+        }
+        if (node instanceof HTMLImageElement) return clean(node.getAttribute('alt') || node.getAttribute('title') || node.getAttribute('src') || node.src);
         return clean(node.textContent);
       };
-      const evaluate = (rule) => {
+      const nodes = (rule) => {
+        if (!rule) return [];
+        for (const candidate of variants(rule)) {
+          try {
+            const result = document.evaluate(candidate, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            const values = [];
+            for (let index = 0; index < result.snapshotLength; index += 1) values.push(result.snapshotItem(index));
+            if (values.length) return values;
+          } catch (_) {}
+        }
+        return [];
+      };
+      const evaluate = (rule, key) => {
         if (!rule) return '';
-        for (const candidate of [rule, rule.replace(/\\/tbody(?=\\/|$)/gi, '')]) {
+        for (const candidate of variants(rule)) {
           try {
             const result = document.evaluate(candidate, document, null, XPathResult.ANY_TYPE, null);
             if (result.resultType === XPathResult.STRING_TYPE && clean(result.stringValue)) return clean(result.stringValue);
             if (result.resultType === XPathResult.NUMBER_TYPE && Number.isFinite(result.numberValue)) return String(result.numberValue);
-            const text = read(result.singleNodeValue || (result.iterateNext ? result.iterateNext() : null));
+            if (result.resultType === XPathResult.BOOLEAN_TYPE && result.booleanValue) return 'true';
+            const text = read(result.singleNodeValue || (result.iterateNext ? result.iterateNext() : null), key);
             if (text) return text;
           } catch (_) {}
         }
-        return '';
+        return nodes(rule).map((node) => read(node, key)).filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
       };
-      const uid = (raw) => {
-        if (/^\\d+$/.test(raw)) return raw;
-        for (const candidate of [raw, window.location.href, ...Array.from(document.querySelectorAll('a[href]')).map((a) => a.href)]) {
+      const escape = (value) => {
+        let escaped = String(value);
+        for (const character of ['\\\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}']) {
+          escaped = escaped.split(character).join('\\\\' + character);
+        }
+        return escaped;
+      };
+      const userID = (raw) => {
+        const source = clean(raw);
+        if (/^\\d+$/.test(source)) return source;
+        const candidates = [source, window.location.href, ...Array.from(document.querySelectorAll('a[href]')).flatMap((anchor) => [anchor.getAttribute('href') || '', anchor.href || ''])].filter(Boolean);
+        if (pageUser.includes('{}')) {
+          const marker = '__HARVEST_USER_ID__';
           try {
-            const url = new URL(candidate, window.location.href);
-            for (const key of ['id', 'uid', 'user_id', 'userid']) { const value = url.searchParams.get(key); if (value) return value; }
-            const match = url.pathname.match(/(?:user|users|userdetails)[^0-9]*(\\d+)/i); if (match) return match[1];
+            const target = new URL(pageUser.replaceAll('{}', marker), window.location.origin + '/');
+            for (const candidate of candidates) {
+              const current = new URL(candidate, window.location.href);
+              for (const [key, value] of target.searchParams.entries()) {
+                if (value === marker && current.origin === target.origin && current.pathname.replace(/\\/$/, '') === target.pathname.replace(/\\/$/, '')) {
+                  const found = clean(current.searchParams.get(key));
+                  if (found) return decodeURIComponent(found);
+                }
+              }
+              const pattern = new RegExp('^' + escape(target.href).replace(escape(marker), '([^/?#&]+)') + '(?:[?#&].*)?$');
+              const match = current.href.match(pattern);
+              if (match && match[1]) return decodeURIComponent(match[1]);
+            }
           } catch (_) {}
         }
-        if (pageUser.includes('{}')) { const match = window.location.href.match(/\\d+/g); if (match) return match.at(-1); }
-        return raw;
+        for (const candidate of candidates) {
+          try {
+            const url = new URL(candidate, window.location.href);
+            for (const key of ['uid', 'user_id', 'userid', 'id']) {
+              const found = clean(url.searchParams.get(key));
+              if (found && /^\\d+$/.test(found)) return found;
+            }
+            const match = url.pathname.match(/(?:user|users|userdetails)[^0-9]*(\\d+)/i);
+            if (match) return match[1];
+          } catch (_) {}
+        }
+        return source;
+      };
+      const normalize = (key, raw) => {
+        let value = clean(raw);
+        if (!value || ['-', '--', '---', '—', 'n/a', 'null', 'none', '暂无', '无'].includes(value.toLowerCase())) return '';
+        if (key === 'uid') return userID(value);
+        if (key === 'email') {
+          const match = value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);
+          if (match) value = match[0];
+        }
+        if (key === 'level') value = value.replace(/_Name\\b/g, '').trim();
+        return value;
       };
       return JSON.stringify(specs.map((spec) => {
-        const raw = evaluate(spec.rule);
-        return { key: spec.key, label: spec.label, value: spec.key === 'uid' ? uid(raw) : raw };
+        const raw = evaluate(spec.rule, spec.key);
+        return { key: spec.key, label: spec.label, value: normalize(spec.key, raw) };
       }).filter((item) => item.value));
     })();
     """
@@ -5034,9 +5127,23 @@ private func browserProfileExtractionScript(config: [String: Any]) -> String {
 
 private func browserBonusExtractionScript(config: [String: Any]) -> String {
     let bonusRule = firstConfigString(config["my_bonus_rule"]) ?? ""
+    let actionValues: [String: Any]
+    if let dictionary = config["buy_action"] as? [String: Any] {
+        actionValues = dictionary
+    } else if let dictionary = config["buy_action"] as? NSDictionary {
+        actionValues = dictionary.reduce(into: [String: Any]()) { result, entry in
+            result[String(describing: entry.key)] = entry.value
+        }
+    } else {
+        actionValues = [:]
+    }
+    let configuredAction = actionValues.reduce(into: [String: String]()) { result, entry in
+        result[entry.key] = String(describing: entry.value)
+    }
     return """
     (() => {
       const bonusRule = \(browserJavaScriptLiteral([bonusRule]))[0] || '';
+      const configuredAction = \(browserJavaScriptLiteral(configuredAction));
       const clean = (value) => String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
       const number = (value) => {
         const match = clean(value).replace(/,/g, '').match(/[0-9]+(?:\\.[0-9]+)?/);
@@ -5062,12 +5169,24 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
       }
       const seen = new Set();
       const items = [];
-      for (const form of Array.from(document.querySelectorAll('form'))) {
+      const exchangeWords = ['exchange', '兑换', '购买', 'buy', '交换'];
+      const forms = Array.from(document.querySelectorAll('form'));
+      for (const form of forms) {
         const optionInput = form.querySelector('input[name="option"]');
-        if (!optionInput || !optionInput.value || seen.has(optionInput.value)) continue;
+        let option = optionInput?.value || '';
         const container = form.closest('tr, [class*="bonus"], [class*="exchange"], article, li') || form;
         const submit = form.querySelector('button[type="submit"], input[type="submit"]');
         const text = clean(container.innerText || container.textContent);
+        const actionText = clean(form.getAttribute('action')).toLowerCase();
+        const submitText = clean(submit?.value || submit?.innerText).toLowerCase();
+        const hasConfiguredAction = Boolean(configuredAction.action || configuredAction.url);
+        const isExchangeForm = actionText.includes('exchange') || actionText.includes('buy') || actionText.includes('bonus')
+          || exchangeWords.some((word) => submitText.includes(word)) || (Boolean(option) && hasConfiguredAction);
+        if (!option && isExchangeForm) {
+          const rowID = clean(container.querySelector('td')?.innerText || '');
+          if (/^\\d+$/.test(rowID)) option = rowID;
+        }
+        if (!option || seen.has(option) || !isExchangeForm) continue;
         if (!text || /赠送|捐赠|消除|头衔|免费|置顶|H&R/i.test(text)) continue;
         const titleNode = container.querySelector('h1, h2, h3, [class*="title"], [class*="name"], td');
         let name = clean(titleNode?.innerText || titleNode?.textContent || text.split(/\\s{2,}|\\n/)[0]);
@@ -5082,7 +5201,7 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
           if (match) cost = number(match[1]);
         }
         if (!cost) {
-          const values = (text.match(/[0-9][0-9,.]*/g) || []).map(number).filter((value) => value >= 10 && value !== Number(optionInput.value));
+          const values = (text.match(/[0-9][0-9,.]*/g) || []).map(number).filter((value) => value >= 10 && value !== Number(option));
           if (values.length) cost = values.at(-1);
         }
         if (!cost) continue;
@@ -5090,12 +5209,16 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
         for (const input of Array.from(form.querySelectorAll('input[type="hidden"]'))) {
           if (input.name) hiddenInputs[input.name] = input.value || '';
         }
-        hiddenInputs.option = optionInput.value;
-        seen.add(optionInput.value);
+        if (!hiddenInputs.option) hiddenInputs.option = option;
+        for (const [key, value] of Object.entries(configuredAction || {})) {
+          if (!(key in hiddenInputs) && !['action', 'url', 'method'].includes(key)) hiddenInputs[key] = String(value);
+        }
+        seen.add(option);
         items.push({
-          name: name || `Option ${optionInput.value}`,
-          cost, option: optionInput.value,
-          action: form.getAttribute('action') || window.location.href,
+          name: name || `Option ${option}`,
+          cost, option,
+          action: form.getAttribute('action') || configuredAction.action || configuredAction.url || window.location.href,
+          method: form.getAttribute('method') || configuredAction.method || 'POST',
           hiddenInputs, disabled: Boolean(submit?.disabled)
         });
       }
@@ -5116,6 +5239,7 @@ private func parsedBrowserBonusPage(_ raw: Any?) -> BrowserBonusPage? {
             cost: row.double("cost") ?? 0,
             option: option,
             action: row.string("action", "formAction") ?? "",
+            method: row.string("method") ?? "POST",
             hiddenInputs: hidden,
             disabled: row.bool("disabled") ?? false
         )
@@ -5129,14 +5253,26 @@ private func browserBonusSubmitScript(_ item: BrowserBonusItem) -> String {
     inputs["option"] = item.option
     return """
     const action = \(browserJavaScriptLiteral([item.action]))[0] || window.location.href;
+    const method = String(\(browserJavaScriptLiteral([item.method]))[0] || 'POST').toUpperCase();
     const inputs = \(browserJavaScriptLiteral(inputs));
     const body = new URLSearchParams();
     Object.entries(inputs).forEach(([key, value]) => body.append(key, String(value)));
-    const response = await fetch(new URL(action, window.location.href), {
-      method: 'POST', credentials: 'include', redirect: 'follow',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body
+    const target = new URL(action, window.location.href);
+    const options = { method, credentials: 'include', redirect: 'follow', headers: {} };
+    if (method === 'GET') {
+      body.forEach((value, key) => target.searchParams.append(key, value));
+    } else {
+      options.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
+      options.body = body;
+    }
+    const response = await fetch(target, options);
+    const responseText = await response.text();
+    return JSON.stringify({
+      ok: response.ok,
+      status: response.status,
+      url: response.url,
+      response: responseText.replace(/\\s+/g, ' ').slice(0, 500)
     });
-    return JSON.stringify({ ok: response.ok, status: response.status });
     """
 }
 
@@ -5156,7 +5292,7 @@ struct SiteBrowserScreen: View {
     @StateObject private var session = BrowserSessionModel()
     @State private var isSyncing = false
     @State private var isWorking = false
-    @State private var siteConfig: [String: Any] = [:]
+    @State private var siteConfig: [String: Any]
     @State private var downloaders: [DownloaderItem] = []
     @State private var pushPayload: BrowserPushPayload?
     @State private var extractedTorrents: [BrowserExtractedTorrent] = []
@@ -5171,10 +5307,17 @@ struct SiteBrowserScreen: View {
     @State private var createdSiteID: Int?
     @State private var persistedSiteBody: [String: Any]?
 
-    init(site: SiteItem, urlString: String, title: String, onSynced: @escaping () async -> Void = {}) {
+    init(
+        site: SiteItem,
+        urlString: String,
+        title: String,
+        initialConfig: [String: Any] = [:],
+        onSynced: @escaping () async -> Void = {}
+    ) {
         self.site = site
         self.urlString = urlString
         self.title = title
+        _siteConfig = State(initialValue: initialConfig)
         self.onSynced = onSynced
     }
 
@@ -5419,9 +5562,20 @@ struct SiteBrowserScreen: View {
             shortcuts.append(SitePageShortcut(key: key, label: label, icon: icon, path: url.absoluteString))
         }
 
-        append(key: "page_index", label: "首页", icon: "house", rawPath: firstConfigString(siteConfig["page_index"]) ?? "", fallbackToSite: true)
+        append(
+            key: "page_index",
+            label: "首页",
+            icon: "house",
+            rawPath: firstConfigString(siteConfig["page_index"]) ?? "",
+            fallbackToSite: true
+        )
         append(key: "page_sign_in", label: "签到页", icon: "checkmark.seal", rawPath: firstConfigString(siteConfig["page_sign_in"]) ?? "", hideAPI: true)
-        append(key: "page_torrents", label: "种子页", icon: "list.bullet.rectangle", rawPath: firstConfigString(siteConfig["page_torrents"]) ?? "")
+        append(
+            key: "page_torrents",
+            label: "种子页",
+            icon: "list.bullet.rectangle",
+            rawPath: nonEmptyConfigString(siteConfig["page_torrents"]) ?? site.torrentsURL
+        )
         for (index, path) in configStrings(siteConfig["page_search"]).enumerated() {
             append(
                 key: "page_search_\(index)",
@@ -5434,7 +5588,14 @@ struct SiteBrowserScreen: View {
         append(key: "page_user", label: "个人中心", icon: "person.crop.circle", rawPath: firstConfigString(siteConfig["page_user"]) ?? "", hideAPI: true, replaceUserID: true)
         append(key: "page_control_panel", label: "控制中心", icon: "slider.horizontal.3", rawPath: firstConfigString(siteConfig["page_control_panel"]) ?? "", replaceUserID: true)
         append(key: "page_message", label: "消息中心", icon: "envelope", rawPath: firstConfigString(siteConfig["page_message"]) ?? "")
-        append(key: "page_mybonus", label: "魔力页面", icon: "wand.and.stars", rawPath: firstConfigString(siteConfig["page_mybonus"]) ?? "")
+        append(
+            key: "page_mybonus",
+            label: "魔力页面",
+            icon: "wand.and.stars",
+            rawPath: nonEmptyConfigString(siteConfig["page_mybonus"])
+                ?? nonEmptyConfigString(siteConfig["buy_page"])
+                ?? ""
+        )
         return shortcuts
     }
 
@@ -5500,17 +5661,25 @@ struct SiteBrowserScreen: View {
     }
 
     @MainActor private func copyAuthorizationDiagnostics() async {
-        let storage = try? await session.captureStorage()
+        let storage = try? await session.captureStorage(allowEmpty: true)
         UIPasteboard.general.string = prettyJSON([
             "current_url": session.currentURL?.absoluteString ?? urlString,
             "initial_url": urlString,
+            "site_id": effectiveSiteID,
+            "site_key": site.siteKey,
+            "config_loaded": !siteConfig.isEmpty,
             "configured_localstorage_length": site.localStorage.count,
             "configured_localstorage": site.localStorage,
             "cookie_length": storage?.cookie.count ?? 0,
             "cookie": storage?.cookie ?? "",
+            "localstorage_item_count": storage?.localStorageItemCount ?? 0,
             "localstorage_length": storage?.localStorage.count ?? 0,
             "localstorage": storage?.localStorage ?? "",
-            "user_agent": session.webView?.customUserAgent ?? "系统默认"
+            "user_agent": session.webView?.customUserAgent ?? "系统默认",
+            "has_torrent_list_rules": hasTorrentListRules,
+            "has_torrent_detail_rules": hasTorrentDetailRules,
+            "has_profile_rules": hasProfileRules,
+            "has_bonus_rules": hasBonusRules
         ])
     }
 
@@ -5560,12 +5729,45 @@ struct SiteBrowserScreen: View {
 
     private var effectiveSiteID: Int { site.id > 0 ? site.id : createdSiteID ?? 0 }
 
+    private func browserConfigHasInterfaces(_ config: [String: Any]) -> Bool {
+        config.keys.contains { key in
+            key.hasPrefix("page_")
+                || key.hasSuffix("_rule")
+                || key == "buy_page"
+                || key == "buy_action"
+        }
+    }
+
     @MainActor private func loadBrowserConfig() async {
-        guard siteConfig.isEmpty, !site.siteKey.isEmpty else { return }
+        guard !browserConfigHasInterfaces(siteConfig), !site.siteKey.isEmpty else { return }
         do {
-            siteConfig = jsonPayloadDictionary(try await appState.api(
+            let direct = jsonPayloadDictionary(try await appState.api(
                 "\(APIPath.websiteList)/\(urlPathSegment(site.siteKey))"
             )) ?? [:]
+            if browserConfigHasInterfaces(direct) {
+                siteConfig = direct
+                return
+            }
+        } catch {
+            // The detail endpoint is not available on older servers. Use the
+            // complete website list as a compatibility fallback below.
+        }
+
+        do {
+            let configs = jsonRows(try await appState.api(APIPath.websiteList))
+            let siteKey = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let siteName = site.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let siteHost = URL(string: site.url)?.host?.lowercased()
+            siteConfig = configs.first(where: { config in
+                let names = [
+                    config.string("name", "site"),
+                    config.string("nickname"),
+                    config.string("tracker")
+                ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                if names.contains(where: { !$0.isEmpty && ($0 == siteKey || $0 == siteName) }) { return true }
+                guard let siteHost, !siteHost.isEmpty else { return false }
+                return configStrings(config["url"]).contains { URL(string: $0)?.host?.lowercased() == siteHost }
+            }) ?? [:]
         } catch {
             siteConfig = [:]
         }
@@ -5590,13 +5792,64 @@ struct SiteBrowserScreen: View {
         pushPayload = BrowserPushPayload(input: value, cookie: cookie)
     }
 
+    @MainActor private func loadConfiguredActionPage(
+        keys: [String],
+        fallbackPath: String = "",
+        replaceUserID: Bool = false
+    ) async throws -> Bool {
+        var paths: [String] = []
+        for key in keys {
+            guard let path = nonEmptyConfigString(siteConfig[key]) else { continue }
+            if key == "page_user", path.lowercased().contains("api/") { continue }
+            paths.append(path)
+        }
+        if !fallbackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            paths.append(fallbackPath)
+        }
+        for rawPath in paths where !rawPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let target = resolvedBrowserShortcutURL(
+                rawPath,
+                fallbackToSite: false,
+                hideAPI: false,
+                replaceUserID: replaceUserID,
+                clearPlaceholder: false
+            ) else { continue }
+            if target.absoluteString == session.currentURL?.absoluteString { continue }
+            try await session.loadAndWait(target)
+            return true
+        }
+        return false
+    }
+
+    @MainActor private func extractedTorrentItems(detail: Bool) async throws -> [BrowserExtractedTorrent] {
+        let raw = try await session.evaluateJavaScript(browserTorrentExtractionScript(config: siteConfig, detail: detail))
+        let parsed = parsedBrowserJavaScriptValue(raw)
+        if detail {
+            guard let parsed, let row = jsonDictionary(parsed) else { return [] }
+            return [BrowserExtractedTorrent(row)]
+        }
+        return jsonRows(parsed ?? []).map(BrowserExtractedTorrent.init)
+    }
+
+    @MainActor private func extractedProfileMetrics() async throws -> [BrowserProfileMetric] {
+        let raw = try await session.evaluateJavaScript(browserProfileExtractionScript(config: siteConfig))
+        return jsonRows(parsedBrowserJavaScriptValue(raw) ?? []).compactMap { row in
+            guard let key = row.string("key"), let value = row.string("value"), !value.isEmpty else { return nil }
+            return BrowserProfileMetric(key: key, label: row.string("label") ?? key, value: value)
+        }
+    }
+
     @MainActor private func extractTorrentList() async {
         isWorking = true
         defer { isWorking = false }
         do {
-            let raw = try await session.evaluateJavaScript(browserTorrentExtractionScript(config: siteConfig, detail: false))
-            let rows = jsonRows(parsedBrowserJavaScriptValue(raw) ?? [])
-            let items = rows.map(BrowserExtractedTorrent.init).filter { !$0.pushURL.isEmpty }
+            var items = try await extractedTorrentItems(detail: false)
+            items = items.filter { !$0.pushURL.isEmpty }
+            if items.isEmpty,
+               try await loadConfiguredActionPage(keys: ["page_torrents"], fallbackPath: site.torrentsURL) {
+                items = try await extractedTorrentItems(detail: false)
+                items = items.filter { !$0.pushURL.isEmpty }
+            }
             guard !items.isEmpty else { throw APIError(statusCode: 0, message: "当前页面未提取到种子") }
             extractedTorrents = items
             showExtractedTorrents = true
@@ -5609,11 +5862,10 @@ struct SiteBrowserScreen: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            let raw = try await session.evaluateJavaScript(browserTorrentExtractionScript(config: siteConfig, detail: true))
-            guard let parsed = parsedBrowserJavaScriptValue(raw), let row = jsonDictionary(parsed) else {
+            let items = try await extractedTorrentItems(detail: true)
+            guard let item = items.first else {
                 throw APIError(statusCode: 0, message: "当前页面未提取到种子详情")
             }
-            let item = BrowserExtractedTorrent(row)
             guard !item.pushURL.isEmpty else { throw APIError(statusCode: 0, message: "当前页面未提取到种子详情") }
             await presentPush(input: item.pushURL)
         } catch {
@@ -5625,11 +5877,11 @@ struct SiteBrowserScreen: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            let raw = try await session.evaluateJavaScript(browserProfileExtractionScript(config: siteConfig))
-            let rows = jsonRows(parsedBrowserJavaScriptValue(raw) ?? [])
-            profileMetrics = rows.compactMap { row in
-                guard let key = row.string("key"), let value = row.string("value"), !value.isEmpty else { return nil }
-                return BrowserProfileMetric(key: key, label: row.string("label") ?? key, value: value)
+            profileMetrics = try await extractedProfileMetrics()
+            for key in ["page_user", "page_control_panel"] where profileMetrics.isEmpty {
+                if try await loadConfiguredActionPage(keys: [key], replaceUserID: true) {
+                    profileMetrics = try await extractedProfileMetrics()
+                }
             }
             guard !profileMetrics.isEmpty else { throw APIError(statusCode: 0, message: "当前页面未提取到用户资料") }
             showProfile = true
@@ -5691,8 +5943,15 @@ struct SiteBrowserScreen: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            let raw = try await session.evaluateJavaScript(browserBonusExtractionScript(config: siteConfig))
-            guard let page = parsedBrowserBonusPage(raw) else {
+            var raw = try await session.evaluateJavaScript(browserBonusExtractionScript(config: siteConfig))
+            var page = parsedBrowserBonusPage(raw)
+            for key in ["page_mybonus", "buy_page"] where page == nil {
+                if try await loadConfiguredActionPage(keys: [key]) {
+                    raw = try await session.evaluateJavaScript(browserBonusExtractionScript(config: siteConfig))
+                    page = parsedBrowserBonusPage(raw)
+                }
+            }
+            guard let page else {
                 throw APIError(statusCode: 0, message: "当前页面未识别到可兑换项目")
             }
             bonusPage = page
@@ -6078,6 +6337,12 @@ private func firstConfigString(_ value: Any?) -> String? {
     if let text = value as? String { return text }
     if let values = value as? [Any] { return values.compactMap { $0 as? String }.first }
     return value.map { String(describing: $0) }
+}
+
+private func nonEmptyConfigString(_ value: Any?) -> String? {
+    guard let text = firstConfigString(value)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !text.isEmpty else { return nil }
+    return text
 }
 
 private func configStrings(_ value: Any?) -> [String] {

@@ -3945,6 +3945,7 @@ struct LogView: View {
 struct BrowserStorageSnapshot {
     let cookie: String
     let localStorage: String
+    let localStorageItemCount: Int
 }
 
 struct BrowserTorrentRequest: Identifiable, Equatable {
@@ -4022,6 +4023,24 @@ final class BrowserSessionModel: ObservableObject {
         webView?.load(URLRequest(url: url))
     }
 
+    func loadAndWait(_ url: URL, timeout: TimeInterval = 15) async throws {
+        guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
+        let previousURL = webView.url
+        load(url)
+        let deadline = Date().addingTimeInterval(timeout)
+        var navigationStarted = false
+        while Date() < deadline {
+            try Task.checkCancellation()
+            if webView.isLoading || webView.url != previousURL { navigationStarted = true }
+            if navigationStarted, !webView.isLoading, webView.url != nil {
+                refreshState(webView)
+                return
+            }
+            try await Task.sleep(for: .milliseconds(150))
+        }
+        throw APIError(statusCode: 0, message: "目标页面加载超时")
+    }
+
     func navigationStarted(_ webView: WKWebView) {
         loadError = nil
         refreshState(webView)
@@ -4063,7 +4082,7 @@ final class BrowserSessionModel: ObservableObject {
         )
     }
 
-    func captureStorage() async throws -> BrowserStorageSnapshot {
+    func captureStorage(allowEmpty: Bool = false) async throws -> BrowserStorageSnapshot {
         guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
         let host = webView.url?.host?.lowercased() ?? ""
         let allCookies: [HTTPCookie] = await withCheckedContinuation { continuation in
@@ -4077,33 +4096,141 @@ final class BrowserSessionModel: ObservableObject {
             .sorted { $0.name < $1.name }
             .map { "\($0.name)=\($0.value)" }
             .joined(separator: "; ")
-        let script = "JSON.stringify(Object.fromEntries(Object.entries(window.localStorage)))"
+        let script = "JSON.stringify({ values: Object.fromEntries(Object.entries(window.localStorage)), count: window.localStorage.length })"
         let result = try await webView.evaluateJavaScript(script)
-        let localStorageText = (result as? String) ?? "{}"
-        guard !cookieText.isEmpty || localStorageText != "{}" else {
+        let localStoragePayload: [String: Any]
+        if let text = result as? String,
+           let data = text.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = object as? [String: Any] {
+            localStoragePayload = dictionary
+        } else {
+            localStoragePayload = [:]
+        }
+        let localStorageValues: [String: Any]
+        if let dictionary = localStoragePayload["values"] as? [String: Any] {
+            localStorageValues = dictionary
+        } else if let dictionary = localStoragePayload["values"] as? NSDictionary {
+            localStorageValues = dictionary.reduce(into: [String: Any]()) { result, entry in
+                result[String(describing: entry.key)] = entry.value
+            }
+        } else {
+            localStorageValues = [:]
+        }
+        let localStorageText: String
+        if localStorageValues.isEmpty {
+            localStorageText = ""
+        } else if let data = try? JSONSerialization.data(withJSONObject: localStorageValues, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) {
+            localStorageText = text
+        } else {
+            localStorageText = ""
+        }
+        let itemCount = (localStoragePayload["count"] as? NSNumber)?.intValue ?? localStorageValues.count
+        guard allowEmpty || !cookieText.isEmpty || !localStorageText.isEmpty else {
             throw APIError(statusCode: 0, message: "当前页面没有可同步的 Cookie 或 LocalStorage")
         }
-        return BrowserStorageSnapshot(cookie: cookieText, localStorage: localStorageText)
+        return BrowserStorageSnapshot(
+            cookie: cookieText,
+            localStorage: localStorageText,
+            localStorageItemCount: itemCount
+        )
     }
 
     func captureLongScreenshot() async throws -> UIImage {
         guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
-        let width = webView.bounds.width
-        guard width > 0 else { throw APIError(statusCode: 0, message: "网页尚未完成布局") }
+        guard webView.bounds.width > 0, webView.bounds.height > 0 else {
+            throw APIError(statusCode: 0, message: "网页尚未完成布局")
+        }
 
-        let contentHeight = max(webView.scrollView.contentSize.height, webView.bounds.height)
-        let maximumHeight = max(1, 60_000 / max(UIScreen.main.scale, 1))
+        let metricsScript = """
+        JSON.stringify({
+          scrollY: window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0,
+          viewportHeight: window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight || 0,
+          contentHeight: Math.max(
+            document.body ? document.body.scrollHeight : 0,
+            document.documentElement ? document.documentElement.scrollHeight : 0,
+            document.body ? document.body.offsetHeight : 0,
+            document.documentElement ? document.documentElement.offsetHeight : 0
+          )
+        })
+        """
+        let rawMetrics = try? await webView.evaluateJavaScript(metricsScript)
+        let metrics: [String: Any]
+        if let text = rawMetrics as? String,
+           let data = text.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data),
+           let dictionary = object as? [String: Any] {
+            metrics = dictionary
+        } else {
+            metrics = [:]
+        }
+        let viewportHeight = (metrics["viewportHeight"] as? NSNumber)?.doubleValue ?? Double(webView.bounds.height)
+        let contentHeight = (metrics["contentHeight"] as? NSNumber)?.doubleValue
+            ?? Double(max(webView.scrollView.contentSize.height, webView.bounds.height))
+        let originalOffset = (metrics["scrollY"] as? NSNumber)?.doubleValue
+            ?? Double(webView.scrollView.contentOffset.y)
+        guard viewportHeight > 0, contentHeight > 0 else { return try await captureVisibleSnapshot(webView) }
+
+        let estimatedPointScale = Double(webView.bounds.height) / viewportHeight
+        let maximumContentHeight = 60_000 / (Double(max(UIScreen.main.scale, 1)) * max(estimatedPointScale, 0.01))
+        let capturedContentHeight = min(contentHeight, maximumContentHeight)
+        let maxScroll = max(0, capturedContentHeight - viewportHeight)
+        let step = max(1, viewportHeight * 0.85)
+        var offsets = [0.0]
+        var next = 0.0
+        while next < maxScroll, offsets.count < 200 {
+            next = min(maxScroll, next + step)
+            if abs((offsets.last ?? 0) - next) < 1 { break }
+            offsets.append(next)
+        }
+
+        var pieces: [(image: UIImage, offset: Double)] = []
+        defer {
+            webView.evaluateJavaScript("window.scrollTo(0, \(Int(originalOffset)));", completionHandler: nil)
+        }
+        for offset in offsets {
+            try Task.checkCancellation()
+            _ = try? await webView.evaluateJavaScript("window.scrollTo(0, \(Int(offset))); true;")
+            try await Task.sleep(for: .milliseconds(300))
+            pieces.append((try await captureVisibleSnapshot(webView), offset))
+        }
+        guard let first = pieces.first else { return try await captureVisibleSnapshot(webView) }
+
+        let pointScale = Double(first.image.size.height) / max(viewportHeight, 1)
+        let maximumPointHeight = 60_000 / Double(max(first.image.scale, 1))
+        let outputHeight = CGFloat(min(maximumPointHeight, max(1, capturedContentHeight * pointScale)))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = first.image.scale
+        format.opaque = true
+        return UIGraphicsImageRenderer(
+            size: CGSize(width: first.image.size.width, height: outputHeight),
+            format: format
+        ).image { context in
+            context.cgContext.setFillColor(UIColor.systemBackground.cgColor)
+            context.cgContext.fill(CGRect(x: 0, y: 0, width: first.image.size.width, height: outputHeight))
+            for piece in pieces {
+                let y = CGFloat(piece.offset * pointScale)
+                guard y < outputHeight else { continue }
+                let height = min(piece.image.size.height, outputHeight - y)
+                piece.image.draw(
+                    in: CGRect(x: 0, y: y, width: first.image.size.width, height: height),
+                    from: CGRect(x: 0, y: 0, width: piece.image.size.width, height: height),
+                    blendMode: .copy,
+                    alpha: 1
+                )
+            }
+        }
+    }
+
+    private func captureVisibleSnapshot(_ webView: WKWebView) async throws -> UIImage {
         let configuration = WKSnapshotConfiguration()
-        configuration.rect = CGRect(x: 0, y: 0, width: width, height: min(contentHeight, maximumHeight))
-        configuration.snapshotWidth = NSNumber(value: Double(width))
-
+        configuration.rect = webView.bounds
+        configuration.snapshotWidth = NSNumber(value: Double(webView.bounds.width))
         return try await withCheckedThrowingContinuation { continuation in
             webView.takeSnapshot(with: configuration) { image, error in
-                if let image {
-                    continuation.resume(returning: image)
-                } else {
-                    continuation.resume(throwing: error ?? APIError(statusCode: 0, message: "网页长截图失败"))
-                }
+                if let image { continuation.resume(returning: image) }
+                else { continuation.resume(throwing: error ?? APIError(statusCode: 0, message: "网页截图失败")) }
             }
         }
     }
@@ -4111,6 +4238,7 @@ final class BrowserSessionModel: ObservableObject {
     func clearCurrentSiteData() async throws {
         guard let webView else { throw APIError(statusCode: 0, message: "浏览器尚未加载") }
         let host = webView.url?.host?.lowercased() ?? ""
+        guard !host.isEmpty else { throw APIError(statusCode: 0, message: "当前站点地址无效") }
         let store = webView.configuration.websiteDataStore.httpCookieStore
         let cookies: [HTTPCookie] = await withCheckedContinuation { continuation in
             store.getAllCookies { continuation.resume(returning: $0) }
@@ -4123,14 +4251,53 @@ final class BrowserSessionModel: ObservableObject {
                 }
             }
         }
-        _ = try? await webView.evaluateJavaScript("""
-        (() => {
-          const marker = '__harvest_local_storage_injected__';
-          try { window.localStorage.clear(); } catch (_) {}
-          try { window.sessionStorage.clear(); } catch (_) {}
-          try { window.sessionStorage.setItem(marker, 'cleared'); } catch (_) {}
-        })();
-        """)
+        _ = try? await webView.callAsyncJavaScript(
+            """
+            try { window.localStorage.clear(); } catch (_) {}
+            try { window.sessionStorage.clear(); } catch (_) {}
+            try {
+              if (typeof caches !== 'undefined') {
+                const keys = await caches.keys();
+                await Promise.all(keys.map((key) => caches.delete(key)));
+              }
+            } catch (_) {}
+            try {
+              if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+                const databases = await indexedDB.databases();
+                for (const database of databases) {
+                  if (database && database.name) indexedDB.deleteDatabase(database.name);
+                }
+              }
+            } catch (_) {}
+            return true;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+
+        let dataStore = webView.configuration.websiteDataStore
+        let records: [WKWebsiteDataRecord] = await withCheckedContinuation { continuation in
+            dataStore.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) {
+                continuation.resume(returning: $0)
+            }
+        }
+        let matchingRecords = records.filter { record in
+            let name = record.displayName.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            return name == host || host.hasSuffix("." + name) || name.hasSuffix("." + host)
+        }
+        if !matchingRecords.isEmpty {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                dataStore.removeData(
+                    ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                    for: matchingRecords
+                ) {
+                    continuation.resume()
+                }
+            }
+        }
+
+        webView.configuration.userContentController.removeAllUserScripts()
         webView.reload()
     }
 }
