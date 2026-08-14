@@ -202,7 +202,7 @@ enum SiteSortField: String, CaseIterable, Identifiable {
     case name = "站点名称"
     case nickname = "昵称"
     case joined = "注册时间"
-    case lastVisit = "最后访问"
+    case lastVisit = "最后活跃时间"
     case seedVolume = "做种体积"
     case magic = "魔力值"
     case score = "积分"
@@ -222,11 +222,38 @@ enum SiteSortField: String, CaseIterable, Identifiable {
     var defaultAscending: Bool {
         self == .updated || self == .sortID
     }
+
+    var icon: String {
+        switch self {
+        case .updated: "clock.arrow.circlepath"
+        case .name: "globe"
+        case .nickname: "textformat"
+        case .joined: "calendar"
+        case .lastVisit: "clock"
+        case .seedVolume: "externaldrive.fill"
+        case .magic: "bolt.fill"
+        case .score: "diamond.fill"
+        case .uploaded, .uploadDelta: "arrow.up"
+        case .downloaded, .downloadDelta: "arrow.down"
+        case .published: "paperplane.fill"
+        case .bonusHour: "timer"
+        case .invitations: "person.fill"
+        case .leeching: "arrow.down.circle.fill"
+        case .seeding: "leaf.fill"
+        case .ratio: "arrow.triangle.2.circlepath"
+        case .sortID: "number"
+        }
+    }
 }
 
 private enum SiteFilterStorageKey {
+    static let query = "site.filter.query"
     static let availability = "site.filter.availability"
     static let condition = "site.filter.condition"
+    static let selectedTags = "site.filter.selectedTags"
+    static let selectedTypes = "site.filter.selectedTypes"
+    static let selectedUsername = "site.filter.selectedUsername"
+    static let selectedEmail = "site.filter.selectedEmail"
     static let sortField = "site.filter.sortField"
     static let ascending = "site.filter.ascending"
 }
@@ -250,7 +277,12 @@ final class SitesViewModel: ObservableObject {
     @Published var isLoading = true
     @Published private(set) var usingCachedData = false
     @Published private(set) var cachedAt: Date?
-    @Published var query = "" { didSet { rebuildFilteredSites() } }
+    @Published var query = "" {
+        didSet {
+            UserDefaults.standard.set(query, forKey: SiteFilterStorageKey.query)
+            rebuildFilteredSites()
+        }
+    }
     @Published var availability: SiteAvailabilityFilter = .alive {
         didSet {
             UserDefaults.standard.set(availability.rawValue, forKey: SiteFilterStorageKey.availability)
@@ -275,14 +307,35 @@ final class SitesViewModel: ObservableObject {
             rebuildFilteredSites()
         }
     }
-    @Published var selectedTags: Set<String> = [] { didSet { rebuildFilteredSites() } }
-    @Published var selectedTypes: Set<String> = [] { didSet { rebuildFilteredSites() } }
-    @Published var selectedUsername = "" { didSet { rebuildFilteredSites() } }
-    @Published var selectedEmail = "" { didSet { rebuildFilteredSites() } }
+    @Published var selectedTags: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(selectedTags.sorted(), forKey: SiteFilterStorageKey.selectedTags)
+            rebuildFilteredSites()
+        }
+    }
+    @Published var selectedTypes: Set<String> = [] {
+        didSet {
+            UserDefaults.standard.set(selectedTypes.sorted(), forKey: SiteFilterStorageKey.selectedTypes)
+            rebuildFilteredSites()
+        }
+    }
+    @Published var selectedUsername = "" {
+        didSet {
+            UserDefaults.standard.set(selectedUsername, forKey: SiteFilterStorageKey.selectedUsername)
+            rebuildFilteredSites()
+        }
+    }
+    @Published var selectedEmail = "" {
+        didSet {
+            UserDefaults.standard.set(selectedEmail, forKey: SiteFilterStorageKey.selectedEmail)
+            rebuildFilteredSites()
+        }
+    }
     private var didRestoreCache = false
 
     init() {
         let defaults = UserDefaults.standard
+        query = defaults.string(forKey: SiteFilterStorageKey.query) ?? ""
         if let value = defaults.string(forKey: SiteFilterStorageKey.availability),
            let restored = SiteAvailabilityFilter(rawValue: value) {
             availability = restored
@@ -291,10 +344,17 @@ final class SitesViewModel: ObservableObject {
            let restored = SiteConditionFilter(rawValue: value) {
             condition = restored
         }
-        if let value = defaults.string(forKey: SiteFilterStorageKey.sortField),
-           let restored = SiteSortField(rawValue: value) {
-            sortField = restored
+        if let value = defaults.string(forKey: SiteFilterStorageKey.sortField) {
+            if value == "最后访问" {
+                sortField = .lastVisit
+            } else if let restored = SiteSortField(rawValue: value) {
+                sortField = restored
+            }
         }
+        selectedTags = Set(defaults.stringArray(forKey: SiteFilterStorageKey.selectedTags) ?? [])
+        selectedTypes = Set(defaults.stringArray(forKey: SiteFilterStorageKey.selectedTypes) ?? [])
+        selectedUsername = defaults.string(forKey: SiteFilterStorageKey.selectedUsername) ?? ""
+        selectedEmail = defaults.string(forKey: SiteFilterStorageKey.selectedEmail) ?? ""
         ascending = defaults.object(forKey: SiteFilterStorageKey.ascending) == nil
             ? sortField.defaultAscending
             : defaults.bool(forKey: SiteFilterStorageKey.ascending)
@@ -367,9 +427,6 @@ final class SitesViewModel: ObservableObject {
             return true
         }
         return values.sorted { left, right in
-            let leftNoticeCount = left.mail + left.notice
-            let rightNoticeCount = right.mail + right.notice
-            if leftNoticeCount != rightNoticeCount { return leftNoticeCount > rightNoticeCount }
             let comparison: ComparisonResult
             switch sortField {
             case .updated: comparison = left.updatedAt.compare(right.updatedAt)
@@ -413,25 +470,25 @@ final class SitesViewModel: ObservableObject {
     var pendingSignInCount: Int { sites.lazy.filter { $0.enabled && $0.signIn && !$0.signed }.count }
     var unreadCount: Int { sites.reduce(0) { $0 + $1.unread } }
     var activeFilterCount: Int {
-        var count = query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 1
+        var count = 0
         if availability != .alive { count += 1 }
         if condition != .all { count += 1 }
         count += selectedTags.count + selectedTypes.count
         if !selectedUsername.isEmpty { count += 1 }
         if !selectedEmail.isEmpty { count += 1 }
-        if sortField != .updated || ascending != SiteSortField.updated.defaultAscending { count += 1 }
         return count
     }
     var hasFilters: Bool {
         activeFilterCount > 0
     }
 
-    func resetFilters() {
-        query = ""
+    var hasActiveSort: Bool {
+        sortField != .updated || ascending != SiteSortField.updated.defaultAscending
+    }
+
+    func clearFilters() {
         availability = .alive
         condition = .all
-        sortField = .updated
-        ascending = SiteSortField.updated.defaultAscending
         selectedTags = []
         selectedTypes = []
         selectedUsername = ""
@@ -439,6 +496,19 @@ final class SitesViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         defaults.removeObject(forKey: SiteFilterStorageKey.availability)
         defaults.removeObject(forKey: SiteFilterStorageKey.condition)
+        defaults.removeObject(forKey: SiteFilterStorageKey.selectedTags)
+        defaults.removeObject(forKey: SiteFilterStorageKey.selectedTypes)
+        defaults.removeObject(forKey: SiteFilterStorageKey.selectedUsername)
+        defaults.removeObject(forKey: SiteFilterStorageKey.selectedEmail)
+    }
+
+    func resetFilters() {
+        query = ""
+        clearFilters()
+        sortField = .updated
+        ascending = SiteSortField.updated.defaultAscending
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: SiteFilterStorageKey.query)
         defaults.removeObject(forKey: SiteFilterStorageKey.sortField)
         defaults.removeObject(forKey: SiteFilterStorageKey.ascending)
     }
@@ -448,6 +518,10 @@ final class SitesViewModel: ObservableObject {
             ascending.toggle()
             return
         }
+        setSortField(field)
+    }
+
+    func setSortField(_ field: SiteSortField) {
         sortField = field
         ascending = field.defaultAscending
     }
@@ -936,49 +1010,83 @@ private struct SiteSearchFilterBar: View {
                 }
                 .buttonStyle(.bordered)
                 .tint(model.hasFilters ? HarvestTheme.blue : .secondary)
-                .accessibilityLabel("筛选和排序，已启用 \(model.activeFilterCount) 项")
+                .accessibilityLabel("筛选，已启用 \(model.activeFilterCount) 项")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
 
-            if model.hasFilters {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 7) {
-                        if !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            filterToken("搜索：\(model.query)", icon: "magnifyingglass") { model.query = "" }
-                        }
-                        if model.availability != .alive {
-                            filterToken(model.availability.rawValue, icon: "antenna.radiowaves.left.and.right") { model.availability = .alive }
-                        }
-                        if model.condition != .all {
-                            filterToken(model.condition.rawValue, icon: "checklist") { model.condition = .all }
-                        }
-                        ForEach(model.selectedTypes.sorted(), id: \.self) { type in
-                            filterToken(type, icon: "square.grid.2x2") { model.selectedTypes.remove(type) }
-                        }
-                        ForEach(model.selectedTags.sorted(), id: \.self) { tag in
-                            filterToken("#\(tag)", icon: "tag") { model.selectedTags.remove(tag) }
-                        }
-                        if !model.selectedUsername.isEmpty {
-                            filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode), icon: "person") { model.selectedUsername = "" }
-                        }
-                        if !model.selectedEmail.isEmpty {
-                            filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode), icon: "envelope") { model.selectedEmail = "" }
-                        }
-                        if model.sortField != .updated || model.ascending != SiteSortField.updated.defaultAscending {
-                            filterToken(model.sortField.rawValue, icon: model.ascending ? "arrow.up" : "arrow.down") {
-                                model.sortField = .updated
-                                model.ascending = SiteSortField.updated.defaultAscending
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 7) {
+                    Menu {
+                        ForEach(SiteSortField.allCases) { field in
+                            Button {
+                                model.setSortField(field)
+                            } label: {
+                                if model.sortField == field {
+                                    Label(field.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Label(field.rawValue, systemImage: field.icon)
+                                }
                             }
                         }
-                        Button("清除全部") { model.resetFilters() }
+                    } label: {
+                        Label(model.sortField.rawValue, systemImage: model.sortField.icon)
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                    .tint(HarvestTheme.blue)
+                    .accessibilityLabel("排序维度：\(model.sortField.rawValue)")
+
+                    Button {
+                        model.ascending.toggle()
+                    } label: {
+                        Label(model.ascending ? "升序" : "降序", systemImage: model.ascending ? "arrow.up" : "arrow.down")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                    .tint(HarvestTheme.blue)
+                    .accessibilityLabel("当前\(model.ascending ? "升序" : "降序")，点击切换")
+
+                    if model.availability != .alive {
+                        filterToken(model.availability.rawValue, icon: "antenna.radiowaves.left.and.right") { model.availability = .alive }
+                    }
+                    if model.condition != .all {
+                        filterToken(model.condition.rawValue, icon: "checklist") { model.condition = .all }
+                    }
+                    ForEach(model.selectedTypes.sorted(), id: \.self) { type in
+                        filterToken(type, icon: "square.grid.2x2") { model.selectedTypes.remove(type) }
+                    }
+                    ForEach(model.selectedTags.sorted(), id: \.self) { tag in
+                        filterToken("#\(tag)", icon: "tag") { model.selectedTags.remove(tag) }
+                    }
+                    if !model.selectedUsername.isEmpty {
+                        filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode), icon: "person") { model.selectedUsername = "" }
+                    }
+                    if !model.selectedEmail.isEmpty {
+                        filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode), icon: "envelope") { model.selectedEmail = "" }
+                    }
+                    if model.hasFilters {
+                        Button("清空筛选") { model.clearFilters() }
                             .font(.caption.weight(.semibold))
                             .buttonStyle(.plain)
                             .foregroundStyle(HarvestTheme.coral)
+                            .accessibilityLabel("清空全部筛选条件")
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
+                    if model.hasActiveSort {
+                        Button("恢复默认排序") {
+                            model.setSortField(.updated)
+                        }
+                            .font(.caption.weight(.semibold))
+                            .buttonStyle(.plain)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
             }
         }
         .background(Color(uiColor: .secondarySystemBackground))
@@ -1458,37 +1566,17 @@ struct SiteFilterSheet: View {
                     filterPicker("用户名", selection: $model.selectedUsername, values: model.availableUsernames, masksValues: true)
                     filterPicker("邮箱", selection: $model.selectedEmail, values: model.availableEmails, masksValues: true)
                 }
-                Section("排序字段") {
-                    ForEach(SiteSortField.allCases) { field in
-                        Button { model.selectSortField(field) } label: {
-                            HStack {
-                                Text(field.rawValue)
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                if model.sortField == field {
-                                    Image(systemName: model.ascending ? "arrow.up" : "arrow.down")
-                                        .foregroundStyle(HarvestTheme.blue)
-                                        .accessibilityLabel(model.ascending ? "升序" : "降序")
-                                }
-                            }
-                        }
-                    }
-                }
-                Section("排序方向") {
-                    Picker("方向", selection: $model.ascending) {
-                        Text("降序").tag(false)
-                        Text("升序").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                }
             }
-            .navigationTitle("筛选和排序")
+            .navigationTitle("筛选站点")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("重置") { model.resetFilters() }.disabled(!model.hasFilters)
+                    Button("清空") { model.clearFilters() }.disabled(!model.hasFilters)
                 }
-                ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("应用筛选") { dismiss() }
+                        .fontWeight(.semibold)
+                }
             }
         }
     }
@@ -2313,6 +2401,8 @@ private func safeFileName(_ value: String) -> String {
 
 struct SiteRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var metricGlowRotation = 0.0
     let site: SiteItem
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
@@ -2369,11 +2459,34 @@ struct SiteRow: View {
         .padding(.vertical, 1)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .accessibilityElement(children: .contain)
+        .onAppear { updateMetricGlowAnimation() }
+        .onDisappear { stopMetricGlowAnimation() }
+        .onChange(of: reduceMotion) { _, _ in updateMetricGlowAnimation() }
     }
 
     private var metricColumns: [GridItem] {
         let count = dynamicTypeSize.isAccessibilitySize ? 2 : 4
         return Array(repeating: GridItem(.flexible(), spacing: 6), count: count)
+    }
+
+    private func updateMetricGlowAnimation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            metricGlowRotation = reduceMotion ? 42 : 0
+        }
+        guard !reduceMotion else { return }
+        withAnimation(.linear(duration: 3.6).repeatForever(autoreverses: false)) {
+            metricGlowRotation = 360
+        }
+    }
+
+    private func stopMetricGlowAnimation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            metricGlowRotation = 0
+        }
     }
 
     private var header: some View {
@@ -2506,7 +2619,8 @@ struct SiteRow: View {
             value: formatBytes(site.uploaded),
             delta: dailyDeltaText(site.uploadDelta),
             icon: "arrow.up",
-            color: HarvestTheme.green
+            color: HarvestTheme.green,
+            glowRotation: metricGlowRotation
         )
     }
 
@@ -2516,20 +2630,21 @@ struct SiteRow: View {
             value: formatBytes(site.downloaded),
             delta: dailyDeltaText(site.downloadDelta),
             icon: "arrow.down",
-            color: HarvestTheme.blue
+            color: HarvestTheme.blue,
+            glowRotation: metricGlowRotation
         )
     }
 
     private var coreMetrics: some View {
         LazyVGrid(columns: metricColumns, spacing: 5) {
-            SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green)
-            SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue)
-            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber)
-            SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral)
-            SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
-            SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber)
-            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue)
-            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.green)
+            SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: formatCompactNumber(site.magic), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "diamond.fill", label: "积分", value: formatCompactNumber(site.score), color: HarvestTheme.coral, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "timer", label: "时魔", value: formatCompactNumber(site.bonusHour), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.blue, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.green, glowRotation: metricGlowRotation)
         }
         .padding(.horizontal, 5)
         .padding(.vertical, 7)
@@ -2546,7 +2661,8 @@ struct SiteRow: View {
                 icon: "clock.arrow.circlepath",
                 label: "最近时间",
                 value: recentTimeText(relativeTo: context.date),
-                color: HarvestTheme.green
+                color: HarvestTheme.green,
+                glowRotation: metricGlowRotation
             )
         }
         .padding(.horizontal, 7)
@@ -2737,16 +2853,68 @@ private struct SiteHeaderCompactMetric: View {
     }
 }
 
+private struct SiteMetricIcon: View {
+    let icon: String
+    let color: Color
+    let size: CGFloat
+    let glowRotation: Double
+
+    private var cornerRadius: CGFloat { max(5, size * 0.2) }
+    private var glowLineWidth: CGFloat { max(1.15, size * 0.05) }
+    private var phaseOffset: Double {
+        Double(icon.unicodeScalars.reduce(0) { ($0 + Int($1.value)) % 360 })
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(color)
+                .padding(1.1)
+
+            Image(systemName: icon)
+                .font(.system(size: size * 0.4, weight: .semibold))
+                .symbolRenderingMode(.monochrome)
+                .foregroundStyle(.white)
+
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(color.opacity(0.24), lineWidth: 0.7)
+
+            AngularGradient(
+                gradient: Gradient(stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .clear, location: 0.54),
+                    .init(color: color.opacity(0.06), location: 0.62),
+                    .init(color: color.opacity(0.24), location: 0.74),
+                    .init(color: color.opacity(0.56), location: 0.86),
+                    .init(color: Color.white.opacity(0.9), location: 0.93),
+                    .init(color: color.opacity(0.22), location: 0.975),
+                    .init(color: .clear, location: 1)
+                ]),
+                center: .center
+            )
+            .rotationEffect(.degrees(glowRotation + phaseOffset))
+            .mask {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(lineWidth: glowLineWidth)
+            }
+            .shadow(color: color.opacity(0.3), radius: max(1.2, size * 0.055))
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct SiteTrafficMetric: View {
     let label: String
     let value: String
     let delta: String
     let icon: String
     let color: Color
+    let glowRotation: Double
 
     var body: some View {
         HStack(spacing: 8) {
-            SymbolBadge(icon: icon, color: color, size: 32)
+            SiteMetricIcon(icon: icon, color: color, size: 32, glowRotation: glowRotation)
             VStack(alignment: .leading, spacing: 2) {
                 Text(label)
                     .font(.caption)
@@ -2774,15 +2942,12 @@ private struct SiteCardMetric: View {
     let label: String
     let value: String
     let color: Color
+    let glowRotation: Double
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 24, height: 24)
-                    .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                SiteMetricIcon(icon: icon, color: color, size: 24, glowRotation: glowRotation)
                 Text(label)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -2809,22 +2974,20 @@ private struct SiteDetailLine: View {
     let value: String
     let color: Color
     let lineLimit: Int?
+    let glowRotation: Double
 
-    init(icon: String, label: String, value: String, color: Color, lineLimit: Int? = 1) {
+    init(icon: String, label: String, value: String, color: Color, lineLimit: Int? = 1, glowRotation: Double = 0) {
         self.icon = icon
         self.label = label
         self.value = value
         self.color = color
         self.lineLimit = lineLimit
+        self.glowRotation = glowRotation
     }
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
-            Image(systemName: icon)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.white)
-                .frame(width: 22, height: 22)
-                .background(color, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            SiteMetricIcon(icon: icon, color: color, size: 22, glowRotation: glowRotation)
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -5058,7 +5221,42 @@ struct SiteBrowserScreen: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .bottomBar) {
+                Button { session.goBack() } label: { Image(systemName: "chevron.backward") }
+                    .disabled(!session.canGoBack)
+                    .accessibilityLabel("后退")
+                Button { session.goForward() } label: { Image(systemName: "chevron.forward") }
+                    .disabled(!session.canGoForward)
+                    .accessibilityLabel("前进")
+                if !browserShortcuts.isEmpty {
+                    Menu {
+                        ForEach(browserShortcuts) { shortcut in
+                            Button { openBrowserShortcut(shortcut) } label: {
+                                Label(shortcut.label, systemImage: shortcut.icon)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "safari")
+                    }
+                    .accessibilityLabel("站点快捷入口")
+                }
+                Menu {
+                    if !site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button("站点配置") { session.setUserAgent(site.userAgent) }
+                    }
+                    Button("Safari macOS") { session.setUserAgent(browserSafariMacUserAgent) }
+                    Button("Safari iPhone") { session.setUserAgent(browserSafariPhoneUserAgent) }
+                    Button("系统默认") { session.setUserAgent(nil) }
+                    Divider()
+                    Button("Chrome Android") { session.setUserAgent(browserChromeAndroidUserAgent) }
+                    Button("Chrome Windows") { session.setUserAgent(browserChromeWindowsUserAgent) }
+                    Button("Edge Windows") { session.setUserAgent(browserEdgeWindowsUserAgent) }
+                    Button("Firefox Windows") { session.setUserAgent(browserFirefoxWindowsUserAgent) }
+                } label: {
+                    Image(systemName: "globe")
+                }
+                .accessibilityLabel("切换 User-Agent")
+                Spacer()
                 Menu {
                     if !browserShortcuts.isEmpty {
                         Menu {
@@ -5123,43 +5321,6 @@ struct SiteBrowserScreen: View {
                     if isSyncing || isWorking || isCapturingScreenshot { ProgressView() } else { Image(systemName: "ellipsis.circle") }
                 }
                 .accessibilityLabel("网页工具")
-            }
-            ToolbarItemGroup(placement: .bottomBar) {
-                Button { session.goBack() } label: { Image(systemName: "chevron.backward") }
-                    .disabled(!session.canGoBack)
-                    .accessibilityLabel("后退")
-                Button { session.goForward() } label: { Image(systemName: "chevron.forward") }
-                    .disabled(!session.canGoForward)
-                    .accessibilityLabel("前进")
-                if !browserShortcuts.isEmpty {
-                    Menu {
-                        ForEach(browserShortcuts) { shortcut in
-                            Button { openBrowserShortcut(shortcut) } label: {
-                                Label(shortcut.label, systemImage: shortcut.icon)
-                            }
-                        }
-                    } label: {
-                        Image(systemName: "safari")
-                    }
-                    .accessibilityLabel("站点快捷入口")
-                }
-                Menu {
-                    if !site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Button("站点配置") { session.setUserAgent(site.userAgent) }
-                    }
-                    Button("Safari macOS") { session.setUserAgent(browserSafariMacUserAgent) }
-                    Button("Safari iPhone") { session.setUserAgent(browserSafariPhoneUserAgent) }
-                    Button("系统默认") { session.setUserAgent(nil) }
-                    Divider()
-                    Button("Chrome Android") { session.setUserAgent(browserChromeAndroidUserAgent) }
-                    Button("Chrome Windows") { session.setUserAgent(browserChromeWindowsUserAgent) }
-                    Button("Edge Windows") { session.setUserAgent(browserEdgeWindowsUserAgent) }
-                    Button("Firefox Windows") { session.setUserAgent(browserFirefoxWindowsUserAgent) }
-                } label: {
-                    Image(systemName: "globe")
-                }
-                .accessibilityLabel("切换 User-Agent")
-                Spacer()
                 Button { session.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .accessibilityLabel("刷新网页")
             }

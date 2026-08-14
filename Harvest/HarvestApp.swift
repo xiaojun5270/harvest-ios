@@ -114,7 +114,7 @@ private final class ManualTaskFeedbackWindow {
     private var hostingController: UIHostingController<ManualTaskFeedbackOverlay>?
 
     func update(_ feedback: ManualTaskFeedback?) {
-        guard let feedback else {
+        guard let feedback, feedback.phase != .failure else {
             window?.isHidden = true
             hostingController = nil
             window = nil
