@@ -1589,11 +1589,19 @@ private struct ResourceSelection: Identifiable {
     let value: [String: Any]
 }
 
+private struct ResourcePushSelection: Identifiable {
+    let id = UUID()
+    let value: [String: Any]
+    let downloader: DownloaderItem
+}
+
 struct SearchView: View {
     @EnvironmentObject private var appState: AppState
     @StateObject private var model = SearchViewModel()
     @State private var selectedMedia: MediaItem?
     @State private var selectedResource: ResourceSelection?
+    @State private var pendingResourcePush: ResourcePushSelection?
+    @State private var resourcePushSelection: ResourcePushSelection?
     @State private var showSettings = false
     @State private var activeSearchTask: Task<Void, Never>?
     @FocusState private var searchFieldFocused: Bool
@@ -1730,7 +1738,16 @@ struct SearchView: View {
         }
         .background(Color(uiColor: .systemBackground))
         .sheet(item: $selectedMedia) { item in MediaDetailSheet(item: item).environmentObject(appState) }
-        .sheet(item: $selectedResource) { selection in ResourcePushSheet(item: selection.value).environmentObject(appState) }
+        .sheet(item: $selectedResource, onDismiss: presentPendingResourcePush) { selection in
+            DownloaderSelectionSheet { downloader, _ in
+                pendingResourcePush = ResourcePushSelection(value: selection.value, downloader: downloader)
+            }
+            .environmentObject(appState)
+        }
+        .sheet(item: $resourcePushSelection) { selection in
+            ResourcePushSheet(item: selection.value, downloader: selection.downloader)
+                .environmentObject(appState)
+        }
         .sheet(isPresented: $showSettings) {
             SearchSettingsSheet(model: model) {
                 await model.loadSites(appState)
@@ -1755,6 +1772,12 @@ struct SearchView: View {
 
     private var searchPlaceholder: String {
         model.mode == "影视" ? "搜索电影、剧集..." : "搜索种子资源..."
+    }
+
+    private func presentPendingResourcePush() {
+        guard let pendingResourcePush else { return }
+        self.pendingResourcePush = nil
+        resourcePushSelection = pendingResourcePush
     }
 
     private var currentResultsAreEmpty: Bool {
@@ -2533,8 +2556,8 @@ struct ResourcePushSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let item: [String: Any]
-    @State private var downloaders: [DownloaderItem] = []
-    @State private var downloaderID = 0
+    let downloader: DownloaderItem
+    @State private var downloaderID: Int
     @State private var url: String
     @State private var savePath = ""
     @State private var suggestedPaths: [String] = []
@@ -2542,7 +2565,7 @@ struct ResourcePushSheet: View {
     @State private var siteIdentifier: String
     @State private var cookie: String
     @State private var generateTorrentURL: Bool
-    @State private var category = ""
+    @State private var category: String
     @State private var tags: String
     @State private var paused = false
     @State private var skipChecking = false
@@ -2564,13 +2587,16 @@ struct ResourcePushSheet: View {
     @State private var isLoading = true
     @State private var isSaving = false
 
-    init(item: [String: Any]) {
+    init(item: [String: Any], downloader: DownloaderItem) {
         self.item = item
+        self.downloader = downloader
         let initialURL = item.string("magnet_url", "magnetUrl", "detail_url", "detailUrl", "download_url", "url") ?? ""
         let initialSite = item.string("site_id", "siteId", "site") ?? ""
+        _downloaderID = State(initialValue: downloader.id)
         _url = State(initialValue: initialURL)
         _siteIdentifier = State(initialValue: initialSite)
         _cookie = State(initialValue: item.string("cookie") ?? "")
+        _category = State(initialValue: item.string("category", "category_name") ?? "")
         let lowercasedURL = initialURL.lowercased()
         _generateTorrentURL = State(initialValue: !initialSite.isEmpty && !lowercasedURL.contains("passkey") && !lowercasedURL.contains("sign"))
         let values = item.strings("tags")
@@ -2580,52 +2606,93 @@ struct ResourcePushSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("资源") {
-                    Text(item.string("title", "name") ?? "未命名资源").font(.headline)
-                    TextField("磁力链接或种子地址", text: $url, axis: .vertical).lineLimit(3...6).textInputAutocapitalization(.never)
-                }
                 Section("下载器") {
-                    if isLoading { ProgressView().frame(maxWidth: .infinity) }
-                    else if downloaders.isEmpty { Text("没有可用下载器").foregroundStyle(.secondary) }
-                    else { Picker("目标下载器", selection: $downloaderID) { ForEach(downloaders) { Text($0.name).tag($0.id) } } }
-                    if !suggestedPaths.isEmpty { Picker("常用路径", selection: $savePath) { Text("不指定").tag(""); ForEach(suggestedPaths, id: \.self) { Text($0).tag($0) } } }
+                    DownloaderIdentityRow(downloader: downloader)
+                }
+
+                Section("链接") {
+                    resourceSummaryCard
+                    TextField("磁力链接或种子地址", text: $url, axis: .vertical)
+                        .lineLimit(3...6)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+
+                Section("路径") {
+                    if isLoading {
+                        HStack(spacing: 9) {
+                            ProgressView()
+                            Text("正在读取常用路径").foregroundStyle(.secondary)
+                        }
+                    } else if !suggestedPaths.isEmpty {
+                        CompactFlowLayout(spacing: 8) {
+                            ForEach(suggestedPaths, id: \.self) { path in
+                                Button {
+                                    savePath = path
+                                } label: {
+                                    Text(pathLabel(path))
+                                        .font(.subheadline.weight(savePath == path ? .semibold : .regular))
+                                        .foregroundStyle(savePath == path ? HarvestTheme.blue : Color.primary)
+                                        .lineLimit(1)
+                                        .frame(maxWidth: 180)
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 8)
+                                        .background(
+                                            savePath == path ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        )
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .stroke(savePath == path ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     TextField("保存路径（可选）", text: $savePath)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+
+                Section("分类与标签") {
                     TextField("分类（可选）", text: $category)
                     TextField("标签，使用逗号分隔", text: $tags)
                 }
-                Section("下载链接") {
-                    Toggle(
-                        "自动生成下载链接",
-                        isOn: Binding(
-                            get: { effectiveGenerateTorrentURL },
-                            set: { if !mustGenerateTorrentURL { generateTorrentURL = $0 } }
+
+                Section("下载选项") {
+                    Toggle("暂停下载", isOn: $paused)
+                    Toggle("跳过文件校验", isOn: $skipChecking)
+                }
+
+                Section {
+                    DisclosureGroup(isExpanded: $showAdvanced) {
+                        Toggle(
+                            "自动生成下载链接",
+                            isOn: Binding(
+                                get: { effectiveGenerateTorrentURL },
+                                set: { if !mustGenerateTorrentURL { generateTorrentURL = $0 } }
+                            )
                         )
-                    )
-                    .disabled(mustGenerateTorrentURL)
-                    TextField("站点标识", text: $siteIdentifier).textInputAutocapitalization(.never)
-                    if !sites.isEmpty {
-                        Menu("从站点选择") {
-                            ForEach(sites) { site in
-                                Button(privacyMaskedText(site.name, enabled: appState.privacyMode)) {
-                                    siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
-                                    if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                        cookie = site.cookie
+                        .disabled(mustGenerateTorrentURL)
+                        TextField("站点标识", text: $siteIdentifier)
+                            .textInputAutocapitalization(.never)
+                        if !sites.isEmpty {
+                            Menu("从站点选择") {
+                                ForEach(sites) { site in
+                                    Button(privacyMaskedText(site.name, enabled: appState.privacyMode)) {
+                                        siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
+                                        if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                            cookie = site.cookie
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    TextField("Cookie（可选）", text: $cookie, axis: .vertical)
-                        .lineLimit(2...5)
-                        .textInputAutocapitalization(.never)
-                }
-                Section("选项") {
-                    Toggle("添加后暂停", isOn: $paused)
-                    Toggle("跳过文件校验", isOn: $skipChecking)
-                    Toggle("高级设置", isOn: $showAdvanced)
-                }
-                if showAdvanced {
-                    Section("高级推送") {
+                        TextField("Cookie（可选）", text: $cookie, axis: .vertical)
+                            .lineLimit(2...5)
+                            .textInputAutocapitalization(.never)
                         TextField("任务名称（可选）", text: $rename)
                         TextField("上传限制（KB/s）", text: $uploadLimit).keyboardType(.numberPad)
                         TextField("下载限制（KB/s）", text: $downloadLimit).keyboardType(.numberPad)
@@ -2656,26 +2723,132 @@ struct ResourcePushSheet: View {
                             Toggle("添加到队列顶部", isOn: $addToTop)
                             Toggle("强制启动", isOn: $forced)
                         }
+                    } label: {
+                        Label("高级选项", systemImage: "slider.horizontal.3")
+                            .font(.headline)
                     }
                 }
             }
-            .navigationTitle("推送资源").navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("推送") { Task { await push() } }.disabled(isLoading || isSaving || downloaderID == 0 || url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) }
+            .scrollContentBackground(.hidden)
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("添加种子")
+            .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 12) {
+                    Button("取消") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .frame(maxWidth: .infinity)
+                    Button {
+                        Task { await push() }
+                    } label: {
+                        if isSaving {
+                            ProgressView().tint(.white)
+                        } else {
+                            Text("下载")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .tint(HarvestTheme.blue)
+                    .frame(maxWidth: .infinity)
+                    .disabled(isLoading || isSaving || downloaderID == 0 || url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial)
             }
             .task { await load() }
         }
-    }
-
-    private var selectedDownloader: DownloaderItem? {
-        downloaders.first { $0.id == downloaderID }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
     }
 
     private var isQBittorrent: Bool {
-        guard let selectedDownloader else { return false }
-        let value = selectedDownloader.category.lowercased()
+        let value = downloader.category.lowercased()
         return !value.contains("tr") && !value.contains("transmission")
+    }
+
+    private var resourceSummaryCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "doc")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(HarvestTheme.blue)
+                    .frame(width: 34, height: 34)
+                    .background(HarvestTheme.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(resourceTitle)
+                        .font(.headline)
+                        .lineLimit(3)
+                    if !resourceSubtitle.isEmpty {
+                        Text(resourceSubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            CompactFlowLayout(spacing: 7) {
+                resourceChip(resourceSize, icon: "externaldrive", color: HarvestTheme.blue)
+                resourceChip("\(seeders)", icon: "arrow.up", color: HarvestTheme.green)
+                resourceChip("\(leechers)", icon: "arrow.down", color: HarvestTheme.coral)
+                resourceChip("\(completers)", icon: "checkmark", color: .secondary)
+                ForEach(Array(summaryLabels.enumerated()), id: \.offset) { _, label in
+                    Text(label)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(label == "HR" ? HarvestTheme.amber : HarvestTheme.blue)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            (label == "HR" ? HarvestTheme.amber : HarvestTheme.blue).opacity(0.09),
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.07), lineWidth: 0.8)
+        }
+    }
+
+    private func resourceChip(_ value: String, icon: String, color: Color) -> some View {
+        Label(value, systemImage: icon)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(color.opacity(0.09), in: Capsule())
+    }
+
+    private var resourceTitle: String { item.string("title", "name") ?? "未命名资源" }
+    private var resourceSubtitle: String { item.string("subtitle", "sub_title") ?? "" }
+    private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
+    private var leechers: Int { item.int("leechers", "leecher", "leech") ?? 0 }
+    private var completers: Int { item.int("completers", "completed", "snatched") ?? 0 }
+    private var resourceSize: String {
+        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
+            return item.string("size", "length") ?? "未知大小"
+        }
+        return formatBytes(bytes)
+    }
+    private var summaryLabels: [String] {
+        var values: [String] = []
+        if let value = item.string("category", "category_name"), !value.isEmpty, value != "无分类" { values.append(value) }
+        if let value = item.string("sale_status", "saleStatus", "promotion"), !value.isEmpty, value != "无优惠" { values.append(value) }
+        if !(item.bool("hr") ?? false) { values.append("HR") }
+        if let value = item.string("published", "pubdate", "created_at", "date"), !value.isEmpty { values.append(value) }
+        return values
+    }
+
+    private func pathLabel(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = trimmed.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? trimmed
+        return label.isEmpty ? trimmed : label
     }
 
     private var mustGenerateTorrentURL: Bool {
@@ -2697,34 +2870,29 @@ struct ResourcePushSheet: View {
         value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
     }
 
-    private func load() async {
+    @MainActor private func load() async {
         defer { isLoading = false }
         do {
-            let downloaderValue = try await appState.api(APIPath.downloaders)
-            downloaders = jsonRows(downloaderValue).map(DownloaderItem.init).filter { $0.enabled }
-            do {
-                suggestedPaths = jsonPathStrings(try await appState.api(APIPath.downloaderPaths))
-            } catch {
-                suggestedPaths = []
-            }
-            do {
-                sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
-                let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let site = sites.first(where: {
-                    String($0.id) == rawSite
-                        || $0.siteKey.caseInsensitiveCompare(rawSite) == .orderedSame
-                        || $0.name.caseInsensitiveCompare(rawSite) == .orderedSame
-                }) {
-                    siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
-                    if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        cookie = site.cookie
-                    }
+            suggestedPaths = jsonPathStrings(try await appState.api(APIPath.downloaderPaths))
+        } catch {
+            suggestedPaths = []
+        }
+        do {
+            sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+            let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let site = sites.first(where: {
+                String($0.id) == rawSite
+                    || $0.siteKey.caseInsensitiveCompare(rawSite) == .orderedSame
+                    || $0.name.caseInsensitiveCompare(rawSite) == .orderedSame
+            }) {
+                siteIdentifier = site.siteKey.isEmpty ? String(site.id) : site.siteKey
+                if cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    cookie = site.cookie
                 }
-            } catch {
-                sites = []
             }
-            downloaderID = downloaders.first?.id ?? 0
-        } catch { appState.presentedError = error.localizedDescription }
+        } catch {
+            sites = []
+        }
     }
 
     private func push() async {
