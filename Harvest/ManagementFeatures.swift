@@ -1093,7 +1093,12 @@ final class AppUpdateViewModel: ObservableObject {
         statusMessage = "正在校验下载地址"
         isDownloading = true
 
-        let expectedSHA256 = link.sha256 ?? await Self.fetchCompanionSHA256(for: link.url)
+        let expectedSHA256: String?
+        if let providedSHA256 = link.sha256 {
+            expectedSHA256 = providedSHA256
+        } else {
+            expectedSHA256 = await Self.fetchCompanionSHA256(for: link.url)
+        }
         if cancelRequested || Task.isCancelled {
             finishCancelledPreparation()
             return

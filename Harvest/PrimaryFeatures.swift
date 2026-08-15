@@ -1323,7 +1323,7 @@ struct DashboardView: View {
                 DashboardTrafficTrendView(
                     points: model.snapshot.trends,
                     days: trendDays,
-                    height: chartHeight
+                    height: CGFloat(chartHeight)
                 )
             }
         case .siteStatus:
@@ -1535,7 +1535,7 @@ struct DashboardView: View {
 private struct DashboardTrafficTrendView: View {
     let points: [TrendPoint]
     let days: Int
-    let height: Int
+    let height: CGFloat
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1558,7 +1558,7 @@ private struct DashboardTrafficTrendView: View {
                     }
                 }
             }
-            .frame(height: CGFloat(height))
+            .frame(height: height)
         }
         .cardSurface()
     }
