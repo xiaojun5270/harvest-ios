@@ -62,7 +62,7 @@ Xcode build and an integration pass against a reachable Harvest server. See
   extraction, and pausable bonus tools
 - Configurable dashboard modules, traffic/server charts, privacy mode, current
   page screenshot sharing, a dedicated dashboard long image, and cached
-  dashboard/site data with visible timestamps and background refresh
+  dashboard/site data with visible timestamps and in-app refresh
 - Downloader setup, persistent 1-60 second refresh settings, automatic-stop
   countdown, pause/resume, WebSocket recovery, cached startup snapshots,
   deduplicated live frames, precomputed torrent filtering, bulk and advanced
@@ -73,6 +73,11 @@ Xcode build and an integration pass against a reachable Harvest server. See
 - Notice lifecycle, unread and app badges, local notifications, Markdown detail,
   cached list restoration, gap-free APP/server log pause/resume, updates, backup/import, users,
   paginated authorization management, and maintenance
+
+Local notice polling and APP-package downloads currently run while the app is
+active. The target does not declare remote-push or background-transfer
+entitlements, so a terminated app cannot receive new notices or continue an IPA
+download in the background.
 
 ## Performance and cache behavior
 

@@ -29,8 +29,6 @@
         <key>NSAllowsArbitraryLoads</key>
         <true/>
     </dict>
-    <key>NSFaceIDUsageDescription</key>
-    <string>用于保护已保存的 Harvest 登录凭据。</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>用于连接局域网中的 Harvest 服务。</string>
     <key>NSPhotoLibraryAddUsageDescription</key>

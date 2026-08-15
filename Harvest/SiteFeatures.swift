@@ -71,12 +71,20 @@ struct SiteItem: Identifiable {
         let statusMap = json.dict("status") ?? [:]
         let latestStatus = statusMap.keys.sorted().last.flatMap { statusMap[$0] as? [String: Any] }
         let signInfo = json.dict("sign_info", "signInfo") ?? [:]
-        id = json.int("id", "site_id") ?? abs((json.string("name") ?? UUID().uuidString).hashValue)
+        let resolvedSiteKey = json.string("site", "website_name", "name") ?? ""
+        let resolvedName = json.string("nickname") ?? resolvedSiteKey
+        let resolvedURL = json.string("mirror", "url", "base_url") ?? ""
+        id = json.int("id", "site_id") ?? stableIdentifier(
+            resolvedSiteKey,
+            resolvedName,
+            resolvedURL,
+            json.string("user_id", "userId", "uid") ?? ""
+        )
         sortID = json.int("sort_id", "sortId") ?? 1
-        siteKey = json.string("site", "website_name", "name") ?? ""
-        name = json.string("nickname") ?? siteKey
+        siteKey = resolvedSiteKey
+        name = resolvedName
         if name.isEmpty { name = "未命名站点" }
-        url = json.string("mirror", "url", "base_url") ?? ""
+        url = resolvedURL
         userID = json.string("user_id", "userId", "uid") ?? ""
         username = json.string("username", "user_name") ?? ""
         email = json.string("email") ?? ""
@@ -95,7 +103,10 @@ struct SiteItem: Identifiable {
         iconURL = json.string("icon", "logo", "favicon", "icon_url", "iconUrl") ?? ""
         uploaded = latestStatus?.double("uploaded", "upload", "uploaded_size") ?? json.double("uploaded", "upload", "uploaded_size") ?? 0
         downloaded = latestStatus?.double("downloaded", "download", "downloaded_size") ?? json.double("downloaded", "download", "downloaded_size") ?? 0
-        ratio = latestStatus?.double("ratio", "share_ratio") ?? json.double("ratio", "share_ratio") ?? (downloaded > 0 ? uploaded / downloaded : 0)
+        let calculatedRatio = downloaded > 0 ? uploaded / downloaded : 0
+        ratio = latestStatus?.double("ratio", "share_ratio")
+            ?? json.double("ratio", "share_ratio")
+            ?? (calculatedRatio.isFinite ? calculatedRatio : 0)
         seeding = latestStatus?.int("seed", "seeding", "seeding_count") ?? json.int("seeding", "seed", "seeding_count") ?? 0
         leeching = latestStatus?.int("leech", "leeching", "downloading") ?? 0
         published = latestStatus?.int("publish", "published") ?? 0
@@ -617,7 +628,9 @@ final class SitesViewModel: ObservableObject {
                 indexed[key] = config
             }
             siteConfigs = indexed
-        } catch { }
+        } catch {
+            recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
+        }
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
@@ -1905,7 +1918,7 @@ struct SiteConfigGeneratorSheet: View {
                     }
                     .disabled(configName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || content.isEmpty || isSaving)
                     Button {
-                        UIPasteboard.general.string = synchronizedContent
+                        copyPrivateText(synchronizedContent)
                     } label: {
                         Label("复制 TOML", systemImage: "doc.on.doc")
                     }
@@ -2076,14 +2089,53 @@ private struct TOMLFieldGroup: Identifiable {
     var id: String { title }
 }
 
+private struct TOMLOptionalField: Identifiable {
+    let key: String
+    let defaultValue: String
+    var id: String { key }
+}
+
+private let tomlOptionalFields: [TOMLOptionalField] = [
+    TOMLOptionalField(key: "page_mybonus", defaultValue: "\"\""),
+    TOMLOptionalField(key: "sign_info_title", defaultValue: "\"\""),
+    TOMLOptionalField(key: "sign_info_content", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrents_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_title_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_subtitle_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_detail_url_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_category_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_poster_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_magnet_url_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_size_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_progress_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_hr_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_sale_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_sale_expire_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_release_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_seeders_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_leechers_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_completers_rule", defaultValue: "\"\""),
+    TOMLOptionalField(key: "torrent_tags_rule", defaultValue: "\"\"")
+]
+
 private struct SiteConfigStructuredEditor: View {
     @Binding var content: String
+    @State private var parsedDocument: TOMLStructuredDocument
+    @State private var customFieldKey = ""
 
-    private var document: TOMLStructuredDocument { TOMLStructuredDocument(content) }
-    private var groups: [TOMLFieldGroup] { tomlFieldGroups(document.fields.filter { $0.section == nil }) }
+    init(content: Binding<String>) {
+        _content = content
+        _parsedDocument = State(initialValue: TOMLStructuredDocument(content.wrappedValue))
+    }
+
+    private var groups: [TOMLFieldGroup] { tomlFieldGroups(parsedDocument.fields.filter { $0.section == nil }) }
+    private var missingOptionalFields: [TOMLOptionalField] {
+        let existing = Set(parsedDocument.fields.filter { $0.section == nil }.map(\.key))
+        return tomlOptionalFields.filter { !existing.contains($0.key) }
+    }
 
     var body: some View {
-        if groups.isEmpty && document.levels.isEmpty {
+        if groups.isEmpty && parsedDocument.levels.isEmpty {
             Section {
                 ContentUnavailableView("没有可编辑字段", systemImage: "doc.text.magnifyingglass")
             }
@@ -2097,7 +2149,7 @@ private struct SiteConfigStructuredEditor: View {
                 Button { content = appendingTOMLLevel(to: content) } label: {
                     Label("添加等级", systemImage: "plus")
                 }
-                ForEach(document.levels) { level in
+                ForEach(parsedDocument.levels) { level in
                     DisclosureGroup {
                         ForEach(level.fields) { field in fieldEditor(field) }
                         Button(role: .destructive) {
@@ -2110,6 +2162,38 @@ private struct SiteConfigStructuredEditor: View {
                     }
                 }
             }
+        }
+        Section("补充字段") {
+            if !missingOptionalFields.isEmpty {
+                Menu {
+                    ForEach(missingOptionalFields) { field in
+                        Button(tomlFieldLabel(field.key)) {
+                            content = appendingTOMLField(field.key, rawValue: field.defaultValue, to: content)
+                        }
+                    }
+                } label: {
+                    Label("添加常用字段", systemImage: "plus.circle")
+                }
+            }
+            HStack {
+                TextField("自定义字段名", text: $customFieldKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button {
+                    let key = customFieldKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !key.isEmpty,
+                          key.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) else { return }
+                    content = appendingTOMLField(key, rawValue: "\"\"", to: content)
+                    customFieldKey = ""
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .disabled(customFieldKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityLabel("添加自定义字段")
+            }
+        }
+        .onChange(of: content) { _, value in
+            parsedDocument = TOMLStructuredDocument(value)
         }
     }
 
@@ -2132,21 +2216,25 @@ private struct SiteConfigStructuredEditor: View {
 
     private func textBinding(for field: TOMLStructuredField) -> Binding<String> {
         Binding {
-            let current = TOMLStructuredDocument(content).fields.first { $0.id == field.id } ?? field
+            let current = parsedDocument.fields.first { $0.id == field.id } ?? field
             return tomlEditableValue(current.rawValue, kind: current.kind)
         } set: { value in
-            let current = TOMLStructuredDocument(content).fields.first { $0.id == field.id } ?? field
-            content = replacingTOMLField(current, with: value, in: content)
+            let current = parsedDocument.fields.first { $0.id == field.id } ?? field
+            let updated = replacingTOMLField(current, with: value, in: content)
+            content = updated
+            parsedDocument = TOMLStructuredDocument(updated)
         }
     }
 
     private func booleanBinding(for field: TOMLStructuredField) -> Binding<Bool> {
         Binding {
-            let current = TOMLStructuredDocument(content).fields.first { $0.id == field.id } ?? field
+            let current = parsedDocument.fields.first { $0.id == field.id } ?? field
             return current.rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
         } set: { value in
-            let current = TOMLStructuredDocument(content).fields.first { $0.id == field.id } ?? field
-            content = replacingTOMLField(current, with: value ? "true" : "false", in: content)
+            let current = parsedDocument.fields.first { $0.id == field.id } ?? field
+            let updated = replacingTOMLField(current, with: value ? "true" : "false", in: content)
+            content = updated
+            parsedDocument = TOMLStructuredDocument(updated)
         }
     }
 }
@@ -3849,8 +3937,8 @@ private struct SiteDailyHistoryRow: View {
             LabeledContent("下载总量", value: formatBytes(point.downloaded))
             LabeledContent("魔力值", value: formatCompactNumber(point.magic))
             LabeledContent("积分", value: formatCompactNumber(point.score))
-            LabeledContent("做种 / 下载", value: "\(Int(point.seeding)) / \(Int(point.leeching))")
-            LabeledContent("发布 / 邀请", value: "\(Int(point.published)) / \(Int(point.invitations))")
+            LabeledContent("做种 / 下载", value: "\(clampedInt(point.seeding)) / \(clampedInt(point.leeching))")
+            LabeledContent("发布 / 邀请", value: "\(clampedInt(point.published)) / \(clampedInt(point.invitations))")
             LabeledContent("分享率", value: String(format: "%.2f", point.ratio))
             LabeledContent("做种量", value: formatBytes(point.seedVolume))
             LabeledContent("做种天数", value: formatCompactNumber(point.seedDays))
@@ -3882,8 +3970,8 @@ private struct SiteMonthlyHistoryRow: View {
             LabeledContent("月末下载", value: formatBytes(point.downloaded))
             LabeledContent("月末魔力", value: formatCompactNumber(point.magic))
             LabeledContent("月末积分", value: formatCompactNumber(point.score))
-            LabeledContent("月末做种 / 下载", value: "\(Int(point.seeding)) / \(Int(point.leeching))")
-            LabeledContent("月末发布 / 邀请", value: "\(Int(point.published)) / \(Int(point.invitations))")
+            LabeledContent("月末做种 / 下载", value: "\(clampedInt(point.seeding)) / \(clampedInt(point.leeching))")
+            LabeledContent("月末发布 / 邀请", value: "\(clampedInt(point.published)) / \(clampedInt(point.invitations))")
             LabeledContent("月末分享率", value: String(format: "%.2f", point.ratio))
             LabeledContent("月末做种量", value: formatBytes(point.seedVolume))
             LabeledContent("月末做种天数", value: formatCompactNumber(point.seedDays))
@@ -3968,7 +4056,10 @@ private func parseSiteLevels(_ value: Any?) -> [SiteLevelRequirement] {
 }
 
 private func parseLevelSize(_ value: Any?) -> Double {
-    if let number = value as? NSNumber { return number.doubleValue }
+    if let number = value as? NSNumber {
+        let result = number.doubleValue
+        return result.isFinite ? max(0, result) : 0
+    }
     guard var text = value as? String else { return 0 }
     text = text.uppercased().replacingOccurrences(of: " ", with: "")
     let units: [(String, Double)] = [
@@ -3980,28 +4071,72 @@ private func parseLevelSize(_ value: Any?) -> Double {
     ]
     for (suffix, multiplier) in units where text.hasSuffix(suffix) {
         text.removeLast(suffix.count)
-        return (Double(text) ?? 0) * multiplier
+        let result = (Double(text) ?? 0) * multiplier
+        return result.isFinite ? max(0, result) : 0
     }
-    return Double(text) ?? 0
+    let result = Double(text) ?? 0
+    return result.isFinite ? max(0, result) : 0
+}
+
+private func appendingTOMLField(_ key: String, rawValue: String, to content: String) -> String {
+    if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return "\(key) = \(rawValue)\n"
+    }
+    let document = TOMLStructuredDocument(content)
+    guard !document.fields.contains(where: { $0.section == nil && $0.key == key }) else { return content }
+    var lines = content.components(separatedBy: "\n")
+    let insertionIndex = lines.firstIndex(where: { tomlSectionName($0) != nil }) ?? lines.endIndex
+    var newLines = ["\(key) = \(rawValue)"]
+    if insertionIndex > 0, !lines[insertionIndex - 1].isEmpty { newLines.append("") }
+    lines.insert(contentsOf: newLines, at: insertionIndex)
+    return lines.joined(separator: "\n")
 }
 
 private struct SiteLevelProgressView: View {
     let site: SiteItem
     let levels: [SiteLevelRequirement]
 
-    private var currentIndex: Int? {
+    private var reportedLevelID: Int? {
+        if let direct = site.raw.int("level_id", "levelId", "current_level_id", "currentLevelId"), direct > 0 {
+            return direct
+        }
+        let statusMap = site.raw.dict("status") ?? [:]
+        let latestStatus = statusMap.keys.sorted().last.flatMap { statusMap[$0] as? [String: Any] }
+        if let latest = latestStatus?.int("level_id", "levelId", "current_level_id", "currentLevelId"), latest > 0 {
+            return latest
+        }
+        return nil
+    }
+    private var currentLevel: SiteLevelRequirement? {
+        if let reportedLevelID,
+           let matched = levels.first(where: { $0.levelID == reportedLevelID }) {
+            return matched
+        }
         let current = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !current.isEmpty else { return nil }
-        return levels.firstIndex { $0.key == current || $0.level == current || $0.name == current }
+        return levels.first { $0.key == current || $0.level == current || $0.name == current }
+    }
+    private var currentIndex: Int? {
+        guard let currentLevel else { return nil }
+        return levels.firstIndex { $0.id == currentLevel.id }
     }
     private var nextLevel: SiteLevelRequirement? {
+        if let levelID = reportedLevelID ?? currentLevel?.levelID, levelID > 0 {
+            return levels
+                .filter { $0.levelID > levelID }
+                .min { $0.levelID < $1.levelID }
+        }
         guard let index = currentIndex, index > 0 else { return nil }
         return levels[index - 1]
     }
     private var reachedLevels: [SiteLevelRequirement] {
+        if let levelID = reportedLevelID ?? currentLevel?.levelID, levelID > 0 {
+            return levels.filter { $0.levelID > 0 && $0.levelID <= levelID }
+        }
         guard let index = currentIndex else { return [] }
         return Array(levels[index...])
     }
+    private var hasResolvedCurrentLevel: Bool { reportedLevelID != nil || currentLevel != nil }
 
     var body: some View {
         List {
@@ -4020,7 +4155,7 @@ private struct SiteLevelProgressView: View {
                         LabeledContent("新增权利", value: nextLevel.rights)
                     }
                 }
-            } else if currentIndex != nil {
+            } else if hasResolvedCurrentLevel {
                 Section { Label("已达到最高配置等级", systemImage: "checkmark.seal.fill").foregroundStyle(HarvestTheme.green) }
             }
             if levels.isEmpty {
@@ -4038,7 +4173,7 @@ private struct SiteLevelProgressView: View {
                             HStack {
                                 Text(level.displayName).font(.subheadline.weight(.semibold))
                                 Spacer()
-                                if currentIndex.map({ levels[$0].id == level.id }) == true {
+                                if currentLevel?.id == level.id {
                                     StatusPill(label: "当前", color: HarvestTheme.green)
                                 }
                             }
@@ -4066,7 +4201,7 @@ private struct SiteLevelProgressView: View {
         if level.days > 0 {
             let joined = parseDate(site.joinedAt)
             let days = joined.map { Double(max(0, Calendar.current.dateComponents([.day], from: $0, to: Date()).day ?? 0)) } ?? 0
-            progressRow("注册天数", current: days, required: Double(level.days)) { String(format: "%.0f 天", $0) }
+            progressRow("注册周数", current: days / 7, required: Double(level.days), formatter: formatLevelWeeks)
         }
         if level.ratio > 0 { progressRow("分享率", current: site.ratio, required: level.ratio) { String(format: "%.2f", $0) } }
         if level.leeches > 0 { LabeledContent("下载任务要求", value: "\(level.leeches)") }
@@ -4074,22 +4209,32 @@ private struct SiteLevelProgressView: View {
     }
 
     private func progressRow(_ label: String, current: Double, required: Double, formatter: (Double) -> String) -> some View {
-        let progress = required > 0 ? min(max(current / required, 0), 1) : 1
+        let safeCurrent = current.isFinite ? current : 0
+        let safeRequired = required.isFinite ? max(0, required) : 0
+        let progress = safeRequired > 0 ? normalizedProgress(safeCurrent / safeRequired) : 1
+        let completed = safeRequired <= 0 || safeCurrent >= safeRequired
         return VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(label).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text("\(formatter(current)) / \(formatter(required))").font(.caption.monospacedDigit())
-                Image(systemName: current >= required ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(current >= required ? HarvestTheme.green : HarvestTheme.amber)
+                Text("\(formatter(safeCurrent)) / \(formatter(safeRequired))").font(.caption.monospacedDigit())
+                Image(systemName: completed ? "checkmark.circle.fill" : "circle.dashed")
+                    .foregroundStyle(completed ? HarvestTheme.green : HarvestTheme.amber)
             }
-            ProgressView(value: progress).tint(current >= required ? HarvestTheme.green : HarvestTheme.amber)
+            ProgressView(value: progress).tint(completed ? HarvestTheme.green : HarvestTheme.amber)
         }
+    }
+
+    private func formatLevelWeeks(_ value: Double) -> String {
+        let rounded = value.rounded()
+        return abs(value - rounded) < 0.05
+            ? "\(clampedInt(rounded)) 周"
+            : String(format: "%.1f 周", value)
     }
 
     private func levelSummary(_ level: SiteLevelRequirement) -> String {
         var values: [String] = []
-        if level.days > 0 { values.append("\(level.days) 天") }
+        if level.days > 0 { values.append("\(level.days) 周") }
         if level.uploaded > 0 { values.append("上传 \(formatBytes(level.uploaded))") }
         if level.downloaded > 0 { values.append("下载 \(formatBytes(level.downloaded))") }
         if level.ratio > 0 { values.append("分享率 \(String(format: "%.2f", level.ratio))") }
@@ -4117,6 +4262,7 @@ private struct SiteSignInDetailView: View {
     @State private var isLoading = false
     @State private var isOperating = false
     @State private var savingFlag: SiteFeatureFlag?
+    @State private var showsAllSignHistory = false
 
     private var current: SiteItem { latestSite ?? site }
     private var logoCandidates: [RemoteImageCandidate] {
@@ -4307,7 +4453,10 @@ private struct SiteSignInDetailView: View {
 
                 if !current.signHistory.isEmpty {
                     Divider()
-                    ForEach(Array(current.signHistory.prefix(12).enumerated()), id: \.offset) { index, row in
+                    let visibleHistory = showsAllSignHistory
+                        ? current.signHistory
+                        : Array(current.signHistory.prefix(12))
+                    ForEach(Array(visibleHistory.enumerated()), id: \.offset) { index, row in
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
                                 Text(row.string("date") ?? "未知日期")
@@ -4324,7 +4473,21 @@ private struct SiteSignInDetailView: View {
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
                         }
-                        if index < min(current.signHistory.count, 12) - 1 { Divider() }
+                        if index < visibleHistory.count - 1 { Divider() }
+                    }
+                    if current.signHistory.count > 12 {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showsAllSignHistory.toggle()
+                            }
+                        } label: {
+                            Label(
+                                showsAllSignHistory ? "收起历史" : "查看全部 \(current.signHistory.count) 条",
+                                systemImage: showsAllSignHistory ? "chevron.up" : "chevron.down"
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderless)
                     }
                 }
             }
@@ -5255,7 +5418,7 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
           if (/^\\d+$/.test(rowID)) option = rowID;
         }
         if (!option || seen.has(option) || !isExchangeForm) continue;
-        if (!text || /赠送|捐赠|消除|头衔|免费|置顶|H&R/i.test(text)) continue;
+        if (!text) continue;
         const titleNode = container.querySelector('h1, h2, h3, [class*="title"], [class*="name"], td');
         let name = clean(titleNode?.innerText || titleNode?.textContent || text.split(/\\s{2,}|\\n/)[0]);
         if (name.length > 80) name = name.slice(0, 80);
@@ -5320,27 +5483,73 @@ private func browserBonusSubmitScript(_ item: BrowserBonusItem) -> String {
     var inputs = item.hiddenInputs
     inputs["option"] = item.option
     return """
-    const action = \(browserJavaScriptLiteral([item.action]))[0] || window.location.href;
-    const method = String(\(browserJavaScriptLiteral([item.method]))[0] || 'POST').toUpperCase();
-    const inputs = \(browserJavaScriptLiteral(inputs));
-    const body = new URLSearchParams();
-    Object.entries(inputs).forEach(([key, value]) => body.append(key, String(value)));
-    const target = new URL(action, window.location.href);
-    const options = { method, credentials: 'include', redirect: 'follow', headers: {} };
-    if (method === 'GET') {
-      body.forEach((value, key) => target.searchParams.append(key, value));
-    } else {
-      options.headers['Content-Type'] = 'application/x-www-form-urlencoded;charset=UTF-8';
-      options.body = body;
-    }
-    const response = await fetch(target, options);
-    const responseText = await response.text();
-    return JSON.stringify({
-      ok: response.ok,
-      status: response.status,
-      url: response.url,
-      response: responseText.replace(/\\s+/g, ' ').slice(0, 500)
-    });
+    (() => {
+      try {
+        const action = \(browserJavaScriptLiteral([item.action]))[0] || window.location.href;
+        const method = String(\(browserJavaScriptLiteral([item.method]))[0] || 'POST').toUpperCase();
+        const inputs = \(browserJavaScriptLiteral(inputs));
+        const optionValue = String(inputs.option || '');
+        const matchingInputs = (form) => Object.entries(inputs).every(([key, value]) => {
+          const input = form.querySelector(`[name="${CSS.escape(key)}"]`);
+          return input && String(input.value ?? '') === String(value ?? '');
+        });
+        const submitFrom = (context, mechanism) => {
+          const form = context.matches?.('form') ? context : context.querySelector('form');
+          const button = context.querySelector('button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])')
+            || form?.querySelector('button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])');
+          if (button) {
+            button.click();
+            return mechanism + '_button';
+          }
+          if (form && typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+            return mechanism + '_request_submit';
+          }
+          return '';
+        };
+
+        const forms = Array.from(document.querySelectorAll('form'));
+        for (const form of forms) {
+          if (!matchingInputs(form)) continue;
+          const mechanism = submitFrom(form, 'form_exact');
+          if (mechanism) return JSON.stringify({ ok: true, mechanism });
+        }
+        for (const form of forms) {
+          const option = form.querySelector('input[name="option"]');
+          if (!option || String(option.value) !== optionValue) continue;
+          const mechanism = submitFrom(form, 'form_option');
+          if (mechanism) return JSON.stringify({ ok: true, mechanism });
+        }
+        for (const container of Array.from(document.querySelectorAll('tr, [class*="mybonus-exchange-card"], [class*="bonus-card"], [class*="exchange"]'))) {
+          const option = container.querySelector('input[name="option"]');
+          const firstCell = container.querySelector('td')?.innerText?.trim().split(/\\s+/)[0] || '';
+          if (String(option?.value || firstCell) !== optionValue) continue;
+          const mechanism = submitFrom(container, 'container_option');
+          if (mechanism) return JSON.stringify({ ok: true, mechanism });
+        }
+
+        const target = new URL(action, window.location.href);
+        if (!['http:', 'https:'].includes(target.protocol) || target.origin !== window.location.origin) {
+          return JSON.stringify({ ok: false, error: '兑换地址不在当前站点' });
+        }
+        const fallback = document.createElement('form');
+        fallback.method = method === 'GET' ? 'GET' : 'POST';
+        fallback.action = target.href;
+        for (const [key, value] of Object.entries(inputs)) {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = key;
+          input.value = String(value ?? '');
+          fallback.appendChild(input);
+        }
+        document.body.appendChild(fallback);
+        if (typeof fallback.requestSubmit === 'function') fallback.requestSubmit();
+        else fallback.submit();
+        return JSON.stringify({ ok: true, mechanism: 'fallback_form' });
+      } catch (error) {
+        return JSON.stringify({ ok: false, error: String(error?.message || error) });
+      }
+    })();
     """
 }
 
@@ -5631,7 +5840,7 @@ struct SiteBrowserScreen: View {
     }
 
     @MainActor private func copyCurrentLink() {
-        UIPasteboard.general.string = (session.currentURL ?? URL(string: urlString))?.absoluteString ?? urlString
+        copyPrivateText((session.currentURL ?? URL(string: urlString))?.absoluteString ?? urlString)
     }
 
     private var browserLocalStorageURLs: [String] {
@@ -5754,6 +5963,10 @@ struct SiteBrowserScreen: View {
 
     @MainActor private func captureLongScreenshot() async {
         guard !isCapturingScreenshot else { return }
+        guard !appState.privacyMode else {
+            appState.presentedError = "隐私模式下不生成原始网页截图，请关闭隐私模式后重试"
+            return
+        }
         isCapturingScreenshot = true
         defer { isCapturingScreenshot = false }
         do {
@@ -5767,10 +5980,10 @@ struct SiteBrowserScreen: View {
     @MainActor private func copyAuthorizationInfo() async {
         do {
             let storage = try await session.captureStorage()
-            UIPasteboard.general.string = prettyJSON([
+            copyPrivateText(prettyJSON([
                 "cookie": storage.cookie,
                 "localstorage": storage.localStorage
-            ])
+            ]))
         } catch {
             appState.presentedError = error.localizedDescription
         }
@@ -5778,7 +5991,7 @@ struct SiteBrowserScreen: View {
 
     @MainActor private func copyAuthorizationDiagnostics() async {
         let storage = try? await session.captureStorage(allowEmpty: true)
-        UIPasteboard.general.string = prettyJSON([
+        copyPrivateText(prettyJSON([
             "current_url": session.currentURL?.absoluteString ?? urlString,
             "initial_url": urlString,
             "site_id": effectiveSiteID,
@@ -5796,7 +6009,7 @@ struct SiteBrowserScreen: View {
             "has_torrent_detail_rules": hasTorrentDetailRules,
             "has_profile_rules": hasProfileRules,
             "has_bonus_rules": hasBonusRules
-        ])
+        ]))
     }
 
     @MainActor private func syncCredentials() async {
@@ -6037,7 +6250,9 @@ struct SiteBrowserScreen: View {
             let storage = try await session.captureStorage()
             body["cookie"] = storage.cookie
             body["local_storage"] = storage.localStorage
-        } catch { }
+        } catch {
+            recordAppLog(.warning, "保存站点资料前读取浏览器凭据失败：\(error.localizedDescription)")
+        }
         let isNew = effectiveSiteID == 0
         let path = isNew ? APIPath.sites : "\(APIPath.sites)/\(effectiveSiteID)"
         let saved = await appState.perform(path, method: isNew ? .post : .put, body: body)
@@ -6099,11 +6314,15 @@ struct SiteBrowserScreen: View {
         do {
             for index in 0..<quantity {
                 try await bonusExchangeState.waitUntilResumed()
-                let raw = try await session.callAsyncJavaScript(browserBonusSubmitScript(item))
-                guard let parsed = parsedBrowserJavaScriptValue(raw),
-                      let result = jsonDictionary(parsed),
-                      result.bool("ok") == true else {
-                    throw APIError(statusCode: 0, message: "第 \(index + 1) 次兑换失败")
+                let raw = try await session.evaluateJavaScript(browserBonusSubmitScript(item))
+                let result = parsedBrowserJavaScriptValue(raw).flatMap(jsonDictionary)
+                guard result?.bool("ok") == true else {
+                    let detail = result?.string("error")
+                    throw APIError(
+                        statusCode: 0,
+                        message: detail.map { "第 \(index + 1) 次兑换失败：\($0)" }
+                            ?? "第 \(index + 1) 次兑换失败"
+                    )
                 }
                 bonusExchangeState.recordCompletion(cost: item.cost)
                 if bonusExchangeState.remaining < item.cost { break }
@@ -6583,7 +6802,7 @@ private struct BrowserBonusSheet: View {
 
     private var maximumQuantity: Int {
         guard let item = selectedItem, item.cost > 0, page.balance > 0 else { return 0 }
-        return max(0, Int(page.balance / item.cost))
+        return max(0, clampedInt(page.balance / item.cost))
     }
 
     var body: some View {
@@ -6703,6 +6922,7 @@ private func configStrings(_ value: Any?) -> [String] {
 }
 
 func formatCompactNumber(_ value: Double) -> String {
+    guard value.isFinite else { return "--" }
     if value >= 1_000_000 { return String(format: "%.2fM", value / 1_000_000) }
     if value >= 1_000 { return String(format: "%.2fK", value / 1_000) }
     return String(format: value.rounded() == value ? "%.0f" : "%.2f", value)

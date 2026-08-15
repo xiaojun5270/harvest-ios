@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import SwiftUI
 import UIKit
@@ -5,7 +6,6 @@ import UniformTypeIdentifiers
 import WebKit
 
 struct NoticeItem: Identifiable, Hashable {
-    let id = UUID()
     let serverID: Int
     var title: String
     var content: String
@@ -13,6 +13,11 @@ struct NoticeItem: Identifiable, Hashable {
     var createdAt: String
     var url: String
     var read: Bool
+    var id: String {
+        serverID > 0
+            ? "server-\(serverID)"
+            : "fallback-\(stableIdentifier(title, category, createdAt, url, content))"
+    }
 
     init(_ json: [String: Any]) {
         serverID = json.int("id") ?? 0
@@ -257,9 +262,27 @@ struct NoticeRow: View {
     let item: NoticeItem
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Circle().fill(item.read ? Color.secondary.opacity(0.10) : HarvestTheme.coral.opacity(0.14)).frame(width: 38, height: 38).overlay(Image(systemName: item.read ? "bell" : "bell.fill").foregroundStyle(item.read ? .secondary : HarvestTheme.coral))
-            VStack(alignment: .leading, spacing: 5) { HStack { Text(item.title).font(.subheadline.weight(item.read ? .regular : .semibold)); Spacer(); Text(item.category).font(.caption2).foregroundStyle(.secondary) }; Text(markdownAttributedString(item.content, inlineOnly: true)).font(.caption).foregroundStyle(.secondary).lineLimit(3); Text(item.createdAt).font(.caption2).foregroundStyle(.tertiary) }
-        }.padding(.vertical, 5)
+            Circle()
+                .fill(item.read ? Color.secondary.opacity(0.10) : HarvestTheme.coral.opacity(0.14))
+                .frame(width: 38, height: 38)
+                .overlay {
+                    Image(systemName: item.read ? "bell" : "bell.fill")
+                        .foregroundStyle(item.read ? .secondary : HarvestTheme.coral)
+                }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(item.title).font(.subheadline.weight(item.read ? .regular : .semibold))
+                    Spacer()
+                    Text(item.category).font(.caption2).foregroundStyle(.secondary)
+                }
+                Text(markdownAttributedString(item.content, inlineOnly: true))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                Text(item.createdAt).font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.vertical, 5)
     }
 }
 
@@ -508,7 +531,7 @@ struct NotificationToolsView: View {
             }
             Spacer()
             Button {
-                UIPasteboard.general.string = value
+                copyPrivateText(value)
             } label: {
                 Image(systemName: "doc.on.doc")
             }
@@ -630,6 +653,7 @@ struct NotificationToolsView: View {
     }
 
     @MainActor private func pollQRCodeStatus() async {
+        var lastErrorMessage = ""
         for _ in 0..<40 where !Task.isCancelled {
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
@@ -637,7 +661,14 @@ struct NotificationToolsView: View {
                 let status = jsonPayloadDictionary(try await appState.api(APIPath.wechatQRCodeStatus)) ?? [:]
                 qrStatus = status.string("status") ?? qrStatus
                 if ["confirmed", "expired"].contains(qrStatus) { return }
-            } catch { }
+                lastErrorMessage = ""
+            } catch {
+                let message = error.localizedDescription
+                if message != lastErrorMessage {
+                    recordAppLog(.warning, "微信二维码状态轮询失败：\(message)")
+                    lastErrorMessage = message
+                }
+            }
         }
         if !Task.isCancelled { qrStatus = "expired" }
     }
@@ -816,6 +847,7 @@ struct DataMaintenanceView: View {
 struct IOSDownloadLink: Identifiable, Hashable {
     let label: String
     let url: URL
+    let sha256: String?
     var id: String { url.absoluteString }
 }
 
@@ -864,16 +896,19 @@ struct DownloadedAppPackage: Identifiable {
 
 private final class AppUpdateDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     private let destination: URL
+    private let expectedSHA256: String?
     private let progress: (Int64, Int64) -> Void
     private let completion: (Result<URL, Error>) -> Void
     private var result: Result<URL, Error>?
 
     init(
         destination: URL,
+        expectedSHA256: String?,
         progress: @escaping (Int64, Int64) -> Void,
         completion: @escaping (Result<URL, Error>) -> Void
     ) {
         self.destination = destination
+        self.expectedSHA256 = expectedSHA256
         self.progress = progress
         self.completion = completion
     }
@@ -903,6 +938,19 @@ private final class AppUpdateDownloadDelegate: NSObject, URLSessionDownloadDeleg
                 try FileManager.default.removeItem(at: destination)
             }
             try FileManager.default.moveItem(at: location, to: destination)
+            guard try isZIPArchive(destination) else {
+                try? FileManager.default.removeItem(at: destination)
+                result = .failure(APIError(statusCode: 0, message: "安装包格式无效"))
+                return
+            }
+            if let expectedSHA256 {
+                let actualSHA256 = try fileSHA256(destination)
+                guard actualSHA256 == expectedSHA256 else {
+                    try? FileManager.default.removeItem(at: destination)
+                    result = .failure(APIError(statusCode: 0, message: "安装包 SHA-256 校验失败"))
+                    return
+                }
+            }
             result = .success(destination)
         } catch {
             result = .failure(error)
@@ -956,6 +1004,11 @@ final class AppUpdateViewModel: ObservableObject {
         } else {
             proxyResults = []
         }
+    }
+
+    deinit {
+        downloadTask?.cancel()
+        downloadSession?.invalidateAndCancel()
     }
 
     var currentVersion: String { appUpdateCurrentVersion() }
@@ -1025,13 +1078,30 @@ final class AppUpdateViewModel: ObservableObject {
     }
 
     func copyDownloadURL(_ link: IOSDownloadLink) {
-        UIPasteboard.general.string = effectiveURL(for: link.url).absoluteString
+        copyPrivateText(effectiveURL(for: link, verifiedSHA256: link.sha256).absoluteString)
         statusMessage = "下载链接已复制"
     }
 
-    func download(_ link: IOSDownloadLink, release: [String: Any]) {
+    func download(_ link: IOSDownloadLink, release: [String: Any]) async {
         guard !isDownloading else { return }
-        let sourceURL = effectiveURL(for: link.url)
+        downloadProgress = 0
+        downloadedBytes = 0
+        expectedDownloadBytes = 0
+        completedPackage = nil
+        cancelRequested = false
+        errorMessage = ""
+        statusMessage = "正在校验下载地址"
+        isDownloading = true
+
+        let expectedSHA256 = link.sha256 ?? await Self.fetchCompanionSHA256(for: link.url)
+        if cancelRequested || Task.isCancelled {
+            finishCancelledPreparation()
+            return
+        }
+        if expectedSHA256 == nil {
+            recordAppLog(.warning, "APP 安装包未提供 SHA-256，将使用 HTTPS 直连并校验 ZIP 格式")
+        }
+        let sourceURL = effectiveURL(for: link, verifiedSHA256: expectedSHA256)
         let version = release.string("version", "tag", "version_name", "name") ?? latestVersion
         let fileName = appUpdateFileName(link: link, version: version)
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("harvest_app_upgrade", isDirectory: true)
@@ -1039,21 +1109,16 @@ final class AppUpdateViewModel: ObservableObject {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         } catch {
             errorMessage = "无法创建安装包临时目录：\(error.localizedDescription)"
+            isDownloading = false
             return
         }
         let destination = directory.appendingPathComponent(fileName, isDirectory: false)
 
-        downloadProgress = 0
-        downloadedBytes = 0
-        expectedDownloadBytes = 0
-        completedPackage = nil
-        cancelRequested = false
-        errorMessage = ""
         statusMessage = "正在下载 \(fileName)"
-        isDownloading = true
 
         let delegate = AppUpdateDownloadDelegate(
             destination: destination,
+            expectedSHA256: expectedSHA256,
             progress: { [weak self] received, expected in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -1082,13 +1147,30 @@ final class AppUpdateViewModel: ObservableObject {
     func cancelDownload() {
         guard isDownloading else { return }
         cancelRequested = true
-        downloadTask?.cancel()
+        if let downloadTask { downloadTask.cancel() }
+        else { statusMessage = "正在取消下载准备" }
     }
 
-    private func effectiveURL(for original: URL) -> URL {
-        guard useGithubProxy, !selectedProxy.isEmpty, isGithubDownloadURL(original) else { return original }
+    private func effectiveURL(for link: IOSDownloadLink, verifiedSHA256: String?) -> URL {
+        let original = link.url
+        guard useGithubProxy,
+              verifiedSHA256 != nil,
+              !selectedProxy.isEmpty,
+              isGithubDownloadURL(original),
+              let proxyURL = URL(string: selectedProxy),
+              proxyURL.scheme?.lowercased() == "https",
+              proxyURL.host != nil else { return original }
         let normalized = selectedProxy.hasSuffix("/") ? selectedProxy : selectedProxy + "/"
         return URL(string: normalized + original.absoluteString) ?? original
+    }
+
+    private func finishCancelledPreparation() {
+        isDownloading = false
+        cancelRequested = false
+        statusMessage = "已取消下载"
+        downloadProgress = 0
+        downloadedBytes = 0
+        expectedDownloadBytes = 0
     }
 
     private func finishDownload(_ result: Result<URL, Error>) {
@@ -1138,6 +1220,24 @@ final class AppUpdateViewModel: ObservableObject {
         }
         let milliseconds = max(1, Int(Date().timeIntervalSince(start) * 1_000))
         return GithubProxyResult(url: normalized, milliseconds: milliseconds, statusCode: statusCode)
+    }
+
+    nonisolated private static func fetchCompanionSHA256(for sourceURL: URL) async -> String? {
+        guard sourceURL.scheme?.lowercased() == "https", isGithubDownloadURL(sourceURL),
+              var components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false) else { return nil }
+        components.path += ".sha256"
+        guard let checksumURL = components.url else { return nil }
+        do {
+            var request = URLRequest(url: checksumURL, timeoutInterval: 10)
+            request.setValue("text/plain", forHTTPHeaderField: "Accept")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            return normalizedSHA256(text)
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -1207,17 +1307,22 @@ func iosDownloadLinks(_ version: [String: Any]) -> [IOSDownloadLink] {
     func append(label: String, value: Any?, requireIOSMarker: Bool = true) {
         let resolvedLabel: String
         let resolvedValue: Any?
+        let resolvedSHA256: String?
         if let dictionary = value as? [String: Any] {
             resolvedLabel = dictionary.string("name", "file", "filename", "label", "platform") ?? label
             resolvedValue = dictionary["url"] ?? dictionary["download_url"] ?? dictionary["downloadUrl"] ?? dictionary["link"]
+            resolvedSHA256 = normalizedSHA256(
+                dictionary.string("sha256", "sha_256", "checksum", "digest", "file_hash", "fileHash")
+            )
         } else {
             resolvedLabel = label
             resolvedValue = value
+            resolvedSHA256 = nil
         }
         let raw = (resolvedValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let directURL = URL(string: raw)
         let url: URL?
-        if let directURL, ["http", "https"].contains(directURL.scheme?.lowercased() ?? "") {
+        if let directURL, directURL.scheme?.lowercased() == "https" {
             url = directURL
         } else if !releaseVersion.isEmpty {
             let rawFileName = URL(string: raw)?.lastPathComponent ?? ""
@@ -1236,7 +1341,13 @@ func iosDownloadLinks(_ version: [String: Any]) -> [IOSDownloadLink] {
             || marker.contains("ipad") || marker.contains("ipa") || marker.contains("testflight")
         guard !requireIOSMarker || isIOS else { return }
         guard seen.insert(url.absoluteString).inserted else { return }
-        links.append(IOSDownloadLink(label: resolvedLabel.isEmpty ? "iOS 下载" : resolvedLabel, url: url))
+        links.append(
+            IOSDownloadLink(
+                label: resolvedLabel.isEmpty ? "iOS 下载" : resolvedLabel,
+                url: url,
+                sha256: resolvedSHA256
+            )
+        )
     }
 
     for key in ["downloadLinks", "download_links", "downloads", "assets"] {
@@ -1256,6 +1367,31 @@ func iosDownloadLinks(_ version: [String: Any]) -> [IOSDownloadLink] {
         }
     }
     return links.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
+}
+
+private func normalizedSHA256(_ value: String?) -> String? {
+    (value ?? "")
+        .lowercased()
+        .split(whereSeparator: { !$0.isHexDigit })
+        .map(String.init)
+        .first { $0.count == 64 }
+}
+
+private func isZIPArchive(_ url: URL) throws -> Bool {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    guard let header = try handle.read(upToCount: 4), header.count == 4 else { return false }
+    return Array(header) == [0x50, 0x4B, 0x03, 0x04]
+}
+
+private func fileSHA256(_ url: URL) throws -> String {
+    let handle = try FileHandle(forReadingFrom: url)
+    defer { try? handle.close() }
+    var hasher = SHA256()
+    while let data = try handle.read(upToCount: 1_048_576), !data.isEmpty {
+        hasher.update(data: data)
+    }
+    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
 private func hasIOSAppPackage(_ version: [String: Any]) -> Bool {
@@ -1297,7 +1433,7 @@ private struct AppUpdateLinkRow: View {
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
-            Button { model.download(link, release: release) } label: { Image(systemName: "arrow.down.circle") }
+            Button { Task { await model.download(link, release: release) } } label: { Image(systemName: "arrow.down.circle") }
                 .disabled(model.isDownloading)
                 .accessibilityLabel("下载并分享 \(link.label)")
             Menu {
@@ -2333,7 +2469,10 @@ private let backendOptionDefinitions: [BackendOptionDefinition] = [
     ])
 ]
 
-private let backendOptionDefinitionsByName = Dictionary(uniqueKeysWithValues: backendOptionDefinitions.map { ($0.name, $0) })
+private let backendOptionDefinitionsByName = Dictionary(
+    backendOptionDefinitions.map { ($0.name, $0) },
+    uniquingKeysWith: { _, latest in latest }
+)
 
 struct BackendOption: Identifiable {
     let serverID: Int?
@@ -2419,12 +2558,29 @@ struct BackendOptionsView: View {
                                 Text(option.serverID == nil ? "尚未创建" : "\(option.value.count) 个参数").font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            StatusPill(label: option.serverID == nil ? "新增" : option.active ? "启用" : "停用", color: option.serverID == nil ? HarvestTheme.amber : option.active ? HarvestTheme.green : .secondary)
+                            StatusPill(
+                                label: option.serverID == nil ? "新增" : option.active ? "启用" : "停用",
+                                color: option.serverID == nil
+                                    ? HarvestTheme.amber
+                                    : option.active ? HarvestTheme.green : .secondary
+                            )
                         }
                     }.buttonStyle(.plain)
                     .swipeActions(edge: .leading) {
                         if option.serverID != nil && !option.isReadOnly {
-                            Button { Task { var updated = option; updated.active.toggle(); _ = await model.save(appState, option: updated) } } label: { Label(option.active ? "停用" : "启用", systemImage: option.active ? "pause" : "play") }.tint(HarvestTheme.amber)
+                            Button {
+                                Task {
+                                    var updated = option
+                                    updated.active.toggle()
+                                    _ = await model.save(appState, option: updated)
+                                }
+                            } label: {
+                                Label(
+                                    option.active ? "停用" : "启用",
+                                    systemImage: option.active ? "pause" : "play"
+                                )
+                            }
+                            .tint(HarvestTheme.amber)
                         }
                     }
                 }.listStyle(.plain).refreshable { await model.load(appState) }
@@ -2471,7 +2627,7 @@ struct OptionEditorSheet: View {
                 if option.name == "monkey_token" {
                     Section("Token 工具") {
                         Button { makeRandomToken() } label: { Label("生成随机 Token", systemImage: "dice") }
-                        Button { UIPasteboard.general.string = editedValue["token"] as? String ?? "" } label: { Label("复制 Token", systemImage: "doc.on.doc") }
+                        Button { copyPrivateText(editedValue["token"] as? String ?? "") } label: { Label("复制 Token", systemImage: "doc.on.doc") }
                             .disabled((editedValue["token"] as? String ?? "").isEmpty)
                     }
                 }
@@ -2852,9 +3008,37 @@ final class UsersViewModel: ObservableObject {
     @Published var isLoading = true
     let endpoint: String
     init(endpoint: String) { self.endpoint = endpoint }
-    func load(_ appState: AppState) async { defer { isLoading = false }; do { users = jsonRows(try await appState.api(endpoint)).map(ManagedUser.init).filter { $0.id > 0 || !$0.username.isEmpty } } catch { appState.presentedError = error.localizedDescription } }
-    func toggle(_ appState: AppState, user: ManagedUser) async { let body: [String: Any] = ["id": user.id, "username": user.username, "email": user.email, "is_active": !user.active, "is_staff": user.staff, "is_superuser": user.admin]; if await appState.perform("\(endpoint)/\(user.id)", method: .put, body: body) { await load(appState) } }
-    func delete(_ appState: AppState, user: ManagedUser) async { if await appState.perform("\(endpoint)/\(user.id)", method: .delete) { users.removeAll { $0.id == user.id } } }
+
+    func load(_ appState: AppState) async {
+        defer { isLoading = false }
+        do {
+            users = jsonRows(try await appState.api(endpoint))
+                .map(ManagedUser.init)
+                .filter { $0.id > 0 || !$0.username.isEmpty }
+        } catch {
+            appState.presentedError = error.localizedDescription
+        }
+    }
+
+    func toggle(_ appState: AppState, user: ManagedUser) async {
+        let body: [String: Any] = [
+            "id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "is_active": !user.active,
+            "is_staff": user.staff,
+            "is_superuser": user.admin
+        ]
+        if await appState.perform("\(endpoint)/\(user.id)", method: .put, body: body) {
+            await load(appState)
+        }
+    }
+
+    func delete(_ appState: AppState, user: ManagedUser) async {
+        if await appState.perform("\(endpoint)/\(user.id)", method: .delete) {
+            users.removeAll { $0.id == user.id }
+        }
+    }
 }
 
 struct UserManagementView: View {
@@ -2993,7 +3177,9 @@ struct AdminUserItem: Identifiable {
 
     var expirationDate: Date? {
         if let date = parseDate(expiresAt) { return date }
-        guard let timestamp = Double(expiresAt.trimmingCharacters(in: .whitespacesAndNewlines)), timestamp > 0 else { return nil }
+        guard let timestamp = Double(expiresAt.trimmingCharacters(in: .whitespacesAndNewlines)),
+              timestamp.isFinite,
+              timestamp > 0 else { return nil }
         return Date(timeIntervalSince1970: timestamp > 10_000_000_000 ? timestamp / 1_000 : timestamp)
     }
 
@@ -3005,7 +3191,7 @@ struct AdminUserItem: Identifiable {
         guard let expirationDate else { return expire > 0 ? "\(expire) 天" : "-" }
         guard expirationDate > Date() else { return "已过期" }
         let seconds = expirationDate.timeIntervalSinceNow
-        return "剩余 \(max(0, Int(ceil(seconds / 86_400)))) 天"
+        return "剩余 \(max(0, clampedInt(ceil(seconds / 86_400)))) 天"
     }
 }
 
@@ -3211,19 +3397,48 @@ struct AdminUserRow: View {
     let user: AdminUserItem
     var body: some View {
         HStack(spacing: 12) {
-            Circle().fill(user.isExpired ? HarvestTheme.coral.opacity(0.14) : user.tryUser ? HarvestTheme.amber.opacity(0.14) : HarvestTheme.green.opacity(0.14)).frame(width: 42, height: 42)
-                .overlay(Image(systemName: user.isExpired ? "calendar.badge.exclamationmark" : user.tryUser ? "hourglass" : "key.fill").foregroundStyle(user.isExpired ? HarvestTheme.coral : user.tryUser ? HarvestTheme.amber : HarvestTheme.green))
+            Circle()
+                .fill(
+                    user.isExpired
+                        ? HarvestTheme.coral.opacity(0.14)
+                        : user.tryUser ? HarvestTheme.amber.opacity(0.14) : HarvestTheme.green.opacity(0.14)
+                )
+                .frame(width: 42, height: 42)
+                .overlay {
+                    Image(
+                        systemName: user.isExpired
+                            ? "calendar.badge.exclamationmark"
+                            : user.tryUser ? "hourglass" : "key.fill"
+                    )
+                    .foregroundStyle(
+                        user.isExpired
+                            ? HarvestTheme.coral
+                            : user.tryUser ? HarvestTheme.amber : HarvestTheme.green
+                    )
+                }
             VStack(alignment: .leading, spacing: 4) {
                 Text(privacyMaskedText(user.username.isEmpty ? user.email : user.username, enabled: appState.privacyMode)).font(.headline)
                 if !user.username.isEmpty {
                     Text(privacyMaskedText(user.email, enabled: appState.privacyMode)).font(.caption).foregroundStyle(.secondary)
                 }
-                Text(user.expiresAt.isEmpty ? "有效期 \(user.expire) 天" : "\(user.authorizationText) · \(user.expiresAt)").font(.caption2).foregroundStyle(user.isExpired ? HarvestTheme.coral : .secondary)
+                Text(
+                    user.expiresAt.isEmpty
+                        ? "有效期 \(user.expire) 天"
+                        : "\(user.authorizationText) · \(user.expiresAt)"
+                )
+                .font(.caption2)
+                .foregroundStyle(user.isExpired ? HarvestTheme.coral : .secondary)
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 4) {
                 Text("\(user.invite) 邀请").font(.caption)
-                Text(user.isExpired ? "过期" : user.tryUser ? "试用" : user.pay > 0 ? "收费" : "免费").font(.caption2).foregroundStyle(user.isExpired ? HarvestTheme.coral : user.tryUser ? HarvestTheme.amber : HarvestTheme.green)
+                Text(user.isExpired ? "过期" : user.tryUser ? "试用" : user.pay > 0 ? "收费" : "免费")
+                    .font(.caption2)
+                    .foregroundStyle(
+                        user.isExpired
+                            ? HarvestTheme.coral
+                            : user.tryUser ? HarvestTheme.amber : HarvestTheme.green
+                    )
             }
         }
         .padding(.vertical, 4)
@@ -3258,13 +3473,33 @@ struct AdminUserEditorSheet: View {
         NavigationStack {
             Form {
                 Section("账号") { TextField("用户名", text: $username); TextField("邮箱", text: $email).keyboardType(.emailAddress).textInputAutocapitalization(.never); TextField("备注", text: $marked) }
-                Section("授权") { TextField("支付金额", text: $pay).keyboardType(.numberPad); TextField("邀请码数量", text: $invite).keyboardType(.numberPad); TextField("有效天数", text: $expire).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
+                Section("授权") {
+                    TextField("支付金额", text: $pay).keyboardType(.numberPad)
+                    TextField("邀请码数量", text: $invite).keyboardType(.numberPad)
+                    TextField("有效天数", text: $expire).keyboardType(.numberPad)
+                    Toggle("试用用户", isOn: $tryUser)
+                }
             }
             .navigationTitle("编辑授权").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("保存") { Task { if await save(["id": user.id, "username": username, "email": email, "pay": Int(pay) ?? 0, "invite": Int(invite) ?? 0, "try_user": tryUser, "marked": marked, "expire": Int(expire) ?? 0]) { dismiss() } } }.disabled(email.isEmpty)
+                    Button("保存") {
+                        Task {
+                            let body: [String: Any] = [
+                                "id": user.id,
+                                "username": username,
+                                "email": email,
+                                "pay": Int(pay) ?? 0,
+                                "invite": Int(invite) ?? 0,
+                                "try_user": tryUser,
+                                "marked": marked,
+                                "expire": Int(expire) ?? 0
+                            ]
+                            if await save(body) { dismiss() }
+                        }
+                    }
+                    .disabled(email.isEmpty)
                 }
             }
         }
@@ -3291,7 +3526,21 @@ struct AdminTokenResetSheet: View {
         NavigationStack {
             Form { TextField("有效天数", text: $expire).keyboardType(.numberPad); TextField("支付金额", text: $pay).keyboardType(.numberPad); Toggle("试用用户", isOn: $tryUser) }
                 .navigationTitle("重置令牌").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(expire) ?? 0, Int(pay) ?? 0, tryUser) { dismiss() } } }.disabled((Int(expire) ?? 0) <= 0 || (Int(pay) ?? 0) <= 0) } }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { dismiss() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("重置") {
+                            Task {
+                                if await reset(Int(expire) ?? 0, Int(pay) ?? 0, tryUser) {
+                                    dismiss()
+                                }
+                            }
+                        }
+                        .disabled((Int(expire) ?? 0) <= 0 || (Int(pay) ?? 0) <= 0)
+                    }
+                }
         }
     }
 }
@@ -3304,7 +3553,19 @@ struct ResetInvitesSheet: View {
         NavigationStack {
             Form { TextField("邀请码数量", text: $count).keyboardType(.numberPad) }
                 .navigationTitle("重置邀请码").navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("重置") { Task { if await reset(Int(count) ?? 0) { dismiss() } } }.disabled((Int(count) ?? -1) < 0) } }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { dismiss() }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("重置") {
+                            Task {
+                                if await reset(Int(count) ?? 0) { dismiss() }
+                            }
+                        }
+                        .disabled((Int(count) ?? -1) < 0)
+                    }
+                }
         }
     }
 }
@@ -3650,7 +3911,7 @@ struct LogView: View {
                             scrollToBottom(proxy)
                         } label: { Label("到底部", systemImage: "arrow.down.to.line") }
                         Divider()
-                        Button { UIPasteboard.general.string = logText } label: { Label("复制当前日志", systemImage: "doc.on.doc") }
+                        Button { copyPrivateText(logText) } label: { Label("复制当前日志", systemImage: "doc.on.doc") }
                             .disabled(entries.isEmpty)
                         Button { Task { await clearCurrent() } } label: { Label("清空当前视图", systemImage: "trash") }
                             .disabled(entries.isEmpty)
@@ -4200,12 +4461,13 @@ final class BrowserSessionModel: ObservableObject {
         }
 
         var pieces: [(image: UIImage, offset: Double)] = []
+        let safeOriginalOffset = max(0, clampedInt(originalOffset))
         defer {
-            webView.evaluateJavaScript("window.scrollTo(0, \(Int(originalOffset)));", completionHandler: nil)
+            webView.evaluateJavaScript("window.scrollTo(0, \(safeOriginalOffset));", completionHandler: nil)
         }
         for offset in offsets {
             try Task.checkCancellation()
-            _ = try? await webView.evaluateJavaScript("window.scrollTo(0, \(Int(offset))); true;")
+            _ = try? await webView.evaluateJavaScript("window.scrollTo(0, \(max(0, clampedInt(offset)))); true;")
             try await Task.sleep(for: .milliseconds(300))
             pieces.append((try await captureVisibleSnapshot(webView), offset))
         }
@@ -4348,9 +4610,12 @@ struct NativeBrowserView: UIViewRepresentable {
         self.session = session
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(session: session) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(session: session, allowedHosts: browserAllowedHosts())
+    }
 
     func makeUIView(context: Context) -> WKWebView {
+        excludeBrowserStorageFromBackup()
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         if let script = localStorageScript() {
@@ -4389,6 +4654,7 @@ struct NativeBrowserView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
         context.coordinator.session = session
+        context.coordinator.allowedHosts = browserAllowedHosts()
         session?.attach(uiView)
         let nextScript = localStorageScript()
         guard context.coordinator.localStorageScript != nextScript else { return }
@@ -4406,8 +4672,12 @@ struct NativeBrowserView: UIViewRepresentable {
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         weak var session: BrowserSessionModel?
         var localStorageScript: String?
+        var allowedHosts: Set<String>
 
-        init(session: BrowserSessionModel?) { self.session = session }
+        init(session: BrowserSessionModel?, allowedHosts: Set<String>) {
+            self.session = session
+            self.allowedHosts = allowedHosts
+        }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation?) {
             session?.navigationStarted(webView)
@@ -4444,7 +4714,29 @@ struct NativeBrowserView: UIViewRepresentable {
                 decisionHandler(.cancel)
                 return
             }
-            decisionHandler(.allow)
+            guard let url = navigationAction.request.url else {
+                decisionHandler(.allow)
+                return
+            }
+            let scheme = url.scheme?.lowercased() ?? ""
+            if ["about", "data", "blob"].contains(scheme) {
+                decisionHandler(.allow)
+                return
+            }
+            if scheme == "http" || scheme == "https" {
+                let isMainFrame = navigationAction.targetFrame?.isMainFrame != false
+                guard !isMainFrame || isAllowedNavigation(url) else {
+                    if navigationAction.targetFrame == nil || navigationAction.navigationType == .linkActivated {
+                        openExternally(url)
+                    }
+                    decisionHandler(.cancel)
+                    return
+                }
+                decisionHandler(.allow)
+                return
+            }
+            openExternally(url)
+            decisionHandler(.cancel)
         }
 
         func webView(
@@ -4476,10 +4768,24 @@ struct NativeBrowserView: UIViewRepresentable {
             guard let url = navigationAction.request.url else { return nil }
             if let request = browserTorrentRequest(url: url) {
                 session?.interceptTorrent(request)
-            } else {
+            } else if isAllowedNavigation(url) {
                 webView.load(navigationAction.request)
+            } else {
+                openExternally(url)
             }
             return nil
+        }
+
+        private func isAllowedNavigation(_ url: URL) -> Bool {
+            guard let host = url.host?.lowercased(), !host.isEmpty else { return false }
+            return allowedHosts.contains { allowed in
+                host == allowed || host.hasSuffix(".\(allowed)")
+            }
+        }
+
+        private func openExternally(_ url: URL) {
+            guard UIApplication.shared.canOpenURL(url) else { return }
+            UIApplication.shared.open(url)
         }
 
         func webView(
@@ -4585,30 +4891,49 @@ struct NativeBrowserView: UIViewRepresentable {
                 .value: value
             ]
             if secure { properties[.secure] = "TRUE" }
+            properties[HTTPCookiePropertyKey(rawValue: "HttpOnly")] = "TRUE"
             return HTTPCookie(properties: properties)
         }
+    }
+
+    private func excludeBrowserStorageFromBackup() {
+        guard let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first else { return }
+        for component in ["WebKit", "Cookies"] {
+            var url = library.appendingPathComponent(component, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            var values = URLResourceValues()
+            values.isExcludedFromBackup = true
+            try? url.setResourceValues(values)
+        }
+    }
+
+    private func browserAllowedHosts() -> Set<String> {
+        var allowedHosts: Set<String> = []
+        for value in [urlString] + localStorageURLs {
+            guard let host = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines))?.host?.lowercased(),
+                  !host.isEmpty else { continue }
+            allowedHosts.insert(host)
+            if host.hasPrefix("www.") { allowedHosts.insert(String(host.dropFirst(4))) }
+            if host.hasPrefix("m.") { allowedHosts.insert(String(host.dropFirst(2))) }
+        }
+        return allowedHosts
     }
 
     private func localStorageScript() -> String? {
         let storage = localStorage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !storage.isEmpty, let storageLiteral = javaScriptLiteral(storage) else { return nil }
 
-        var allowedHosts: Set<String> = []
-        for value in [urlString] + localStorageURLs {
-            guard let host = URL(string: value.trimmingCharacters(in: .whitespacesAndNewlines))?.host?.lowercased(),
-                  !host.isEmpty else { continue }
-            allowedHosts.insert(host)
-            let baseHost: String
-            if host.hasPrefix("www.") { baseHost = String(host.dropFirst(4)) }
-            else if host.hasPrefix("m.") { baseHost = String(host.dropFirst(2)) }
-            else { baseHost = host }
-            allowedHosts.insert(baseHost)
-            allowedHosts.insert("www.\(baseHost)")
-            allowedHosts.insert("m.\(baseHost)")
-        }
+        let allowedHosts = browserAllowedHosts()
         guard !allowedHosts.isEmpty,
               let hostsData = try? JSONSerialization.data(withJSONObject: allowedHosts.sorted()),
               let hostsLiteral = String(data: hostsData, encoding: .utf8) else { return nil }
+        var authHosts = allowedHosts
+        if allowedHosts.contains(where: { $0.contains("m-team") || $0.contains("mteam") }) {
+            authHosts.insert("api.m-team.cc")
+            authHosts.insert("api2.m-team.cc")
+        }
+        guard let authHostsData = try? JSONSerialization.data(withJSONObject: authHosts.sorted()),
+              let authHostsLiteral = String(data: authHostsData, encoding: .utf8) else { return nil }
         let authBridge = installsLocalStorageAuthBridge ? "true" : "false"
         return """
         (() => {
@@ -4670,29 +4995,12 @@ struct NativeBrowserView: UIViewRepresentable {
               if (!token) return '';
               return token.toLowerCase().startsWith('bearer ') ? token : 'Bearer ' + token;
             };
-            const apiHosts = () => {
-              const hosts = new Set();
-              const addHost = (value) => {
-                if (!value) return;
-                try {
-                  const url = new URL(String(value), window.location.href);
-                  if (url.host) hosts.add(url.host.toLowerCase());
-                } catch (_) {}
-              };
-              for (const key of ['apiHost', 'api_host', 'baseApi', 'base_api', 'apiBase', 'api_base']) {
-                try { addHost(window.localStorage.getItem(key)); } catch (_) {}
-              }
-              if (window.location.hostname.toLowerCase().includes('m-team')) {
-                hosts.add('api.m-team.cc');
-                hosts.add('api2.m-team.cc');
-              }
-              return hosts;
-            };
+            const apiHosts = new Set(\(authHostsLiteral));
             const shouldAttachAuth = (value) => {
               if (!value) return false;
               try {
                 const url = new URL(String(value), window.location.href);
-                return apiHosts().has(url.host.toLowerCase());
+                return url.protocol === 'https:' && apiHosts.has(url.hostname.toLowerCase());
               } catch (_) { return false; }
             };
 

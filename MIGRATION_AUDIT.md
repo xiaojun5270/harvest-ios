@@ -9,8 +9,9 @@ UI/service call sites.
 
 This audit maps the active Flutter mobile workflows to native iOS screens and
 service calls. It is a living source-level checklist, not a certification that
-the two clients are already identical at runtime. The native target currently
-uses 86 `APIPath` entries, including all three first-run setup endpoints.
+the two clients are already identical at runtime. The native target declares 93
+`APIPath` entries and currently references 86 of them, including all three
+first-run setup endpoints.
 Flutter constants not mirrored as product screens are interceptor-only auth
 routes, inactive feature constants, or alternate trailing-slash forms.
 
@@ -38,7 +39,7 @@ pass, and device testing against a reachable Harvest server.
   WebSocket updates, search, status/category/tag/site filters, sorting, detail,
   files, Trackers, `.torrent` export, long-press selection, select-all, bulk
   controls, advanced qBittorrent/Transmission actions, safe data deletion, and
-  torrent creation. A downloader opened from its card remains a locked scope;
+  torrent add/push workflows. A downloader opened from its card remains a locked scope;
   this scope is hidden from the filter count and survives filter reset.
 - The not-yet-added site catalog now opens as a searchable native sheet instead
   of a long picker. Search supports case/diacritic folding and the same
@@ -250,7 +251,7 @@ pass, and device testing against a reachable Harvest server.
 - Downloader lifecycle, connectivity tests, configurable real-time refresh,
   countdown and pause/resume, WebSocket recovery, speed mode, category/tag
   management, tracker replacement, preferences, torrent detail, selection,
-  file-directory trees, virtual Tracker filtering, bulk controls, advanced
+  file-directory trees, Tracker display/replacement, bulk controls, advanced
   qBittorrent actions, share limits, manual push, advanced push, and monkey
   push.
 - Scheduled-task lifecycle, Cron editing, task results, Markdown result detail,
@@ -275,7 +276,9 @@ pass, and device testing against a reachable Harvest server.
 ## Intentional Platform Differences
 
 - Desktop sidebars, window controls, and floating log windows are not applicable
-  to iOS. Their underlying workflows remain available in native screens.
+  to iOS. The desktop-only 16-state torrent filter is not mirrored; iOS uses the
+  Flutter mobile client's compact status semantics. Other workflows remain
+  available in native screens.
 - The Flutter client's multiple visual site-card styles are replaced by one new
   native design. All card modules use the requested 24-point continuous radius.
 - iOS cannot silently install an unsigned IPA. The app opens an IPA/download

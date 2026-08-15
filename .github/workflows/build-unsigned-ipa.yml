@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: unsigned-ipa-${{ github.ref }}
@@ -19,11 +19,13 @@ jobs:
   build:
     name: Build iOS app without signing
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Show toolchain
         run: |
@@ -68,27 +70,23 @@ jobs:
           fi
 
           shasum -a 256 output/Harvest-unsigned.ipa | tee output/Harvest-unsigned.ipa.sha256
+          DSYM_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Harvest.app.dSYM"
+          if test -d "$DSYM_PATH"; then
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DSYM_PATH" output/Harvest.app.dSYM.zip
+          fi
           ls -lh output/Harvest-unsigned.ipa
 
       - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Harvest-unsigned-${{ github.run_number }}
           path: |
             output/Harvest-unsigned.ipa
             output/Harvest-unsigned.ipa.sha256
+            output/Harvest.app.dSYM.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
-
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            output/Harvest-unsigned.ipa
-            output/Harvest-unsigned.ipa.sha256
 
       - name: Write summary
         run: |
@@ -101,3 +99,25 @@ jobs:
             echo
             echo "This IPA must be signed before installation on a stock iOS device."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: Harvest-unsigned-${{ github.run_number }}
+          path: output
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          files: |
+            output/Harvest-unsigned.ipa
+            output/Harvest-unsigned.ipa.sha256

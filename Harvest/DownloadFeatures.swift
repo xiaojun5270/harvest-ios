@@ -41,12 +41,19 @@ struct DownloaderItem: Identifiable {
         let preferences = payload.dict("prefs", "preferences") ?? json.dict("prefs", "preferences") ?? [:]
         let status = payload.dict("info", "status", "server_state") ?? payload
         let currentStats = status.dict("current-stats", "currentStats") ?? [:]
-        id = json.int("id") ?? abs((json.string("name") ?? UUID().uuidString).hashValue)
-        name = json.string("name", "nickname", "title") ?? "下载器"
+        let resolvedName = json.string("name", "nickname", "title") ?? "下载器"
         let categoryValue = json.string("category", "type", "client") ?? "qBittorrent"
+        let resolvedHost = json.string("host", "external_host", "url") ?? ""
+        id = json.int("id") ?? stableIdentifier(
+            resolvedName,
+            categoryValue,
+            resolvedHost,
+            String(json.int("port") ?? 0)
+        )
+        name = resolvedName
         category = categoryValue
         networkProtocol = json.string("protocol") ?? "http"
-        host = json.string("host", "external_host", "url") ?? ""
+        host = resolvedHost
         externalHost = json.string("external_host", "externalHost") ?? ""
         port = json.int("port") ?? 0
         username = json.string("username") ?? ""
@@ -348,9 +355,24 @@ struct TorrentItem: Identifiable, @unchecked Sendable {
 
     init(_ json: [String: Any]) {
         numericID = json.int("id", "torrent_id") ?? 0
-        torrentHash = json.string("hashString", "hash_string", "hash", "infohash_v1", "torrent_hash") ?? (numericID > 0 ? String(numericID) : UUID().uuidString)
-        name = json.string("name", "title") ?? "未命名任务"
-        downloaderID = json.int("downloader_id", "downloader", "client_id") ?? 0
+        let resolvedName = json.string("name", "title") ?? "未命名任务"
+        let resolvedDownloaderID = json.int("downloader_id", "downloader", "client_id") ?? 0
+        if let hash = json.string("hashString", "hash_string", "hash", "infohash_v1", "torrent_hash") {
+            torrentHash = hash
+        } else if numericID > 0 {
+            torrentHash = String(numericID)
+        } else {
+            torrentHash = "fallback-\(stableIdentifier(
+                String(resolvedDownloaderID),
+                resolvedName,
+                json.string("save_path", "savePath", "downloadDir", "download_dir") ?? "",
+                json.string("addedDate", "added_on", "added_at") ?? "",
+                json.string("sizeWhenDone", "totalSize", "total_size", "size") ?? "",
+                json.string("magnetLink", "magnet_link", "magnet_uri", "magnet") ?? ""
+            ))"
+        }
+        name = resolvedName
+        downloaderID = resolvedDownloaderID
         id = "\(downloaderID):\(torrentHash)"
         downloaderCategory = json.string("downloader_category", "client_type") ?? "Qb"
         status = torrentStatusLabel(json.string("state", "status") ?? "unknown", client: downloaderCategory)
@@ -450,7 +472,8 @@ private func torrentCategorySortText(_ item: TorrentItem) -> String {
 private func torrentETA(_ item: TorrentItem) -> Double {
     guard item.remaining > 0 else { return 0 }
     guard item.downloadSpeed > 0 else { return Double.greatestFiniteMagnitude }
-    return item.remaining / item.downloadSpeed
+    let value = item.remaining / item.downloadSpeed
+    return value.isFinite ? value : Double.greatestFiniteMagnitude
 }
 
 private func torrentSpeedLimitSortValue(_ item: TorrentItem) -> Double {
@@ -599,33 +622,210 @@ private struct TorrentDerivedState {
     var siteLabels: [String: String] = [:]
 }
 
+private struct TorrentMetadataSnapshot: @unchecked Sendable {
+    let items: [TorrentItem]
+    let hostLabels: [(host: String, label: String)]
+    let keyLabels: [(key: String, label: String)]
+}
+
+private struct TorrentMetadataResult: @unchecked Sendable {
+    let categories: [String]
+    let tags: [String]
+    let sites: [String]
+    let siteLabels: [String: String]
+}
+
+private struct TorrentFilterCriteria: @unchecked Sendable {
+    let query: String
+    let status: String
+    let downloaderID: Int
+    let category: String
+    let tags: Set<String>
+    let site: String
+    let sortField: TorrentSortField
+    let sortAscending: Bool
+}
+
+private struct TorrentFilterSnapshot: @unchecked Sendable {
+    let items: [TorrentItem]
+    let siteLabels: [String: String]
+    let criteria: TorrentFilterCriteria
+}
+
+private struct FilteredTorrentSnapshot: @unchecked Sendable {
+    let items: [TorrentItem]
+}
+
+private struct DecodedTorrentSnapshot: @unchecked Sendable {
+    let items: [TorrentItem]
+    let signature: Int
+}
+
+private func resolvedTorrentSiteLabel(
+    for torrent: TorrentItem,
+    hostLabels: [(host: String, label: String)],
+    keyLabels: [(key: String, label: String)]
+) -> String {
+    if !torrent.siteHint.isEmpty { return torrent.siteHint }
+    let trackerText = torrent.trackerURLs.joined(separator: " ").lowercased()
+    for tracker in torrent.trackerURLs {
+        guard var host = URL(string: tracker)?.host?.lowercased(), !host.isEmpty else { continue }
+        if host.hasPrefix("www.") { host.removeFirst(4) }
+        if let match = hostLabels.first(where: {
+            host == $0.host || host.hasSuffix(".\($0.host)") || $0.host.hasSuffix(".\(host)")
+        }) {
+            return match.label
+        }
+    }
+    if let match = keyLabels.first(where: { trackerText.contains($0.key) }) {
+        return match.label
+    }
+    for tracker in torrent.trackerURLs {
+        if let host = URL(string: tracker)?.host, !host.isEmpty { return host }
+    }
+    return ""
+}
+
+private func torrentMatchesStatus(_ item: TorrentItem, status: String) -> Bool {
+    let code = torrentStatusCode(item)
+    switch status {
+    case "下载中": return code == 3 || code == 4
+    case "做种中": return code == 5 || code == 6
+    case "等待中": return code == 1 || code == 2
+    case "已停止": return code == 0
+    case "错误": return item.hasError
+    default: return true
+    }
+}
+
+private func filteredTorrents(_ snapshot: TorrentFilterSnapshot) -> [TorrentItem] {
+    let criteria = snapshot.criteria
+    var result = snapshot.items.filter { item in
+        let queryMatch = criteria.query.isEmpty || item.name.localizedCaseInsensitiveContains(criteria.query)
+        let downloaderMatch = criteria.downloaderID == 0 || item.downloaderID == criteria.downloaderID
+        let categoryMatch = criteria.category.isEmpty || torrentMatchesCategory(item, category: criteria.category)
+        let tagMatch = criteria.tags.isEmpty || item.tags.contains(where: criteria.tags.contains)
+        let siteMatch = criteria.site.isEmpty || snapshot.siteLabels[item.id] == criteria.site
+        return queryMatch
+            && downloaderMatch
+            && categoryMatch
+            && tagMatch
+            && siteMatch
+            && torrentMatchesStatus(item, status: criteria.status)
+    }
+    result.sort { left, right in
+        let comparison: Int
+        switch criteria.sortField {
+        case .queuePosition:
+            comparison = compareTorrentValues(left.queuePosition, right.queuePosition)
+        case .name:
+            comparison = left.name.localizedCaseInsensitiveCompare(right.name).rawValue
+        case .selectedSize:
+            comparison = compareTorrentValues(left.size, right.size)
+        case .totalSize:
+            comparison = compareTorrentValues(left.totalSize, right.totalSize)
+        case .progress:
+            comparison = compareTorrentValues(left.progress, right.progress)
+        case .status:
+            comparison = compareTorrentValues(torrentStatusCode(left), torrentStatusCode(right))
+        case .seeds:
+            comparison = compareTorrentValues(left.seedCount, right.seedCount)
+        case .peers:
+            comparison = compareTorrentValues(left.peerCount, right.peerCount)
+        case .downloadSpeed:
+            comparison = compareTorrentValues(left.downloadSpeed, right.downloadSpeed)
+        case .uploadSpeed:
+            comparison = compareTorrentValues(left.uploadSpeed, right.uploadSpeed)
+        case .eta:
+            comparison = compareTorrentValues(torrentETA(left), torrentETA(right))
+        case .ratio:
+            comparison = compareTorrentValues(left.ratio, right.ratio)
+        case .category:
+            comparison = torrentCategorySortText(left)
+                .localizedCaseInsensitiveCompare(torrentCategorySortText(right)).rawValue
+        case .tags:
+            comparison = left.tags.joined(separator: ", ")
+                .localizedCaseInsensitiveCompare(right.tags.joined(separator: ", ")).rawValue
+        case .addedDate:
+            comparison = compareTorrentValues(left.addedTimestamp, right.addedTimestamp)
+        case .completedDate:
+            comparison = compareTorrentValues(left.completedTimestamp, right.completedTimestamp)
+        case .tracker:
+            comparison = left.tracker.localizedCaseInsensitiveCompare(right.tracker).rawValue
+        case .speedLimit:
+            comparison = compareTorrentValues(torrentSpeedLimitSortValue(left), torrentSpeedLimitSortValue(right))
+        case .downloaded:
+            comparison = compareTorrentValues(left.downloaded, right.downloaded)
+        case .uploaded:
+            comparison = compareTorrentValues(left.uploaded, right.uploaded)
+        case .sessionTransfer:
+            comparison = compareTorrentValues(
+                left.sessionDownloaded + left.sessionUploaded,
+                right.sessionDownloaded + right.sessionUploaded
+            )
+        case .savePath:
+            comparison = left.savePath.localizedCaseInsensitiveCompare(right.savePath).rawValue
+        case .ratioLimit:
+            comparison = compareTorrentValues(left.ratioLimit, right.ratioLimit)
+        case .lastSeenComplete:
+            comparison = compareTorrentValues(left.lastSeenCompleteTimestamp, right.lastSeenCompleteTimestamp)
+        case .activityDate:
+            comparison = compareTorrentValues(left.activityTimestamp, right.activityTimestamp)
+        }
+        if comparison == 0 { return left.id < right.id }
+        return criteria.sortAscending ? comparison < 0 : comparison > 0
+    }
+    return result
+}
+
 @MainActor
 final class DownloadsViewModel: ObservableObject {
+    private final class WeakReference {
+        weak var value: DownloadsViewModel?
+        init(_ value: DownloadsViewModel) { self.value = value }
+    }
+
     @Published var downloaders: [DownloaderItem] = []
     private(set) var torrents: [TorrentItem] = [] {
-        didSet { rebuildTorrentMetadata() }
+        didSet { scheduleTorrentMetadataRebuild() }
     }
     private(set) var sites: [SiteItem] = [] {
         didSet {
             rebuildSiteIndex()
-            rebuildTorrentMetadata()
+            scheduleTorrentMetadataRebuild()
         }
     }
     private var websiteConfigs: [[String: Any]] = [] {
         didSet {
             rebuildSiteIndex()
-            rebuildTorrentMetadata()
+            scheduleTorrentMetadataRebuild()
         }
     }
     @Published var isLoading = true
-    @Published var query = "" { didSet { rebuildFilteredTorrents() } }
-    @Published var filter = "全部" { didSet { rebuildFilteredTorrents() } }
-    @Published var downloaderFilter = 0 { didSet { rebuildFilteredTorrents() } }
-    @Published var categoryFilter = "" { didSet { rebuildFilteredTorrents() } }
-    @Published var tagFilters: Set<String> = [] { didSet { rebuildFilteredTorrents() } }
-    @Published var siteFilter = "" { didSet { rebuildFilteredTorrents() } }
-    @Published var sortField = TorrentSortField.queuePosition { didSet { rebuildFilteredTorrents() } }
-    @Published var sortAscending = true { didSet { rebuildFilteredTorrents() } }
+    @Published var query = "" {
+        didSet { if query != oldValue { filterInputsDidChange(debounced: true) } }
+    }
+    @Published var filter = "全部" {
+        didSet { if filter != oldValue { filterInputsDidChange() } }
+    }
+    @Published var downloaderFilter = 0 {
+        didSet { if downloaderFilter != oldValue { filterInputsDidChange() } }
+    }
+    @Published var categoryFilter = "" {
+        didSet { if categoryFilter != oldValue { filterInputsDidChange() } }
+    }
+    @Published var tagFilters: Set<String> = [] {
+        didSet { if tagFilters != oldValue { filterInputsDidChange() } }
+    }
+    @Published var siteFilter = "" {
+        didSet { if siteFilter != oldValue { filterInputsDidChange() } }
+    }
+    @Published var sortField = TorrentSortField.queuePosition {
+        didSet { if sortField != oldValue { filterInputsDidChange() } }
+    }
+    @Published var sortAscending = true {
+        didSet { if sortAscending != oldValue { filterInputsDidChange() } }
+    }
     @Published var socketConnections: Set<Int> = []
     @Published private(set) var refreshEnabled = true
     @Published private(set) var refreshPaused = false
@@ -643,6 +843,12 @@ final class DownloadsViewModel: ObservableObject {
     private var countdownTask: Task<Void, Never>?
     private var cacheWriteTask: Task<Void, Never>?
     private var compactSummaryTask: Task<Void, Never>?
+    private var filterRebuildTask: Task<Void, Never>?
+    private var metadataRebuildTask: Task<Void, Never>?
+    private var filterRebuildGeneration = 0
+    private var metadataRebuildGeneration = 0
+    private var isBatchingFilterUpdates = false
+    private var filterRebuildPending = false
     private var isViewActive = false
     private var isWatching = false
     private var restoredCache = false
@@ -656,6 +862,16 @@ final class DownloadsViewModel: ObservableObject {
         self.sessionCacheKey = includesTorrentData
             ? "downloads.snapshot.v1"
             : "downloads.downloaders.snapshot.v1"
+    }
+
+    deinit {
+        speedWatchTask?.cancel()
+        downloaderWatchTasks.values.forEach { $0.cancel() }
+        countdownTask?.cancel()
+        cacheWriteTask?.cancel()
+        compactSummaryTask?.cancel()
+        filterRebuildTask?.cancel()
+        metadataRebuildTask?.cancel()
     }
 
     let statusFilters = ["全部", "下载中", "做种中", "等待中", "已停止", "错误"]
@@ -677,98 +893,102 @@ final class DownloadsViewModel: ObservableObject {
 
     var filtered: [TorrentItem] { derived.filtered }
 
-    private func rebuildFilteredTorrents() {
-        var next = derived
-        next.filtered = makeFilteredTorrents(siteLabels: next.siteLabels)
-        derived = next
+    private func filterInputsDidChange(debounced: Bool = false) {
+        if isBatchingFilterUpdates {
+            filterRebuildPending = true
+            return
+        }
+        scheduleFilteredTorrentRebuild(debounced: debounced)
     }
 
-    private func makeFilteredTorrents(siteLabels: [String: String]) -> [TorrentItem] {
-        var result = torrents.filter { item in
-            let queryMatch = query.isEmpty || item.name.localizedCaseInsensitiveContains(query)
-            let downloaderMatch = downloaderFilter == 0 || item.downloaderID == downloaderFilter
-            let categoryMatch = categoryFilter.isEmpty || torrentMatchesCategory(item, category: categoryFilter)
-            let tagMatch = tagFilters.isEmpty || item.tags.contains(where: tagFilters.contains)
-            let siteMatch = siteFilter.isEmpty || siteLabels[item.id] == siteFilter
-            return queryMatch && downloaderMatch && categoryMatch && tagMatch && siteMatch && matchesStatus(item)
-        }
-        result.sort { left, right in
-            let comparison: Int
-            switch sortField {
-            case .queuePosition:
-                comparison = compareTorrentValues(left.queuePosition, right.queuePosition)
-            case .name:
-                comparison = left.name.localizedCaseInsensitiveCompare(right.name).rawValue
-            case .selectedSize:
-                comparison = compareTorrentValues(left.size, right.size)
-            case .totalSize:
-                comparison = compareTorrentValues(left.totalSize, right.totalSize)
-            case .progress:
-                comparison = compareTorrentValues(left.progress, right.progress)
-            case .status:
-                comparison = compareTorrentValues(torrentStatusCode(left), torrentStatusCode(right))
-            case .seeds:
-                comparison = compareTorrentValues(left.seedCount, right.seedCount)
-            case .peers:
-                comparison = compareTorrentValues(left.peerCount, right.peerCount)
-            case .downloadSpeed:
-                comparison = compareTorrentValues(left.downloadSpeed, right.downloadSpeed)
-            case .uploadSpeed:
-                comparison = compareTorrentValues(left.uploadSpeed, right.uploadSpeed)
-            case .eta:
-                comparison = compareTorrentValues(torrentETA(left), torrentETA(right))
-            case .ratio:
-                comparison = compareTorrentValues(left.ratio, right.ratio)
-            case .category:
-                comparison = torrentCategorySortText(left).localizedCaseInsensitiveCompare(torrentCategorySortText(right)).rawValue
-            case .tags:
-                comparison = left.tags.joined(separator: ", ").localizedCaseInsensitiveCompare(right.tags.joined(separator: ", ")).rawValue
-            case .addedDate:
-                comparison = compareTorrentValues(left.addedTimestamp, right.addedTimestamp)
-            case .completedDate:
-                comparison = compareTorrentValues(left.completedTimestamp, right.completedTimestamp)
-            case .tracker:
-                comparison = left.tracker.localizedCaseInsensitiveCompare(right.tracker).rawValue
-            case .speedLimit:
-                comparison = compareTorrentValues(torrentSpeedLimitSortValue(left), torrentSpeedLimitSortValue(right))
-            case .downloaded:
-                comparison = compareTorrentValues(left.downloaded, right.downloaded)
-            case .uploaded:
-                comparison = compareTorrentValues(left.uploaded, right.uploaded)
-            case .sessionTransfer:
-                comparison = compareTorrentValues(
-                    left.sessionDownloaded + left.sessionUploaded,
-                    right.sessionDownloaded + right.sessionUploaded
-                )
-            case .savePath:
-                comparison = left.savePath.localizedCaseInsensitiveCompare(right.savePath).rawValue
-            case .ratioLimit:
-                comparison = compareTorrentValues(left.ratioLimit, right.ratioLimit)
-            case .lastSeenComplete:
-                comparison = compareTorrentValues(left.lastSeenCompleteTimestamp, right.lastSeenCompleteTimestamp)
-            case .activityDate:
-                comparison = compareTorrentValues(left.activityTimestamp, right.activityTimestamp)
+    private func scheduleFilteredTorrentRebuild(debounced: Bool = false) {
+        filterRebuildTask?.cancel()
+        filterRebuildGeneration &+= 1
+        let generation = filterRebuildGeneration
+        let snapshot = TorrentFilterSnapshot(
+            items: torrents,
+            siteLabels: derived.siteLabels,
+            criteria: TorrentFilterCriteria(
+                query: query,
+                status: filter,
+                downloaderID: downloaderFilter,
+                category: categoryFilter,
+                tags: tagFilters,
+                site: siteFilter,
+                sortField: sortField,
+                sortAscending: sortAscending
+            )
+        )
+        let reference = WeakReference(self)
+        filterRebuildTask = Task {
+            if debounced {
+                do { try await Task.sleep(for: .milliseconds(140)) }
+                catch { return }
             }
-            if comparison == 0 { return left.id < right.id }
-            return sortAscending ? comparison < 0 : comparison > 0
+            guard !Task.isCancelled else { return }
+            let worker = Task.detached(priority: .userInitiated) {
+                FilteredTorrentSnapshot(items: filteredTorrents(snapshot))
+            }
+            let result = await withTaskCancellationHandler(
+                operation: { await worker.value },
+                onCancel: { worker.cancel() }
+            )
+            guard !Task.isCancelled,
+                  let model = reference.value,
+                  model.filterRebuildGeneration == generation else { return }
+            var next = model.derived
+            next.filtered = result.items
+            model.derived = next
+            model.filterRebuildTask = nil
         }
-        return result
     }
 
-    private func rebuildTorrentMetadata() {
-        var next = derived
-        var labels: [String: String] = [:]
-        labels.reserveCapacity(torrents.count)
-        for torrent in torrents {
-            let label = resolvedSiteLabel(for: torrent)
-            if !label.isEmpty { labels[torrent.id] = label }
+    private func scheduleTorrentMetadataRebuild() {
+        metadataRebuildTask?.cancel()
+        metadataRebuildGeneration &+= 1
+        let generation = metadataRebuildGeneration
+        let snapshot = TorrentMetadataSnapshot(
+            items: torrents,
+            hostLabels: siteHostLabels,
+            keyLabels: siteKeyLabels
+        )
+        let reference = WeakReference(self)
+        metadataRebuildTask = Task {
+            let worker = Task.detached(priority: .utility) { () -> TorrentMetadataResult in
+                var labels: [String: String] = [:]
+                labels.reserveCapacity(snapshot.items.count)
+                for torrent in snapshot.items {
+                    if Task.isCancelled { break }
+                    let label = resolvedTorrentSiteLabel(
+                        for: torrent,
+                        hostLabels: snapshot.hostLabels,
+                        keyLabels: snapshot.keyLabels
+                    )
+                    if !label.isEmpty { labels[torrent.id] = label }
+                }
+                return TorrentMetadataResult(
+                    categories: Array(Set(snapshot.items.flatMap(torrentCategories))).sorted(),
+                    tags: Array(Set(snapshot.items.lazy.flatMap(\.tags))).sorted(),
+                    sites: Array(Set(labels.values)).sorted(),
+                    siteLabels: labels
+                )
+            }
+            let result = await withTaskCancellationHandler(
+                operation: { await worker.value },
+                onCancel: { worker.cancel() }
+            )
+            guard !Task.isCancelled,
+                  let model = reference.value,
+                  model.metadataRebuildGeneration == generation else { return }
+            var next = model.derived
+            next.categories = result.categories
+            next.tags = result.tags
+            next.sites = result.sites
+            next.siteLabels = result.siteLabels
+            model.derived = next
+            model.metadataRebuildTask = nil
+            model.scheduleFilteredTorrentRebuild()
         }
-        next.categories = Array(Set(torrents.flatMap(torrentCategories))).sorted()
-        next.tags = Array(Set(torrents.lazy.flatMap(\.tags))).sorted()
-        next.siteLabels = labels
-        next.sites = Array(Set(labels.values)).sorted()
-        next.filtered = makeFilteredTorrents(siteLabels: labels)
-        derived = next
     }
 
     private func rebuildSiteIndex() {
@@ -802,6 +1022,7 @@ final class DownloadsViewModel: ObservableObject {
     }
 
     func resetFilters() {
+        isBatchingFilterUpdates = true
         filter = "全部"
         downloaderFilter = 0
         categoryFilter = ""
@@ -809,6 +1030,11 @@ final class DownloadsViewModel: ObservableObject {
         siteFilter = ""
         sortField = .queuePosition
         sortAscending = true
+        isBatchingFilterUpdates = false
+        if filterRebuildPending {
+            filterRebuildPending = false
+            filterInputsDidChange()
+        }
     }
 
     func load(_ appState: AppState) async {
@@ -866,7 +1092,10 @@ final class DownloadsViewModel: ObservableObject {
                 for await value in group { values.append(value) }
                 return values
             }
-            let downloaderByID = Dictionary(uniqueKeysWithValues: enabledDownloaders.map { ($0.id, $0) })
+            let downloaderByID = Dictionary(
+                enabledDownloaders.map { ($0.id, $0) },
+                uniquingKeysWith: { current, _ in current }
+            )
             for (downloaderID, data, errorMessage) in loads {
                 guard let downloader = downloaderByID[downloaderID] else { continue }
                 if let data,
@@ -894,12 +1123,16 @@ final class DownloadsViewModel: ObservableObject {
                 do {
                     let siteRaw = try await appState.api(APIPath.sites)
                     sites = jsonRows(siteRaw).map(SiteItem.init)
-                } catch { }
+                } catch {
+                    recordAppLog(.warning, "下载页站点索引刷新失败：\(error.localizedDescription)")
+                }
             }
             if websiteConfigs.isEmpty || usingCachedData {
                 do {
                     websiteConfigs = jsonRows(try await appState.api(APIPath.websiteList))
-                } catch { }
+                } catch {
+                    recordAppLog(.warning, "下载页站点配置刷新失败：\(error.localizedDescription)")
+                }
             }
             usingCachedData = successfulDownloaderLoads < enabledDownloaders.count
             if !usingCachedData { cachedAt = nil }
@@ -918,7 +1151,10 @@ final class DownloadsViewModel: ObservableObject {
         _ configured: [DownloaderItem],
         previous: [DownloaderItem]
     ) -> [DownloaderItem] {
-        let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
+        let previousByID = Dictionary(
+            previous.map { ($0.id, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
         return configured.map { item in
             let status = item.raw.dict("status") ?? [:]
             guard status.isEmpty,
@@ -1190,46 +1426,11 @@ final class DownloadsViewModel: ObservableObject {
     }
 
     func siteLabel(for torrent: TorrentItem) -> String {
-        derived.siteLabels[torrent.id] ?? resolvedSiteLabel(for: torrent)
-    }
-
-    private func resolvedSiteLabel(for torrent: TorrentItem) -> String {
-        if !torrent.siteHint.isEmpty { return torrent.siteHint }
-        let trackerText = torrent.trackerURLs.joined(separator: " ").lowercased()
-        for tracker in torrent.trackerURLs {
-            guard var host = URL(string: tracker)?.host?.lowercased(), !host.isEmpty else { continue }
-            if host.hasPrefix("www.") { host.removeFirst(4) }
-            if let match = siteHostLabels.first(where: {
-                host == $0.host || host.hasSuffix(".\($0.host)") || $0.host.hasSuffix(".\(host)")
-            }) {
-                return match.label
-            }
-        }
-        if let match = siteKeyLabels.first(where: { trackerText.contains($0.key) }) {
-            return match.label
-        }
-        for tracker in torrent.trackerURLs {
-            if let host = URL(string: tracker)?.host, !host.isEmpty { return host }
-        }
-        return ""
-    }
-
-    private func matchesStatus(_ item: TorrentItem) -> Bool {
-        let code = torrentStatusCode(item)
-        switch filter {
-        case "下载中":
-            return code == 3 || code == 4
-        case "做种中":
-            return code == 5 || code == 6
-        case "等待中":
-            return code == 1 || code == 2
-        case "已停止":
-            return code == 0
-        case "错误":
-            return item.hasError
-        default:
-            return true
-        }
+        derived.siteLabels[torrent.id] ?? resolvedTorrentSiteLabel(
+            for: torrent,
+            hostLabels: siteHostLabels,
+            keyLabels: siteKeyLabels
+        )
     }
 
     func control(
@@ -1518,13 +1719,14 @@ final class DownloadsViewModel: ObservableObject {
         isWatching = true
         refreshDeadline = Date().addingTimeInterval(TimeInterval(refreshDuration * 60))
         reconcileWatching(appState)
-        countdownTask = Task { [weak self] in
-            guard let self else { return }
-            do { try await Task.sleep(for: .seconds(self.refreshDuration * 60)) }
+        let duration = refreshDuration
+        let reference = WeakReference(self)
+        countdownTask = Task {
+            do { try await Task.sleep(for: .seconds(duration * 60)) }
             catch { return }
-            guard self.isWatching else { return }
-            self.refreshPaused = true
-            self.stopActiveWatching(clearRemaining: true)
+            guard let model = reference.value, model.isWatching else { return }
+            model.refreshPaused = true
+            model.stopActiveWatching(clearRemaining: true)
         }
     }
 
@@ -1546,8 +1748,9 @@ final class DownloadsViewModel: ObservableObject {
     private func reconcileWatching(_ appState: AppState) {
         guard isWatching else { return }
         if speedWatchTask == nil || speedWatchTask?.isCancelled == true {
-            speedWatchTask = Task { [weak self] in
-                await self?.watchDownloaderSpeeds(appState)
+            let reference = WeakReference(self)
+            speedWatchTask = Task {
+                await Self.watchDownloaderSpeeds(reference, appState: appState)
             }
         }
 
@@ -1581,121 +1784,220 @@ final class DownloadsViewModel: ObservableObject {
             let token = UUID()
             downloaderWatchTokens[downloader.id] = token
             downloaderWatchSignatures[downloader.id] = signature
-            downloaderWatchTasks[downloader.id] = Task { [weak self] in
-                await self?.watchDownloader(appState, downloader: downloader, token: token)
+            let reference = WeakReference(self)
+            downloaderWatchTasks[downloader.id] = Task {
+                await Self.watchDownloader(reference, appState: appState, downloader: downloader, token: token)
             }
         }
     }
 
-    private func watchDownloaderSpeeds(_ appState: AppState) async {
-        while isWatching && !Task.isCancelled {
+    private static func watchDownloaderSpeeds(_ reference: WeakReference, appState: AppState) async {
+        var reconnectAttempt = 0
+        while reference.value?.isWatching == true && !Task.isCancelled {
+            var receivedFrame = false
             do {
                 let stream = APIClient.shared.streamWebSocket(
                     baseURL: appState.baseURL,
                     path: APIPath.downloaderSpeed,
                     token: appState.accessToken,
-                    subscription: ["interval": refreshInterval]
+                    subscription: ["interval": reference.value?.refreshInterval ?? DownloaderRefreshDefaults.interval]
                 )
                 for try await event in stream {
-                    guard isWatching, !Task.isCancelled else { return }
-                    let data = (event["data"] as? [String: Any]) ?? jsonPayloadDictionary(event) ?? [:]
-                    guard !data.isEmpty else { continue }
-                    var liveByKey: [String: [String: Any]] = [:]
-                    for (key, value) in data {
-                        if let value = value as? [String: Any] { liveByKey[key.lowercased()] = value }
-                    }
-                    var updated = downloaders
-                    var changed = false
-                    for index in updated.indices {
-                        let downloader = updated[index]
-                        let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
-                        guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
-                        let liveTotal = downloaderMetricInt(live, keys: downloaderTotalCountKeys)
-                        var fallbackStatus: [String: Any] = [:]
-                        if downloaderIsTransmission(downloader.category)
-                            || downloaderMetricInt(live, keys: downloaderActiveCountKeys) == nil
-                            || ((liveTotal ?? 0) == 0 && downloader.totalTorrentCount > 0) {
-                            fallbackStatus["activeTorrentCount"] = downloader.activeTorrentCount
-                        }
-                        if downloaderMetricInt(live, keys: downloaderPausedCountKeys) == nil {
-                            fallbackStatus["pausedTorrentCount"] = downloader.pausedTorrentCount
-                        }
-                        if liveTotal == nil || (liveTotal == 0 && downloader.totalTorrentCount > 0) {
-                            fallbackStatus["torrentCount"] = downloader.totalTorrentCount
-                        }
-                        var merged = downloader.raw
-                        merged["status"] = live
-                        if !fallbackStatus.isEmpty {
-                            merged = mergingDownloaderStatus(fallbackStatus, into: merged)
-                        }
-                        let next = DownloaderItem(merged)
-                        guard downloaderLiveSignature(next) != downloaderLiveSignature(downloader) else { continue }
-                        updated[index] = next
-                        changed = true
-                    }
-                    if changed {
-                        downloaders = updated
-                        if !includesTorrentData {
-                            usingCachedData = false
-                            cachedAt = nil
-                        }
-                        scheduleCachePersistence(appState)
-                    }
+                    guard reference.value?.isWatching == true, !Task.isCancelled else { return }
+                    receivedFrame = true
+                    reconnectAttempt = 0
+                    reference.value?.applyDownloaderSpeedEvent(event, appState: appState)
                 }
-            } catch { }
-            if isWatching && !Task.isCancelled { try? await Task.sleep(for: .seconds(3)) }
+            } catch {
+                guard reference.value?.isWatching == true, !Task.isCancelled else { return }
+                recordAppLog(.warning, "下载器速度连接中断：\(error.localizedDescription)")
+            }
+            guard reference.value?.isWatching == true, !Task.isCancelled else { return }
+            if receivedFrame { reconnectAttempt = 0 }
+            reconnectAttempt = min(reconnectAttempt + 1, 6)
+            let delay = min(30, 1 << reconnectAttempt)
+            recordAppLog(.warning, "下载器速度将在 \(delay) 秒后重连")
+            do { try await Task.sleep(for: .seconds(delay)) }
+            catch { return }
         }
     }
 
-    private func watchDownloader(_ appState: AppState, downloader: DownloaderItem, token: UUID) async {
-        while isCurrentWatch(downloader.id, token: token) && !Task.isCancelled {
+    private func applyDownloaderSpeedEvent(_ event: [String: Any], appState: AppState) {
+        let data = (event["data"] as? [String: Any]) ?? jsonPayloadDictionary(event) ?? [:]
+        guard !data.isEmpty else { return }
+        var liveByKey: [String: [String: Any]] = [:]
+        for (key, value) in data {
+            if let value = value as? [String: Any] { liveByKey[key.lowercased()] = value }
+        }
+        var updated = downloaders
+        var changed = false
+        for index in updated.indices {
+            let downloader = updated[index]
+            let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
+            guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
+            let liveTotal = downloaderMetricInt(live, keys: downloaderTotalCountKeys)
+            var fallbackStatus: [String: Any] = [:]
+            if downloaderIsTransmission(downloader.category)
+                || downloaderMetricInt(live, keys: downloaderActiveCountKeys) == nil
+                || ((liveTotal ?? 0) == 0 && downloader.totalTorrentCount > 0) {
+                fallbackStatus["activeTorrentCount"] = downloader.activeTorrentCount
+            }
+            if downloaderMetricInt(live, keys: downloaderPausedCountKeys) == nil {
+                fallbackStatus["pausedTorrentCount"] = downloader.pausedTorrentCount
+            }
+            if liveTotal == nil || (liveTotal == 0 && downloader.totalTorrentCount > 0) {
+                fallbackStatus["torrentCount"] = downloader.totalTorrentCount
+            }
+            var merged = downloader.raw
+            merged["status"] = live
+            if !fallbackStatus.isEmpty {
+                merged = mergingDownloaderStatus(fallbackStatus, into: merged)
+            }
+            let next = DownloaderItem(merged)
+            guard downloaderLiveSignature(next) != downloaderLiveSignature(downloader) else { continue }
+            updated[index] = next
+            changed = true
+        }
+        guard changed else { return }
+        downloaders = updated
+        if !includesTorrentData {
+            usingCachedData = false
+            cachedAt = nil
+        }
+        scheduleCachePersistence(appState)
+    }
+
+    private static func watchDownloader(
+        _ reference: WeakReference,
+        appState: AppState,
+        downloader: DownloaderItem,
+        token: UUID
+    ) async {
+        var reconnectAttempt = 0
+        while reference.value?.isCurrentWatch(downloader.id, token: token) == true && !Task.isCancelled {
             do {
                 let stream = APIClient.shared.streamWebSocket(
                     baseURL: appState.baseURL,
                     path: APIPath.downloaderTorrents,
                     token: appState.accessToken,
-                    subscription: ["downloader_id": downloader.id, "interval": refreshInterval]
+                    subscription: [
+                        "downloader_id": downloader.id,
+                        "interval": reference.value?.refreshInterval ?? DownloaderRefreshDefaults.interval
+                    ]
                 )
                 var receivedFrame = false
                 for try await event in stream {
-                    guard isCurrentWatch(downloader.id, token: token), !Task.isCancelled else { return }
+                    guard reference.value?.isCurrentWatch(downloader.id, token: token) == true,
+                          !Task.isCancelled else { return }
                     if !receivedFrame {
                         receivedFrame = true
-                        socketConnections.insert(downloader.id)
+                        reconnectAttempt = 0
+                        reference.value?.socketConnections.insert(downloader.id)
                     }
                     let payload = jsonPayloadDictionary(event) ?? event
+                    let snapshotKeys = ["torrents", "items", "list", "rows", "records", "data"]
+                    let hasExplicitSnapshot = snapshotKeys.contains { payload[$0] != nil }
+                    let directRows = payload.values.compactMap { $0 as? [String: Any] }
+                    let looksLikeDirectSnapshot = !payload.isEmpty
+                        && directRows.count == payload.count
+                        && directRows.contains { row in
+                            row["name"] != nil || row["hash"] != nil || row["state"] != nil
+                        }
+                    guard hasExplicitSnapshot || looksLikeDirectSnapshot else { continue }
                     guard JSONSerialization.isValidJSONObject(payload),
                           let payloadData = try? JSONSerialization.data(withJSONObject: payload) else { continue }
                     let downloaderID = downloader.id
                     let downloaderCategory = downloader.category
-                    let incoming = await Task.detached(priority: .utility) {
-                        guard let value = try? JSONSerialization.jsonObject(with: payloadData, options: [.fragmentsAllowed]) else {
-                            return [TorrentItem]()
+                    let worker = Task.detached(priority: .utility) { () -> DecodedTorrentSnapshot? in
+                        guard !Task.isCancelled,
+                              let value = try? JSONSerialization.jsonObject(
+                                  with: payloadData,
+                                  options: [.fragmentsAllowed]
+                              ) else {
+                            return nil
                         }
-                        return jsonRows(value).map {
-                            var row = $0
+                        let rows = jsonRows(value)
+                        var items: [TorrentItem] = []
+                        items.reserveCapacity(rows.count)
+                        for source in rows {
+                            guard !Task.isCancelled else { return nil }
+                            var row = source
                             row["downloader_id"] = downloaderID
                             row["downloader_category"] = downloaderCategory
-                            return TorrentItem(row)
+                            items.append(TorrentItem(row))
                         }
-                    }.value
-                    guard !incoming.isEmpty else { continue }
-                    let signature = torrentSnapshotSignature(incoming)
-                    guard torrentSnapshotSignatures[downloader.id] != signature else { continue }
-                    torrentSnapshotSignatures[downloader.id] = signature
-                    var updated = torrents.filter { $0.downloaderID != downloader.id }
-                    updated.append(contentsOf: incoming)
-                    torrents = updated
-                    scheduleCachePersistence(appState)
+                        var hasher = Hasher()
+                        hasher.combine(items.count)
+                        for item in items {
+                            guard !Task.isCancelled else { return nil }
+                            hasher.combine(item.id)
+                            hasher.combine(item.status)
+                            hasher.combine(item.progress)
+                            hasher.combine(item.uploadSpeed)
+                            hasher.combine(item.downloadSpeed)
+                            hasher.combine(item.ratio)
+                            hasher.combine(item.queuePosition)
+                            hasher.combine(item.seedCount)
+                            hasher.combine(item.peerCount)
+                            hasher.combine(item.remaining)
+                            hasher.combine(item.downloadLimit)
+                            hasher.combine(item.uploadLimit)
+                            hasher.combine(item.ratioLimit)
+                            hasher.combine(item.addedTimestamp)
+                            hasher.combine(item.completedTimestamp)
+                            hasher.combine(item.activityTimestamp)
+                            hasher.combine(item.lastSeenCompleteTimestamp)
+                            hasher.combine(item.category)
+                            hasher.combine(item.tags)
+                            hasher.combine(item.errorText)
+                        }
+                        return DecodedTorrentSnapshot(items: items, signature: hasher.finalize())
+                    }
+                    let snapshot = await withTaskCancellationHandler(
+                        operation: { await worker.value },
+                        onCancel: { worker.cancel() }
+                    )
+                    guard !Task.isCancelled,
+                          reference.value?.isCurrentWatch(downloader.id, token: token) == true else { return }
+                    guard let snapshot else { continue }
+                    reference.value?.applyTorrentSnapshot(
+                        snapshot.items,
+                        signature: snapshot.signature,
+                        downloaderID: downloader.id,
+                        appState: appState
+                    )
                 }
-                if isCurrentWatch(downloader.id, token: token) { socketConnections.remove(downloader.id) }
+                if reference.value?.isCurrentWatch(downloader.id, token: token) == true {
+                    reference.value?.socketConnections.remove(downloader.id)
+                }
             } catch {
-                if isCurrentWatch(downloader.id, token: token) { socketConnections.remove(downloader.id) }
+                if reference.value?.isCurrentWatch(downloader.id, token: token) == true {
+                    reference.value?.socketConnections.remove(downloader.id)
+                    recordAppLog(.warning, "\(downloader.name) 实时任务连接中断：\(error.localizedDescription)")
+                }
             }
-            if isCurrentWatch(downloader.id, token: token), !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+            if reference.value?.isCurrentWatch(downloader.id, token: token) == true, !Task.isCancelled {
+                reconnectAttempt = min(reconnectAttempt + 1, 6)
+                let delay = min(30, 1 << reconnectAttempt)
+                recordAppLog(.warning, "\(downloader.name) 将在 \(delay) 秒后重连")
+                do { try await Task.sleep(for: .seconds(delay)) }
+                catch { return }
             }
         }
+    }
+
+    private func applyTorrentSnapshot(
+        _ incoming: [TorrentItem],
+        signature: Int,
+        downloaderID: Int,
+        appState: AppState
+    ) {
+        guard torrentSnapshotSignatures[downloaderID] != signature else { return }
+        torrentSnapshotSignatures[downloaderID] = signature
+        var updated = torrents.filter { $0.downloaderID != downloaderID }
+        updated.append(contentsOf: incoming)
+        torrents = updated
+        scheduleCachePersistence(appState)
     }
 
     private func isCurrentWatch(_ downloaderID: Int, token: UUID) -> Bool {
@@ -1721,33 +2023,6 @@ final class DownloadsViewModel: ObservableObject {
         return hasher.finalize()
     }
 
-    private func torrentSnapshotSignature(_ items: [TorrentItem]) -> Int {
-        var hasher = Hasher()
-        hasher.combine(items.count)
-        for item in items {
-            hasher.combine(item.id)
-            hasher.combine(item.status)
-            hasher.combine(item.progress)
-            hasher.combine(item.uploadSpeed)
-            hasher.combine(item.downloadSpeed)
-            hasher.combine(item.ratio)
-            hasher.combine(item.queuePosition)
-            hasher.combine(item.seedCount)
-            hasher.combine(item.peerCount)
-            hasher.combine(item.remaining)
-            hasher.combine(item.downloadLimit)
-            hasher.combine(item.uploadLimit)
-            hasher.combine(item.ratioLimit)
-            hasher.combine(item.addedTimestamp)
-            hasher.combine(item.completedTimestamp)
-            hasher.combine(item.activityTimestamp)
-            hasher.combine(item.lastSeenCompleteTimestamp)
-            hasher.combine(item.category)
-            hasher.combine(item.tags)
-            hasher.combine(item.errorText)
-        }
-        return hasher.finalize()
-    }
 }
 
 struct DownloadsView: View {
@@ -2564,10 +2839,10 @@ struct DownloaderCard: View {
         guard isTransmission else { return formatSpeed(value) }
         if value >= 1_000 {
             let megabytes = value / 1_000
-            if megabytes.rounded() == megabytes { return "\(Int(megabytes)) MB/s" }
+            if megabytes.rounded() == megabytes { return "\(clampedInt(megabytes)) MB/s" }
             return String(format: "%.1f MB/s", megabytes)
         }
-        return "\(Int(value.rounded())) KB/s"
+        return "\(clampedInt(value.rounded())) KB/s"
     }
 }
 
@@ -3101,8 +3376,19 @@ struct TorrentRow: View {
                     Button(role: .destructive) { confirmDelete = true } label: { Label("删除", systemImage: "trash") }
                 } label: { Image(systemName: "ellipsis").frame(width: 30, height: 30) }
             }
-            ProgressView(value: item.progress).tint(progressColor)
-            HStack { Text("\(Int(item.progress * 100))%").fontWeight(.semibold); Text(formatBytes(item.size)); Spacer(); Label(formatSpeed(item.downloadSpeed), systemImage: "arrow.down").foregroundStyle(HarvestTheme.blue); Label(formatSpeed(item.uploadSpeed), systemImage: "arrow.up").foregroundStyle(HarvestTheme.green) }.font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+            let safeProgress = normalizedProgress(item.progress)
+            ProgressView(value: safeProgress).tint(progressColor)
+            HStack {
+                Text("\(clampedInt(safeProgress * 100))%").fontWeight(.semibold)
+                Text(formatBytes(item.size))
+                Spacer()
+                Label(formatSpeed(item.downloadSpeed), systemImage: "arrow.down")
+                    .foregroundStyle(HarvestTheme.blue)
+                Label(formatSpeed(item.uploadSpeed), systemImage: "arrow.up")
+                    .foregroundStyle(HarvestTheme.green)
+            }
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(.secondary)
         }
         .cardSurface()
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
@@ -3146,7 +3432,7 @@ struct TorrentRow: View {
 
     private func copyButton(_ title: String, value: String, icon: String) -> some View {
         Button {
-            UIPasteboard.general.string = value
+            copyPrivateText(value)
         } label: {
             Label(title, systemImage: icon)
         }
@@ -3251,14 +3537,19 @@ struct TorrentAdvancedActionsSheet: View {
                         Button("应用超级做种") { runQB("set_super_seeding", extra: ["enable": superSeeding]) }
                         TextField("上传限制（KB/s，0 为不限速）", text: $uploadLimitKB).keyboardType(.numberPad)
                         Button("设置上传限制") {
-                            let bytes = max(0, (Int(uploadLimitKB) ?? 0) * 1024)
-                            runQB("set_upload_limit", extra: ["limit": bytes])
+                            let kilobytes = max(0, Int(uploadLimitKB.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0)
+                            let bytes = kilobytes.multipliedReportingOverflow(by: 1024)
+                            let safeBytes = bytes.overflow ? Int.max : bytes.partialValue
+                            runQB("set_upload_limit", extra: ["limit": safeBytes])
                         }
                         TextField("分享率限制（如 2.0，-1 不限制）", text: $ratioLimit).keyboardType(.decimalPad)
                         TextField("做种时间限制（小时）", text: $seedingHours).keyboardType(.decimalPad)
                         Button("设置分享限制") {
                             let ratio = Double(ratioLimit) ?? -2
-                            let seconds = (Double(seedingHours) ?? 0) * 3600
+                            let hours = max(0, Double(seedingHours) ?? 0)
+                            let seconds = hours.isFinite
+                                ? min(hours * 3600, Double(Int.max))
+                                : 0
                             runQB("set_share_limits", extra: ["ratio_limit": ratio, "seeding_time_limit": seconds])
                         }
                     }
@@ -3381,7 +3672,7 @@ struct TorrentDetailSheet: View {
             List {
                 Section("传输") {
                     LabeledContent("状态", value: item.status)
-                    LabeledContent("进度", value: "\(Int(item.progress * 100))%")
+                    LabeledContent("进度", value: "\(clampedInt(normalizedProgress(item.progress) * 100))%")
                     LabeledContent("大小", value: formatBytes(item.size))
                     LabeledContent("分享率", value: String(format: "%.2f", item.ratio))
                     LabeledContent("下载速度", value: formatSpeed(item.downloadSpeed))
@@ -3606,11 +3897,11 @@ private struct TorrentFileTreeLabel: View {
             HStack {
                 Text(node.size > 0 ? formatBytes(node.size) : "未知大小")
                 Spacer()
-                Text("\(Int(node.progress * 100))%")
+                Text("\(clampedInt(normalizedProgress(node.progress) * 100))%")
             }
             .font(.caption2)
             .foregroundStyle(.secondary)
-            ProgressView(value: node.progress)
+            ProgressView(value: normalizedProgress(node.progress))
                 .tint(node.progress >= 1 ? HarvestTheme.green : HarvestTheme.blue)
         }
         .padding(.vertical, 2)
@@ -3871,7 +4162,10 @@ struct AddTorrentSheet: View {
         if let value = Double(ratioLimit) { body["ratio_limit"] = value }
         if let value = Int(seedingTimeLimit) { body["seeding_time_limit"] = value }
         let torrentIDs = urls.compactMap(torrentIDFromInput).uniqued()
-        if torrentIDs.count == 1 { body["ids"] = torrentIDs[0] }
+        if torrentIDs.count == 1 {
+            body["ids"] = torrentIDs[0]
+            body["tid"] = torrentIDs[0]
+        }
         else if !torrentIDs.isEmpty { body["ids"] = torrentIDs }
 
         if isQBittorrent {
@@ -4231,7 +4525,9 @@ struct DownloaderSettingsSheet: View {
 
     @ViewBuilder private func preferenceControl(_ draft: DownloaderPreferenceDraft) -> some View {
         let choices = preferenceChoices(draft.key, transmission: isTransmission)
-        if !choices.isEmpty {
+        if isTransmission && draft.key == "alt-speed-time-day" {
+            TransmissionWeekdaySelector(selection: textBinding(draft.key))
+        } else if !choices.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Picker(preferenceLabel(draft.key), selection: textBinding(draft.key)) {
                     if !choices.contains(where: { $0.value == draft.text }) {
@@ -4329,6 +4625,72 @@ struct DownloaderSettingsSheet: View {
     }
 }
 
+private struct TransmissionWeekdaySelector: View {
+    @Binding var selection: String
+
+    private let days: [(bit: Int, label: String)] = [
+        (2, "周一"), (4, "周二"), (8, "周三"), (16, "周四"),
+        (32, "周五"), (64, "周六"), (1, "周日")
+    ]
+
+    private var value: Int { Int(selection) ?? 0 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("备用限速生效日期").font(.subheadline)
+            HStack(spacing: 8) {
+                presetButton("每天", value: 127)
+                presetButton("工作日", value: 62)
+                presetButton("周末", value: 65)
+            }
+            CompactFlowLayout(spacing: 7) {
+                ForEach(days, id: \.bit) { day in
+                    let selected = value & day.bit != 0
+                    Button { toggle(day.bit) } label: {
+                        Text(day.label)
+                            .font(.caption.weight(selected ? .semibold : .regular))
+                            .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(
+                                selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+                            }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            Text("alt-speed-time-day")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private func presetButton(_ title: String, value preset: Int) -> some View {
+        Button {
+            selection = String(preset)
+        } label: {
+            HStack(spacing: 5) {
+                if value == preset { Image(systemName: "checkmark") }
+                Text(title)
+            }
+            .font(.caption.weight(.medium))
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .tint(value == preset ? HarvestTheme.blue : Color.secondary)
+    }
+
+    private func toggle(_ bit: Int) {
+        let next = (value & bit) == 0 ? (value | bit) : (value & ~bit)
+        selection = String(next)
+    }
+}
+
 private func preferenceChoices(_ key: String, transmission: Bool) -> [DownloaderPreferenceChoice] {
     func choices(_ values: [(String, String)]) -> [DownloaderPreferenceChoice] {
         values.map { DownloaderPreferenceChoice(value: $0.0, title: $0.1) }
@@ -4378,20 +4740,68 @@ private func preferenceChoices(_ key: String, transmission: Bool) -> [Downloader
 private func preferenceSection(_ key: String, transmission: Bool) -> String {
     let value = key.lowercased()
     if transmission {
-        if value.hasPrefix("speed-limit") || value.hasPrefix("alt-speed") { return "带宽设置" }
-        if value.hasPrefix("peer-") || value.contains("port-forward") || value == "tcp-enabled" || value.hasPrefix("dht-") || value.hasPrefix("pex-") || value.hasPrefix("lpd-") || value.hasPrefix("utp-") || value == "encryption" || value.hasPrefix("blocklist-") { return "网络设置" }
+        if hasAnyPrefix(value, ["speed-limit", "alt-speed"]) { return "带宽设置" }
+        if hasAnyPrefix(value, ["peer-", "dht-", "pex-", "lpd-", "utp-", "blocklist-"])
+            || containsAny(value, ["port-forward"])
+            || equalsAny(value, ["tcp-enabled", "encryption"]) {
+            return "网络设置"
+        }
         if value.contains("queue") { return "队列设置" }
-        if value.contains("download-dir") || value.contains("incomplete") || value.contains("partial") || value.contains("seedratio") || value.contains("seeding-limit") || value.contains("start-added") || value.contains("trash-original") || value.contains("cache-size") { return "下载设置" }
+        if containsAny(value, [
+            "download-dir", "incomplete", "partial", "seedratio", "seeding-limit",
+            "start-added", "trash-original", "cache-size"
+        ]) {
+            return "下载设置"
+        }
         return "高级"
     }
     if value.hasPrefix("rss_") { return "RSS" }
-    if value.hasPrefix("web_ui") || value.hasPrefix("bypass_") || value.hasPrefix("alternative_webui") || value.hasPrefix("dyndns_") || value == "use_https" { return "WebUI" }
-    if value.hasPrefix("dl_limit") || value.hasPrefix("up_limit") || value.hasPrefix("alt_dl") || value.hasPrefix("alt_up") || value.hasPrefix("scheduler") || value.hasPrefix("schedule_") || value.hasPrefix("limit_") { return "速度" }
-    if value.hasPrefix("listen_") || value == "upnp" || value.contains("port") || value.hasPrefix("max_connec") || value.hasPrefix("max_uploads") || value.hasPrefix("proxy_") { return "连接" }
-    if value == "dht" || value == "pex" || value == "lsd" || value.contains("encryption") || value.contains("anonymous") || value.contains("queueing") || value.hasPrefix("max_active") || value.hasPrefix("slow_torrent") || value.hasPrefix("max_ratio") || value.hasPrefix("max_seeding") || value.hasPrefix("add_trackers") || value.hasPrefix("embedded_tracker") { return "BitTorrent" }
-    if value.contains("save_path") || value.contains("temp_path") || value.hasPrefix("export_") || value.contains("incomplete") || value.hasPrefix("auto_tmm") || value.contains("category_changed") || value.contains("torrent_changed") || value.contains("preallocate") || value.contains("unwanted") || value.hasPrefix("mail_notification") || value.hasPrefix("autorun") || value.hasPrefix("add_to_top") || value.hasPrefix("add_stopped") { return "下载" }
-    if value.hasPrefix("confirm_") || value.hasPrefix("file_log") || value.contains("performance_warning") || value.contains("status_bar") || value.contains("torrent_content_layout") { return "行为" }
+    if hasAnyPrefix(value, ["web_ui", "bypass_", "alternative_webui", "dyndns_"])
+        || value == "use_https" {
+        return "WebUI"
+    }
+    if hasAnyPrefix(value, [
+        "dl_limit", "up_limit", "alt_dl", "alt_up", "scheduler", "schedule_", "limit_"
+    ]) {
+        return "速度"
+    }
+    if hasAnyPrefix(value, ["listen_", "max_connec", "max_uploads", "proxy_"])
+        || value == "upnp"
+        || value.contains("port") {
+        return "连接"
+    }
+    if equalsAny(value, ["dht", "pex", "lsd"])
+        || containsAny(value, ["encryption", "anonymous", "queueing"])
+        || hasAnyPrefix(value, [
+            "max_active", "slow_torrent", "max_ratio", "max_seeding", "add_trackers", "embedded_tracker"
+        ]) {
+        return "BitTorrent"
+    }
+    if containsAny(value, [
+        "save_path", "temp_path", "incomplete", "category_changed", "torrent_changed",
+        "preallocate", "unwanted"
+    ]) || hasAnyPrefix(value, [
+        "export_", "auto_tmm", "mail_notification", "autorun", "add_to_top", "add_stopped"
+    ]) {
+        return "下载"
+    }
+    if hasAnyPrefix(value, ["confirm_", "file_log"])
+        || containsAny(value, ["performance_warning", "status_bar", "torrent_content_layout"]) {
+        return "行为"
+    }
     return "高级"
+}
+
+private func hasAnyPrefix(_ value: String, _ prefixes: [String]) -> Bool {
+    prefixes.contains { value.hasPrefix($0) }
+}
+
+private func containsAny(_ value: String, _ fragments: [String]) -> Bool {
+    fragments.contains { value.contains($0) }
+}
+
+private func equalsAny(_ value: String, _ candidates: [String]) -> Bool {
+    candidates.contains(value)
 }
 
 private func preferenceLabel(_ key: String) -> String {
@@ -4402,6 +4812,8 @@ private func preferenceLabel(_ key: String) -> String {
         "alt_up_limit": "备用上传速度", "speed-limit-down": "最大下载速度", "speed-limit-up": "最大上传速度",
         "speed-limit-down-enabled": "启用下载限速", "speed-limit-up-enabled": "启用上传限速",
         "alt-speed-down": "备用下载速度", "alt-speed-up": "备用上传速度", "alt-speed-enabled": "启用备用限速",
+        "alt-speed-time-enabled": "启用定时备用限速", "alt-speed-time-begin": "备用限速开始时间",
+        "alt-speed-time-end": "备用限速结束时间", "alt-speed-time-day": "备用限速生效日期",
         "listen_port": "传入连接端口", "peer-port": "连接端口", "max_connec": "全局最大连接数",
         "max_connec_per_torrent": "单种最大连接数", "peer-limit-global": "全局 Peer 上限",
         "peer-limit-per-torrent": "单种 Peer 上限", "dht": "启用 DHT", "dht-enabled": "启用 DHT",

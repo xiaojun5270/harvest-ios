@@ -1,6 +1,7 @@
 import Foundation
 import Security
 import SwiftUI
+import UIKit
 import UserNotifications
 import WebKit
 
@@ -343,6 +344,46 @@ func recordAppLog(_ level: AppLogLevel, _ message: String) {
     Task { await AppLogStore.shared.append(level, message) }
 }
 
+func stableIdentifier(_ values: String...) -> Int {
+    let source = values
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        .joined(separator: "|")
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in source.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 1_099_511_628_211
+    }
+    let identifier = Int(hash & UInt64(Int.max))
+    return identifier == 0 ? 1 : identifier
+}
+
+func copyPrivateText(_ value: String, expiresAfter: TimeInterval = 5 * 60) {
+    guard !value.isEmpty else { return }
+    UIPasteboard.general.setItems(
+        [["public.utf8-plain-text": value]],
+        options: [
+            .localOnly: true,
+            .expirationDate: Date().addingTimeInterval(expiresAfter)
+        ]
+    )
+}
+
+func clampedInt(_ value: Double) -> Int {
+    guard value.isFinite else { return 0 }
+    if value >= Double(Int.max) { return Int.max }
+    if value <= Double(Int.min) { return Int.min }
+    return Int(value)
+}
+
+func clampedInt(_ value: CGFloat) -> Int {
+    clampedInt(Double(value))
+}
+
+func normalizedProgress(_ value: Double) -> Double {
+    guard value.isFinite else { return 0 }
+    return min(max(value, 0), 1)
+}
+
 struct AppSessionCacheRecord: Sendable {
     let payload: Data
     let cachedAt: Date
@@ -354,25 +395,46 @@ private func normalizedCacheKey(_ key: String) -> String {
 
 private func isSensitiveCacheKey(_ key: String) -> Bool {
     let key = normalizedCacheKey(key)
-    if key.contains("password") || key.contains("passwd") || key.contains("secret") || key.contains("token") {
-        return true
-    }
+    if ["pwd", "pass"].contains(key) { return true }
     return [
-        "pwd", "pass", "cookie", "cookies", "passkey", "authkey", "authorization",
-        "localstorage", "apikey", "apisecret", "clientsecret", "credential", "credentials"
-    ].contains(key)
+        "password", "passwd", "secret", "token", "cookie", "passkey", "authkey",
+        "authorization", "localstorage", "apikey", "credential", "rss", "username", "email"
+    ].contains { key.contains($0) }
 }
 
-private func sanitizedCachedURL(_ value: String) -> String {
+private func sanitizedCachedURL(_ value: String, stripPath: Bool = false) -> String {
     guard var components = URLComponents(string: value) else { return value }
+    let originalPath = components.path
     let originalItems = components.queryItems ?? []
     let filteredItems = originalItems.filter { item in
         let name = normalizedCacheKey(item.name)
-        return !name.contains("token")
-            && !name.contains("secret")
-            && !["passkey", "authkey", "apikey", "signature", "credential"].contains(name)
+        return ![
+            "password", "passwd", "secret", "token", "cookie", "passkey", "authkey",
+            "authorization", "apikey", "signature", "credential", "rss", "username", "email"
+        ].contains { name.contains($0) }
     }
-    guard components.user != nil || components.password != nil || filteredItems.count != originalItems.count else {
+    if stripPath {
+        components.path = components.path.isEmpty ? "" : "/"
+    } else if !components.path.isEmpty {
+        var previousSegment = ""
+        components.path = components.path
+            .split(separator: "/", omittingEmptySubsequences: false)
+            .map { rawSegment -> String in
+                let segment = String(rawSegment)
+                let normalized = normalizedCacheKey(segment)
+                let followsSensitiveLabel = ["token", "secret", "passkey", "authkey", "apikey", "credential"]
+                    .contains { previousSegment.contains($0) }
+                let looksLikeCredential = segment.count >= 24
+                    && segment.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+                previousSegment = normalized
+                return followsSensitiveLabel || looksLikeCredential ? "redacted" : segment
+            }
+            .joined(separator: "/")
+    }
+    guard components.user != nil
+            || components.password != nil
+            || filteredItems.count != originalItems.count
+            || components.path != originalPath else {
         return value
     }
     components.user = nil
@@ -401,7 +463,8 @@ private func cacheSafeObject(_ value: Any, keyHint: String? = nil) -> Any {
     if let string = value as? String, let keyHint {
         let key = normalizedCacheKey(keyHint)
         if key.contains("url") || key.contains("link") || key.contains("tracker") || key == "rss" || key == "announce" {
-            return sanitizedCachedURL(string)
+            let stripsCredentialPath = key.contains("tracker") || key.contains("announce") || key.contains("rss")
+            return sanitizedCachedURL(string, stripPath: stripsCredentialPath)
         }
     }
     return value
@@ -461,7 +524,10 @@ actor AppSessionCache {
             try? FileManager.default.removeItem(at: url)
             return nil
         }
-        let safePayload = cacheSafePayload(decodedEnvelope.payload) ?? decodedEnvelope.payload
+        guard let safePayload = cacheSafePayload(decodedEnvelope.payload) else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
         let envelope = Envelope(
             scope: decodedEnvelope.scope,
             name: decodedEnvelope.name,
@@ -476,11 +542,12 @@ actor AppSessionCache {
     func write(scope: String, name: String, payload: Data) {
         sanitizeLegacyCacheIfNeeded()
         guard payload.count <= maximumEntryBytes else { return }
+        guard let safePayload = cacheSafePayload(payload) else { return }
         let envelope = Envelope(
             scope: scope,
             name: name,
             cachedAt: Date(),
-            payload: cacheSafePayload(payload) ?? payload
+            payload: safePayload
         )
         memory[memoryKey(scope: scope, name: name)] = envelope
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -537,9 +604,15 @@ actor AppSessionCache {
         ) else { return }
         for url in urls {
             guard let data = try? Data(contentsOf: url),
-                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data),
-                  let safePayload = cacheSafePayload(envelope.payload),
-                  safePayload != envelope.payload else { continue }
+                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            guard let safePayload = cacheSafePayload(envelope.payload) else {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            guard safePayload != envelope.payload else { continue }
             persist(
                 Envelope(scope: envelope.scope, name: envelope.name, cachedAt: envelope.cachedAt, payload: safePayload),
                 to: url
@@ -1199,6 +1272,7 @@ final class AppState: ObservableObject {
     private(set) var refreshToken: String
     private var lastAutomaticRefresh = Date.distantPast
     private var loginAttemptID: UUID?
+    private var accessTokenRefresh: (id: UUID, task: Task<Void, Error>)?
     private var manualTasks: [UUID: ManualTaskFeedback] = [:]
     private var manualTaskOrder: [UUID] = []
 
@@ -1384,22 +1458,14 @@ final class AppState: ObservableObject {
     }
 
     func clearAllPersistentData() async {
+        accessTokenRefresh?.task.cancel()
+        accessTokenRefresh = nil
         let notificationCenter = UNUserNotificationCenter.current()
         notificationCenter.removeAllDeliveredNotifications()
         notificationCenter.removeAllPendingNotificationRequests()
         try? await notificationCenter.setBadgeCount(0)
 
-        let dataStore = WKWebsiteDataStore.default()
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            dataStore.removeData(
-                ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
-                modifiedSince: .distantPast
-            ) {
-                continuation.resume()
-            }
-        }
-        HTTPCookieStorage.shared.cookies?.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
-        URLCache.shared.removeAllCachedResponses()
+        await clearWebSessionData()
         await RemoteImageDataCache.shared.removeAll()
         await AppLogStore.shared.clear()
         await AppSessionCache.shared.clearAll()
@@ -1513,6 +1579,9 @@ final class AppState: ObservableObject {
             presentedError = "请输入账号和密码"
             return
         }
+
+        accessTokenRefresh?.task.cancel()
+        accessTokenRefresh = nil
 
         let attemptID = UUID()
         loginAttemptID = attemptID
@@ -1628,12 +1697,17 @@ final class AppState: ObservableObject {
     func logout() {
         recordAppLog(.info, "账号已退出登录")
         loginAttemptID = nil
+        accessTokenRefresh?.task.cancel()
+        accessTokenRefresh = nil
         isBusy = false
         manualTaskFeedback = nil
         manualTasks.removeAll()
         manualTaskOrder.removeAll()
         clearSession()
-        Task { await updateUnreadNoticeCount(0) }
+        Task {
+            await clearWebSessionData()
+            await updateUnreadNoticeCount(0)
+        }
     }
 
     func quickLogin(_ record: LoginRecord) async {
@@ -1699,18 +1773,29 @@ final class AppState: ObservableObject {
         timeoutInterval: TimeInterval? = nil,
         retry: Bool = true
     ) async throws -> Any {
+        let requestAccessToken = accessToken
         do {
             let result = try await APIClient.shared.request(
                 baseURL: baseURL,
                 path: path,
                 method: method,
-                token: accessToken,
+                token: requestAccessToken,
                 query: query,
                 body: body,
                 timeoutInterval: timeoutInterval
             )
             return result
         } catch let error as APIError where error.statusCode == 401 && retry && !refreshToken.isEmpty {
+            if !accessToken.isEmpty, accessToken != requestAccessToken {
+                return try await api(
+                    path,
+                    method: method,
+                    query: query,
+                    body: body,
+                    timeoutInterval: timeoutInterval,
+                    retry: false
+                )
+            }
             await AppLogStore.shared.append(.warning, "\(method.rawValue) \(path) 返回 401，正在刷新令牌")
             try await refreshAccessToken()
             return try await api(
@@ -1733,17 +1818,21 @@ final class AppState: ObservableObject {
         parts: [MultipartPart],
         retry: Bool = true
     ) async throws -> Any {
+        let requestAccessToken = accessToken
         do {
             let result = try await APIClient.shared.upload(
                 baseURL: baseURL,
                 path: path,
-                token: accessToken,
+                token: requestAccessToken,
                 fields: fields,
                 parts: parts
             )
             await AppLogStore.shared.append(.info, "POST \(path) 上传完成")
             return result
         } catch let error as APIError where error.statusCode == 401 && retry && !refreshToken.isEmpty {
+            if !accessToken.isEmpty, accessToken != requestAccessToken {
+                return try await upload(path, fields: fields, parts: parts, retry: false)
+            }
             try await refreshAccessToken()
             return try await upload(path, fields: fields, parts: parts, retry: false)
         } catch {
@@ -1759,11 +1848,12 @@ final class AppState: ObservableObject {
         body: [String: Any]? = nil,
         retry: Bool = true
     ) async throws -> (data: Data, fileName: String?) {
+        let requestAccessToken = accessToken
         do {
             let result = try await APIClient.shared.download(
                 baseURL: baseURL,
                 path: path,
-                token: accessToken,
+                token: requestAccessToken,
                 query: query,
                 method: method,
                 body: body
@@ -1771,6 +1861,9 @@ final class AppState: ObservableObject {
             await AppLogStore.shared.append(.info, "\(method.rawValue) \(path) 下载完成")
             return result
         } catch let error as APIError where error.statusCode == 401 && retry && !refreshToken.isEmpty {
+            if !accessToken.isEmpty, accessToken != requestAccessToken {
+                return try await download(path, query: query, method: method, body: body, retry: false)
+            }
             try await refreshAccessToken()
             return try await download(path, query: query, method: method, body: body, retry: false)
         } catch {
@@ -2006,29 +2099,55 @@ final class AppState: ObservableObject {
     }
 
     private func refreshAccessToken() async throws {
+        if let accessTokenRefresh {
+            try await accessTokenRefresh.task.value
+            return
+        }
         guard !refreshToken.isEmpty else { throw APIError(statusCode: 401, message: "登录已过期") }
-        let raw = try await APIClient.shared.request(
-            baseURL: baseURL,
-            path: APIPath.tokenRefresh,
-            method: .post,
-            body: ["refresh": refreshToken]
-        )
-        if let businessError = jsonBusinessError(raw, fallback: "登录已过期") {
-            throw businessError
+
+        let refreshID = UUID()
+        let expectedBaseURL = baseURL
+        let expectedRefreshToken = refreshToken
+        let task = Task { [weak self] in
+            let raw = try await APIClient.shared.request(
+                baseURL: expectedBaseURL,
+                path: APIPath.tokenRefresh,
+                method: .post,
+                body: ["refresh": expectedRefreshToken]
+            )
+            try Task.checkCancellation()
+            if let businessError = jsonBusinessError(raw, fallback: "登录已过期") {
+                throw businessError
+            }
+            guard let tokens = jsonAuthTokenDictionary(raw),
+                  let next = tokens.string("access", "access_token", "accessToken", "token") else {
+                throw APIError(statusCode: 401, message: "登录已过期")
+            }
+            guard let self,
+                  self.baseURL == expectedBaseURL,
+                  self.refreshToken == expectedRefreshToken else {
+                throw CancellationError()
+            }
+            self.accessToken = next
+            KeychainStore.set(next, for: "accessToken")
+            if let nextRefresh = tokens.string("refresh", "refresh_token", "refreshToken") {
+                self.refreshToken = nextRefresh
+                KeychainStore.set(nextRefresh, for: "refreshToken")
+            }
         }
-        guard let tokens = jsonAuthTokenDictionary(raw),
-              let next = tokens.string("access", "access_token", "accessToken", "token") else {
-            throw APIError(statusCode: 401, message: "登录已过期")
-        }
-        accessToken = next
-        KeychainStore.set(next, for: "accessToken")
-        if let nextRefresh = tokens.string("refresh", "refresh_token", "refreshToken") {
-            refreshToken = nextRefresh
-            KeychainStore.set(nextRefresh, for: "refreshToken")
+        accessTokenRefresh = (refreshID, task)
+        do {
+            try await task.value
+            if accessTokenRefresh?.id == refreshID { accessTokenRefresh = nil }
+        } catch {
+            if accessTokenRefresh?.id == refreshID { accessTokenRefresh = nil }
+            throw error
         }
     }
 
     private func clearSession() {
+        accessTokenRefresh?.task.cancel()
+        accessTokenRefresh = nil
         accessToken = ""
         refreshToken = ""
         profile = nil
@@ -2039,6 +2158,20 @@ final class AppState: ObservableObject {
         KeychainStore.delete("accessToken")
         KeychainStore.delete("refreshToken")
         Task { _ = try? await UNUserNotificationCenter.current().setBadgeCount(0) }
+    }
+
+    private func clearWebSessionData() async {
+        let dataStore = WKWebsiteDataStore.default()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            dataStore.removeData(
+                ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                modifiedSince: .distantPast
+            ) {
+                continuation.resume()
+            }
+        }
+        HTTPCookieStorage.shared.cookies?.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
+        URLCache.shared.removeAllCachedResponses()
     }
 
     private func normalizeServer(_ value: String) -> String {
@@ -2226,9 +2359,16 @@ extension Dictionary where Key == String, Value == Any {
 
     func double(_ keys: String...) -> Double? {
         for key in keys {
-            if let value = self[key] as? Double { return value }
-            if let value = self[key] as? NSNumber { return value.doubleValue }
-            if let value = self[key] as? String, let number = Double(value) { return number }
+            if let value = self[key] as? Double, value.isFinite { return value }
+            if let value = self[key] as? NSNumber {
+                let number = value.doubleValue
+                if number.isFinite { return number }
+            }
+            if let value = self[key] as? String,
+               let number = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+               number.isFinite {
+                return number
+            }
         }
         return nil
     }
@@ -2278,7 +2418,8 @@ func formatBytes(_ bytes: Double) -> String {
     formatter.countStyle = .binary
     formatter.allowedUnits = [.useKB, .useMB, .useGB, .useTB, .usePB]
     formatter.includesUnit = true
-    return formatter.string(fromByteCount: Int64(max(0, bytes)))
+    let byteCount = bytes >= Double(Int64.max) ? Int64.max : Int64(max(0, bytes))
+    return formatter.string(fromByteCount: byteCount)
 }
 
 func formatSpeed(_ bytes: Double) -> String {

@@ -20,9 +20,18 @@ struct TaskItem: Identifiable {
     var raw: [String: Any]
 
     init(_ json: [String: Any]) {
-        id = json.int("id", "task_id") ?? abs((json.string("name") ?? UUID().uuidString).hashValue)
-        name = json.string("name", "task_name", "title") ?? "计划任务"
-        taskType = json.string("task", "type", "task_type", "kind") ?? "自动化"
+        let resolvedName = json.string("name", "task_name", "title") ?? "计划任务"
+        let resolvedType = json.string("task", "type", "task_type", "kind") ?? "自动化"
+        let resolvedArguments = json.string("args") ?? "[]"
+        let resolvedKeywordArguments = json.string("kwargs") ?? "{}"
+        id = json.int("id", "task_id") ?? stableIdentifier(
+            resolvedName,
+            resolvedType,
+            resolvedArguments,
+            resolvedKeywordArguments
+        )
+        name = resolvedName
+        taskType = resolvedType
         description = json.string("description", "detail") ?? ""
         enabled = json.bool("enable", "enabled", "is_active") ?? true
         let crontab = json.dict("crontab")
@@ -43,8 +52,8 @@ struct TaskItem: Identifiable {
             ? [cronMinute, cronHour, cronDayOfMonth, cronMonthOfYear, cronDayOfWeek].joined(separator: " ")
             : expression
         crontabID = json.int("crontab_id", "crontabId") ?? crontab?.int("id") ?? 0
-        args = json.string("args") ?? "[]"
-        kwargs = json.string("kwargs") ?? "{}"
+        args = resolvedArguments
+        kwargs = resolvedKeywordArguments
         raw = json
     }
 }
@@ -62,16 +71,32 @@ struct TaskResultItem: Identifiable {
     init(_ json: [String: Any]) {
         let taskID = json.string("task_id", "taskId", "celery_task_id", "celeryTaskId", "uuid") ?? ""
         let resultID = json.string("id", "result_id", "resultId") ?? ""
-        self.id = resultID.isEmpty ? (taskID.isEmpty ? UUID().uuidString : taskID) : resultID
+        let resolvedName = json.string("name", "task_name", "taskName", "task") ?? "未命名任务"
+        let resolvedCreatedAt = json.string(
+            "created_at", "createdAt", "date_created", "dateCreated",
+            "started_at", "startedAt", "timestamp"
+        ) ?? ""
+        if !resultID.isEmpty {
+            self.id = resultID
+        } else if !taskID.isEmpty {
+            self.id = taskID
+        } else {
+            self.id = "fallback-\(stableIdentifier(
+                resolvedName,
+                resolvedCreatedAt,
+                json.string("args") ?? "",
+                json.string("kwargs") ?? ""
+            ))"
+        }
         self.taskID = taskID.isEmpty ? self.id : taskID
-        name = json.string("name", "task_name", "taskName", "task") ?? "未命名任务"
+        name = resolvedName
         status = json.string("status", "state", "result_status", "resultStatus") ?? "UNKNOWN"
         if let value = json["summary"] ?? json["message"] ?? json["result"] ?? json["retval"] ?? json["traceback"] ?? json["error"] {
             summary = (value as? String) ?? prettyJSON(value)
         } else {
             summary = ""
         }
-        createdAt = json.string("created_at", "createdAt", "date_created", "dateCreated", "started_at", "startedAt", "timestamp") ?? ""
+        createdAt = resolvedCreatedAt
         finishedAt = json.string("updated_at", "updatedAt", "date_done", "dateDone", "finished_at", "finishedAt", "completed_at", "completedAt") ?? ""
         raw = json
     }
@@ -444,7 +469,14 @@ struct TaskRow: View {
             )
             VStack(alignment: .leading, spacing: 5) { Text(item.name).font(.headline); Text(item.taskType).font(.caption).foregroundStyle(.secondary); Text(item.schedule).font(.caption2).foregroundStyle(.tertiary) }
             Spacer()
-            Button(action: run) { Image(systemName: "play.fill").frame(width: 34, height: 34).background(HarvestTheme.green.opacity(0.12), in: Circle()).foregroundStyle(HarvestTheme.green) }.buttonStyle(.plain).accessibilityLabel("立即执行")
+            Button(action: run) {
+                Image(systemName: "play.fill")
+                    .frame(width: 34, height: 34)
+                    .background(HarvestTheme.green.opacity(0.12), in: Circle())
+                    .foregroundStyle(HarvestTheme.green)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("立即执行")
         }.padding(.vertical, 4)
     }
 }
@@ -587,7 +619,15 @@ struct TaskEditorSheet: View {
                 if let validationError { Section { Label(validationError, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(HarvestTheme.coral) } }
             }
             .navigationTitle(task == nil ? "新建任务" : "编辑任务").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("保存") { Task { await save() } }.disabled(name.isEmpty || type.isEmpty || minute.isEmpty || hour.isEmpty) } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { Task { await save() } }
+                        .disabled(name.isEmpty || type.isEmpty || minute.isEmpty || hour.isEmpty)
+                }
+            }
             .onAppear { if type.isEmpty { type = taskTypes.first ?? "" } }
             .task(id: type) { if isTorrentMoveTask { await loadDownloaders() } }
         }
@@ -698,7 +738,10 @@ struct TaskEditorSheet: View {
         do {
             let raw = try await appState.api(APIPath.downloaderPreferences + "\(downloader.id)", query: ["with_status": true])
             return nestedDownloadPath(jsonPayloadDictionary(raw) ?? [:]) ?? ""
-        } catch { return "" }
+        } catch {
+            recordAppLog(.warning, "读取 \(downloader.name) 默认路径失败：\(error.localizedDescription)")
+            return ""
+        }
     }
 
     private func nestedDownloadPath(_ dictionary: [String: Any]) -> String? {
@@ -788,6 +831,7 @@ struct TaskResultDetailSheet: View {
             loadedResult = TaskResultItem(merged)
         } catch {
             // The list response remains a usable fallback, matching the Flutter detail flow.
+            recordAppLog(.warning, "读取任务执行详情失败：\(error.localizedDescription)")
         }
     }
 }
@@ -830,6 +874,25 @@ private func mediaImageValue(_ content: [String: Any]) -> String {
         if let value = mediaStringValue(content[key]) { return value }
     }
     return ""
+}
+
+private func mediaBackdropValue(_ content: [String: Any]) -> String {
+    for key in [
+        "backdrop_path", "backdrop_url", "backdropUrl", "backdrop",
+        "background_url", "backgroundUrl", "background", "still_path", "photos"
+    ] {
+        if let value = mediaStringValue(content[key]) { return value }
+    }
+    return ""
+}
+
+private func mediaTypeLabel(_ value: String) -> String {
+    switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "movie", "film": return "电影"
+    case "tv", "series", "show": return "剧集"
+    case "person", "people": return "人物"
+    default: return value
+    }
 }
 
 private func isNumericMediaID(_ value: String) -> Bool {
@@ -932,6 +995,7 @@ struct MediaItem: Identifiable {
     var subtitle: String
     var overview: String
     var poster: String
+    var backdrop: String
     var score: Double
     var year: String
     var source: String
@@ -950,8 +1014,17 @@ struct MediaItem: Identifiable {
         let normalizedRemoteID = isDoubanSource(source)
             ? rawRemoteID.flatMap(doubanSubjectID)
             : rawRemoteID
-        remoteID = normalizedRemoteID ?? rawRemoteID ?? UUID().uuidString
         let resolvedType = mediaType.isEmpty ? (json.string("media_type", "target_type", "targetType") ?? content.string("media_type") ?? "") : mediaType
+        let fallbackTitle = content.string("title", "name", "original_title")
+            ?? json.string("title", "name", "original_title")
+            ?? ""
+        let fallbackYear = content.string("release_date", "first_air_date", "year")
+            ?? json.string("release_date", "first_air_date", "year")
+            ?? ""
+        let fallbackImage = mediaImageValue(content).isEmpty ? mediaImageValue(json) : mediaImageValue(content)
+        remoteID = normalizedRemoteID
+            ?? rawRemoteID
+            ?? "fallback-\(stableIdentifier(source, resolvedType, fallbackTitle, fallbackYear, fallbackImage))"
         id = "\(source):\(resolvedType):\(remoteID)"
         title = content.string("title", "name", "original_title")
             ?? json.string("title", "name", "original_title")
@@ -966,6 +1039,11 @@ struct MediaItem: Identifiable {
             ?? ""
         let imageValue = mediaImageValue(content)
         poster = mediaPosterURL(imageValue.isEmpty ? mediaImageValue(json) : imageValue, source: source)
+        let backdropValue = mediaBackdropValue(content)
+        backdrop = mediaBackdropURL(
+            backdropValue.isEmpty ? mediaBackdropValue(json) : backdropValue,
+            source: source
+        )
         score = content.double("vote_average", "score", "rate", "rating_num", "rating")
             ?? json.double("vote_average", "score", "rate", "rating_num", "rating")
             ?? content.dict("rating")?.double("value", "star_count")
@@ -1001,6 +1079,28 @@ private func mediaPosterURL(_ value: String, source: String) -> String {
     return normalized
 }
 
+private func mediaBackdropURL(_ value: String, source: String) -> String {
+    var normalized = normalizedRemoteImageURL(value)
+    guard !normalized.isEmpty else { return "" }
+    if source == "TMDB" {
+        if normalized.hasPrefix("/") {
+            normalized = "https://image.tmdb.org/t/p/w780\(normalized)"
+        } else if normalized.lowercased().contains("image.tmdb.org/t/p/") {
+            for size in ["original", "w342", "w500", "w1280"] {
+                normalized = normalized.replacingOccurrences(
+                    of: "/t/p/\(size)/",
+                    with: "/t/p/w780/",
+                    options: [.caseInsensitive]
+                )
+            }
+        }
+    }
+    if isDoubanSource(source), normalized.hasPrefix("/") {
+        normalized = "https://movie.douban.com\(normalized)"
+    }
+    return normalized
+}
+
 enum ResourceSearchSortField: String, CaseIterable, Identifiable {
     case title = "标题"
     case subtitle = "副标题"
@@ -1010,6 +1110,21 @@ enum ResourceSearchSortField: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     var defaultAscending: Bool { self == .title || self == .subtitle }
+}
+
+fileprivate struct ResourceSearchListItem: Identifiable {
+    let id: String
+    let value: [String: Any]
+}
+
+private func resourceHasHRValue(_ item: [String: Any]) -> Bool {
+    if let value = item.bool("hr", "is_hr", "isHR") { return value }
+    let value = item.string("hr", "is_hr", "isHR")?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased() ?? ""
+    guard !value.isEmpty else { return false }
+    if let number = Double(value), number.isFinite { return number > 0 }
+    return !["false", "no", "none", "null", "nil", "无", "否", "-", "--"].contains(value)
 }
 
 @MainActor
@@ -1059,10 +1174,35 @@ final class SearchViewModel: ObservableObject {
         maxCount = defaults.object(forKey: "search.maxCount") == nil ? 5 : defaults.integer(forKey: "search.maxCount")
         sitesEnabled = defaults.object(forKey: "search.sitesEnabled") == nil ? true : defaults.bool(forKey: "search.sitesEnabled")
         selectedSiteIDs = Set((defaults.stringArray(forKey: "search.siteIDs") ?? []).compactMap(Int.init))
+        resourceSortField = ResourceSearchSortField(
+            rawValue: defaults.string(forKey: "search.resource.sortField") ?? ""
+        ) ?? .seeders
+        resourceSortAscending = defaults.object(forKey: "search.resource.sortAscending") == nil
+            ? resourceSortField.defaultAscending
+            : defaults.bool(forKey: "search.resource.sortAscending")
+        resourceFilterSites = Set(defaults.stringArray(forKey: "search.resource.filter.sites") ?? [])
+        resourceFilterSales = Set(defaults.stringArray(forKey: "search.resource.filter.sales") ?? [])
+        resourceFilterCategories = Set(defaults.stringArray(forKey: "search.resource.filter.categories") ?? [])
+        resourceFilterResolutions = Set(defaults.stringArray(forKey: "search.resource.filter.resolutions") ?? [])
+        resourceFilterTags = Set(defaults.stringArray(forKey: "search.resource.filter.tags") ?? [])
+        resourceFilterSeasons = Set(defaults.stringArray(forKey: "search.resource.filter.seasons") ?? [])
+        resourceFilterEpisodes = Set(defaults.stringArray(forKey: "search.resource.filter.episodes") ?? [])
+        resourceFilterExcludeHR = defaults.bool(forKey: "search.resource.filter.excludeHR")
+        resourceFilterSizeEnabled = defaults.bool(forKey: "search.resource.filter.sizeEnabled")
+        if defaults.object(forKey: "search.resource.filter.minSizeGB") != nil {
+            resourceFilterMinSizeGB = defaults.double(forKey: "search.resource.filter.minSizeGB")
+        }
+        if defaults.object(forKey: "search.resource.filter.maxSizeGB") != nil {
+            resourceFilterMaxSizeGB = defaults.double(forKey: "search.resource.filter.maxSizeGB")
+        }
     }
 
     var displayedResources: [[String: Any]] {
         resources.filter(matchesResourceFilters).sorted(by: resourceComesBefore)
+    }
+
+    fileprivate var displayedResourceItems: [ResourceSearchListItem] {
+        displayedResources.map { ResourceSearchListItem(id: resourceIdentifier($0), value: $0) }
     }
 
     var resourceSites: [String] {
@@ -1119,7 +1259,6 @@ final class SearchViewModel: ObservableObject {
             media = []
         } else {
             resources = []
-            resetResourceFilters()
         }
         defer {
             if searchGeneration == generation { isLoading = false }
@@ -1255,7 +1394,6 @@ final class SearchViewModel: ObservableObject {
             media = []
             resources = []
             statusMessage = ""
-            resetResourceFilters()
         } else if wasLoading {
             statusMessage = "搜索已停止"
         }
@@ -1309,10 +1447,11 @@ final class SearchViewModel: ObservableObject {
                     if $0.sortID != $1.sortID { return $0.sortID < $1.sortID }
                     return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 }
-            let available = Set(sites.map(\.id))
-            selectedSiteIDs = selectedSiteIDs.intersection(available)
         } catch {
-            sites = []
+            recordAppLog(.warning, "加载资源搜索站点失败：\(error.localizedDescription)")
+            if mode == "资源", sites.isEmpty {
+                statusMessage = "站点列表加载失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -1321,6 +1460,23 @@ final class SearchViewModel: ObservableObject {
         defaults.set(maxCount, forKey: "search.maxCount")
         defaults.set(sitesEnabled, forKey: "search.sitesEnabled")
         defaults.set(selectedSiteIDs.sorted().map { String($0) }, forKey: "search.siteIDs")
+    }
+
+    func saveResourcePreferences() {
+        let defaults = UserDefaults.standard
+        defaults.set(resourceSortField.rawValue, forKey: "search.resource.sortField")
+        defaults.set(resourceSortAscending, forKey: "search.resource.sortAscending")
+        defaults.set(resourceFilterSites.sorted(), forKey: "search.resource.filter.sites")
+        defaults.set(resourceFilterSales.sorted(), forKey: "search.resource.filter.sales")
+        defaults.set(resourceFilterCategories.sorted(), forKey: "search.resource.filter.categories")
+        defaults.set(resourceFilterResolutions.sorted(), forKey: "search.resource.filter.resolutions")
+        defaults.set(resourceFilterTags.sorted(), forKey: "search.resource.filter.tags")
+        defaults.set(resourceFilterSeasons.sorted(), forKey: "search.resource.filter.seasons")
+        defaults.set(resourceFilterEpisodes.sorted(), forKey: "search.resource.filter.episodes")
+        defaults.set(resourceFilterExcludeHR, forKey: "search.resource.filter.excludeHR")
+        defaults.set(resourceFilterSizeEnabled, forKey: "search.resource.filter.sizeEnabled")
+        defaults.set(resourceFilterMinSizeGB, forKey: "search.resource.filter.minSizeGB")
+        defaults.set(resourceFilterMaxSizeGB, forKey: "search.resource.filter.maxSizeGB")
     }
 
     func resetLocalSettings() {
@@ -1333,6 +1489,8 @@ final class SearchViewModel: ObservableObject {
         resourceSortField = .seeders
         resourceSortAscending = false
         resetResourceFilters()
+        clearHistory()
+        saveSettings()
     }
 
     func addHistory(_ keyword: String) {
@@ -1361,6 +1519,12 @@ final class SearchViewModel: ObservableObject {
             resourceSortField = field
             resourceSortAscending = field.defaultAscending
         }
+        saveResourcePreferences()
+    }
+
+    func toggleResourceSortDirection() {
+        resourceSortAscending.toggle()
+        saveResourcePreferences()
     }
 
     func resetResourceFilters() {
@@ -1375,6 +1539,7 @@ final class SearchViewModel: ObservableObject {
         resourceFilterSizeEnabled = false
         resourceFilterMinSizeGB = 0
         resourceFilterMaxSizeGB = 100
+        saveResourcePreferences()
     }
 
     func siteLabel(_ value: String) -> String {
@@ -1415,8 +1580,8 @@ final class SearchViewModel: ObservableObject {
             .filter { !$0.isEmpty }
     }
 
-    func resourceIsHRSafe(_ item: [String: Any]) -> Bool {
-        item.bool("hr") ?? false
+    func resourceHasHR(_ item: [String: Any]) -> Bool {
+        resourceHasHRValue(item)
     }
 
     func resourceSeeders(_ item: [String: Any]) -> Int {
@@ -1432,14 +1597,19 @@ final class SearchViewModel: ObservableObject {
     }
 
     func resourceSize(_ item: [String: Any]) -> Double {
-        if let value = item.double("size", "length", "size_bytes", "sizeBytes") { return value }
+        if let value = item.double("size", "length", "size_bytes", "sizeBytes") {
+            return value > 0 ? value : 0
+        }
         let text = item.string("size", "length")?.uppercased() ?? ""
         let number = Double(text.components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted).joined()) ?? 0
-        if text.contains("T") { return number * 1_099_511_627_776 }
-        if text.contains("G") { return number * 1_073_741_824 }
-        if text.contains("M") { return number * 1_048_576 }
-        if text.contains("K") { return number * 1024 }
-        return number
+        let multiplier: Double
+        if text.contains("T") { multiplier = 1_099_511_627_776 }
+        else if text.contains("G") { multiplier = 1_073_741_824 }
+        else if text.contains("M") { multiplier = 1_048_576 }
+        else if text.contains("K") { multiplier = 1024 }
+        else { multiplier = 1 }
+        let result = number * multiplier
+        return result.isFinite && result > 0 ? result : 0
     }
 
     func resourcePublished(_ item: [String: Any]) -> String {
@@ -1486,7 +1656,7 @@ final class SearchViewModel: ObservableObject {
         if !resourceFilterTags.isEmpty && Set(resourceTagValues(item)).isDisjoint(with: resourceFilterTags) { return false }
         if !resourceFilterSeasons.isEmpty && Set(resourceSeasonValues(item)).isDisjoint(with: resourceFilterSeasons) { return false }
         if !resourceFilterEpisodes.isEmpty && Set(resourceEpisodeValues(item)).isDisjoint(with: resourceFilterEpisodes) { return false }
-        if resourceFilterExcludeHR && !resourceIsHRSafe(item) { return false }
+        if resourceFilterExcludeHR && resourceHasHR(item) { return false }
         if resourceFilterSizeEnabled {
             let bytes = resourceSize(item)
             guard bytes > 0 else { return false }
@@ -1537,7 +1707,7 @@ final class SearchViewModel: ObservableObject {
 
     private func resourceDateValue(_ value: String) -> TimeInterval? {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let number = Double(text) {
+        if let number = Double(text), number.isFinite {
             return number > 10_000_000_000 ? number / 1000 : number
         }
         return parseDate(text)?.timeIntervalSince1970
@@ -1561,7 +1731,7 @@ final class SearchViewModel: ObservableObject {
         }
     }
 
-    private func resourceIdentifier(_ item: [String: Any]) -> String {
+    func resourceIdentifier(_ item: [String: Any]) -> String {
         let parts = [
             resourceSiteValue(item),
             item.string("id", "torrent_id", "torrentId", "tid", "hash", "info_hash", "infoHash") ?? "",
@@ -1625,6 +1795,7 @@ struct SearchView: View {
     @State private var pendingResourcePush: ResourcePushSelection?
     @State private var resourcePushSelection: ResourcePushSelection?
     @State private var showSettings = false
+    @State private var showResourceFilters = false
     @State private var activeSearchTask: Task<Void, Never>?
     @FocusState private var searchFieldFocused: Bool
     let onClose: () -> Void
@@ -1718,7 +1889,30 @@ struct SearchView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 14)
 
+            if model.mode == "资源" {
+                resourceToolbar
+            }
+
             Divider().opacity(0.45)
+
+            if !currentResultsAreEmpty, !model.statusMessage.isEmpty {
+                HStack(spacing: 8) {
+                    if model.isLoading {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: searchStatusIsWarning ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(searchStatusIsWarning ? HarvestTheme.amber : HarvestTheme.green)
+                    }
+                    Text(model.statusMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color(uiColor: .secondarySystemBackground))
+            }
 
             if model.isLoading && currentResultsAreEmpty {
                 VStack(spacing: 12) {
@@ -1729,15 +1923,20 @@ struct SearchView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if currentResultsAreEmpty {
-                VStack(spacing: 18) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 64, weight: .ultraLight))
-                        .foregroundStyle(Color.secondary.opacity(0.22))
-                    Text(emptyMessage)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                if model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !model.history.isEmpty {
+                    searchHistoryView
+                } else {
+                    VStack(spacing: 18) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 64, weight: .ultraLight))
+                            .foregroundStyle(Color.secondary.opacity(0.22))
+                        Text(emptyMessage)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List {
                     if model.mode == "影视" {
@@ -1746,9 +1945,12 @@ struct SearchView: View {
                                 .buttonStyle(.plain)
                         }
                     } else {
-                        ForEach(Array(model.displayedResources.enumerated()), id: \.offset) { _, item in
-                            Button { selectedResource = ResourceSelection(value: item) } label: {
-                                ResourceRowItem(item: item, siteLabel: model.siteLabel(model.resourceSiteValue(item)))
+                        ForEach(model.displayedResourceItems) { item in
+                            Button { selectedResource = ResourceSelection(value: item.value) } label: {
+                                ResourceRowItem(
+                                    item: item.value,
+                                    siteLabel: model.siteLabel(model.resourceSiteValue(item.value))
+                                )
                             }
                                 .buttonStyle(.plain)
                         }
@@ -1776,6 +1978,10 @@ struct SearchView: View {
             }
             .presentationDetents([.large])
         }
+        .sheet(isPresented: $showResourceFilters) {
+            ResourceFilterSheet(model: model)
+                .presentationDetents([.large])
+        }
         .task { await model.loadSites(appState); consumePendingResourceSearch() }
         .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
         .onChange(of: model.query) { _, value in
@@ -1796,6 +2002,90 @@ struct SearchView: View {
         model.mode == "影视" ? "搜索电影、剧集..." : "搜索种子资源..."
     }
 
+    private var resourceToolbar: some View {
+        HStack(spacing: 10) {
+            Button { showResourceFilters = true } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "line.3.horizontal.decrease")
+                    Text(model.resourceFilterCount == 0 ? "筛选" : "筛选 \(model.resourceFilterCount)")
+                }
+            }
+            .buttonStyle(.bordered)
+            .tint(model.resourceFilterCount == 0 ? Color.secondary : HarvestTheme.blue)
+
+            Menu {
+                ForEach(ResourceSearchSortField.allCases) { field in
+                    Button { model.selectResourceSort(field) } label: {
+                        Label(
+                            field.rawValue,
+                            systemImage: model.resourceSortField == field ? "checkmark" : "arrow.up.arrow.down"
+                        )
+                    }
+                }
+            } label: {
+                Label(model.resourceSortField.rawValue, systemImage: "arrow.up.arrow.down")
+            }
+            .buttonStyle(.bordered)
+
+            Button { model.toggleResourceSortDirection() } label: {
+                Image(systemName: model.resourceSortAscending ? "arrow.up" : "arrow.down")
+                    .frame(width: 20)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityLabel(model.resourceSortAscending ? "升序" : "降序")
+
+            Spacer(minLength: 0)
+            if !model.resources.isEmpty {
+                Text("\(model.displayedResources.count)/\(model.resources.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.subheadline.weight(.medium))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 12)
+    }
+
+    private var searchHistoryView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                HStack {
+                    Text("最近搜索").font(.headline)
+                    Spacer()
+                    Button { model.clearHistory() } label: {
+                        Image(systemName: "trash")
+                    }
+                    .accessibilityLabel("清空搜索历史")
+                }
+                .padding(.bottom, 8)
+
+                ForEach(model.history.prefix(20), id: \.self) { keyword in
+                    Button {
+                        model.query = keyword
+                        startSearch()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "clock.arrow.circlepath")
+                                .foregroundStyle(.secondary)
+                            Text(keyword)
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Spacer()
+                            Image(systemName: "arrow.up.left")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Divider()
+                }
+            }
+            .padding(16)
+        }
+    }
+
     private func presentPendingResourcePush() {
         guard let pendingResourcePush else { return }
         self.pendingResourcePush = nil
@@ -1803,12 +2093,21 @@ struct SearchView: View {
     }
 
     private var currentResultsAreEmpty: Bool {
-        model.mode == "影视" ? model.media.isEmpty : model.resources.isEmpty
+        model.mode == "影视" ? model.media.isEmpty : model.displayedResources.isEmpty
+    }
+
+    private var searchStatusIsWarning: Bool {
+        let value = model.statusMessage.lowercased()
+        return value.contains("失败") || value.contains("不可用") || value.contains("未完成")
+            || value.contains("error")
     }
 
     private var emptyMessage: String {
         if !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !model.statusMessage.isEmpty {
+            if model.mode == "资源", !model.resources.isEmpty, model.displayedResources.isEmpty {
+                return "当前筛选条件没有匹配资源"
+            }
             return model.statusMessage
         }
         return model.mode == "影视" ? "输入影视名称开始搜索" : "输入资源关键词开始搜索"
@@ -1877,9 +2176,15 @@ struct ResourceFilterSheet: View {
                     Button("清除") { model.resetResourceFilters() }
                         .disabled(model.resourceFilterCount == 0)
                 }
-                ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") {
+                        model.saveResourcePreferences()
+                        dismiss()
+                    }
+                }
             }
         }
+        .onDisappear { model.saveResourcePreferences() }
     }
 
     private var sizeRangeLabel: String {
@@ -2156,8 +2461,26 @@ struct MediaRow: View {
             }
             .frame(width: 62, height: 88)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 6) { Text(item.title).font(.headline); if !item.subtitle.isEmpty { Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }; Text(item.overview).font(.caption).foregroundStyle(.secondary).lineLimit(2); HStack { if item.score > 0 { Label(String(format: "%.1f", item.score), systemImage: "star.fill").foregroundStyle(HarvestTheme.amber) }; if !item.year.isEmpty { Text(item.year) }; Text(item.source).foregroundStyle(HarvestTheme.green) }.font(.caption2) }
-        }.padding(.vertical, 5)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(item.title).font(.headline)
+                if !item.subtitle.isEmpty {
+                    Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Text(item.overview).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                HStack(spacing: 7) {
+                    if item.score > 0 {
+                        Label(String(format: "%.1f", item.score), systemImage: "star.fill")
+                            .foregroundStyle(HarvestTheme.amber)
+                    }
+                    if !item.year.isEmpty { Text(item.year) }
+                    let typeLabel = mediaTypeLabel(item.mediaType)
+                    if !typeLabel.isEmpty { Text(typeLabel).foregroundStyle(HarvestTheme.blue) }
+                    Text(item.source).foregroundStyle(HarvestTheme.green)
+                }
+                .font(.caption2)
+            }
+        }
+        .padding(.vertical, 5)
     }
 }
 
@@ -2211,7 +2534,7 @@ struct ResourceRowItem: View {
         if let category = item.string("category", "category_name"), !category.isEmpty, category != "无分类" { values.append(category) }
         let sale = item.string("sale_status", "saleStatus", "promotion") ?? ""
         if !sale.isEmpty, sale != "无优惠" { values.append(sale) }
-        if !(item.bool("hr") ?? false) { values.append("HR") }
+        if resourceHasHRValue(item) { values.append("HR") }
         if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty { values.append(published) }
         return values
     }
@@ -2228,6 +2551,20 @@ struct MediaDetailSheet: View {
         NavigationStack {
             List {
                 Section {
+                    if !backdrop.isEmpty {
+                        CachedRemoteImage(
+                            url: URL(string: backdrop),
+                            headers: imageHeaders
+                        ) { image in
+                            image.resizable().scaledToFill()
+                        } placeholder: {
+                            Color.secondary.opacity(0.10)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 168)
+                        .clipped()
+                        .listRowInsets(EdgeInsets())
+                    }
                     HStack(alignment: .top, spacing: 14) {
                         CachedRemoteImage(
                             url: URL(string: poster),
@@ -2254,6 +2591,9 @@ struct MediaDetailSheet: View {
                                     Text(ratingUnavailableReason).foregroundStyle(.secondary)
                                 }
                                 if !year.isEmpty { Text(year) }
+                                if !mediaTypeName.isEmpty {
+                                    Text(mediaTypeName).foregroundStyle(HarvestTheme.blue)
+                                }
                                 Text(item.source).foregroundStyle(HarvestTheme.green)
                             }
                             .font(.caption)
@@ -2383,6 +2723,11 @@ struct MediaDetailSheet: View {
         let value = mediaImageValue(resolved)
         return mediaPosterURL(value.isEmpty ? item.poster : value, source: item.source)
     }
+    private var backdrop: String {
+        let value = mediaBackdropValue(resolved)
+        return mediaBackdropURL(value.isEmpty ? item.backdrop : value, source: item.source)
+    }
+    private var mediaTypeName: String { mediaTypeLabel(item.mediaType) }
     private var score: Double { resolved.double("vote_average", "score") ?? resolved.dict("rating")?.double("value") ?? item.score }
     private var ratingCount: Int { resolved.int("vote_count") ?? resolved.dict("rating")?.int("count") ?? 0 }
     private var ratingUnavailableReason: String { resolved.string("null_rating_reason") ?? "" }
@@ -2578,6 +2923,12 @@ private struct MediaTrailerCard: View {
     }
 }
 
+private struct ResourcePushCategory: Identifiable {
+    let name: String
+    let savePath: String
+    var id: String { name }
+}
+
 struct ResourcePushSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -2593,6 +2944,8 @@ struct ResourcePushSheet: View {
     @State private var generateTorrentURL: Bool
     @State private var category: String
     @State private var tags: String
+    @State private var availableCategories: [ResourcePushCategory] = []
+    @State private var availableTags: [String] = []
     @State private var paused = false
     @State private var skipChecking = false
     @State private var showAdvanced = false
@@ -2684,7 +3037,62 @@ struct ResourcePushSheet: View {
                 }
 
                 Section("分类与标签") {
+                    if !availableCategories.isEmpty {
+                        Menu {
+                            Button("不指定分类") { category = "" }
+                            Divider()
+                            ForEach(availableCategories) { item in
+                                Button {
+                                    category = item.name
+                                    if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                                       !item.savePath.isEmpty {
+                                        savePath = item.savePath
+                                    }
+                                } label: {
+                                    Label(
+                                        item.name,
+                                        systemImage: category == item.name ? "checkmark" : "folder"
+                                    )
+                                }
+                            }
+                        } label: {
+                            HStack {
+                                Label("下载器分类", systemImage: "folder")
+                                Spacer()
+                                Text(category.isEmpty ? "未选择" : category)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
                     TextField("分类（可选）", text: $category)
+                    if !availableTags.isEmpty {
+                        CompactFlowLayout(spacing: 7) {
+                            ForEach(availableTags, id: \.self) { tag in
+                                let selected = selectedTagValues.contains(tag)
+                                Button { toggleTag(tag) } label: {
+                                    Label(tag, systemImage: selected ? "checkmark" : "tag")
+                                        .font(.caption.weight(selected ? .semibold : .regular))
+                                        .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 6)
+                                        .background(
+                                            selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        )
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+                                        }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     TextField("标签，使用逗号分隔", text: $tags)
                 }
 
@@ -2884,7 +3292,7 @@ struct ResourcePushSheet: View {
         var values: [String] = []
         if let value = item.string("category", "category_name"), !value.isEmpty, value != "无分类" { values.append(value) }
         if let value = item.string("sale_status", "saleStatus", "promotion"), !value.isEmpty, value != "无优惠" { values.append(value) }
-        if !(item.bool("hr") ?? false) { values.append("HR") }
+        if resourceHasHRValue(item) { values.append("HR") }
         if let value = item.string("published", "pubdate", "created_at", "date"), !value.isEmpty {
             values.append(String(value.prefix(10)))
         }
@@ -2912,19 +3320,44 @@ struct ResourcePushSheet: View {
         generateTorrentURL || mustGenerateTorrentURL
     }
 
+    private var selectedTagValues: Set<String> {
+        Set(
+            tags.split(separator: ",")
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+    }
+
     private func isMTeamSiteIdentifier(_ value: String) -> Bool {
         value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
     }
 
+    private func toggleTag(_ tag: String) {
+        var values = selectedTagValues
+        if values.contains(tag) { values.remove(tag) }
+        else { values.insert(tag) }
+        tags = values.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }.joined(separator: ", ")
+    }
+
     @MainActor private func load() async {
         defer { isLoading = false }
-        do {
-            suggestedPaths = jsonPathStrings(try await appState.api(APIPath.downloaderPaths))
-        } catch {
-            suggestedPaths = []
-        }
-        do {
-            sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+        async let pathsValue = optionalValue(APIPath.downloaderPaths, label: "常用路径")
+        async let sitesValue = optionalValue(APIPath.sites, label: "站点列表")
+        async let tagsValue = optionalValue(APIPath.downloaderTags + "\(downloaderID)", label: "下载器标签")
+        async let categoriesValue = optionalValue(
+            APIPath.downloaderCategories + "\(downloaderID)",
+            label: "下载器分类"
+        )
+        let values = await (pathsValue, sitesValue, tagsValue, categoriesValue)
+
+        suggestedPaths = values.0.map { jsonPathStrings($0) } ?? []
+        sites = values.1.map { jsonRows($0).map(SiteItem.init) } ?? []
+        availableTags = values.2.map { normalizedResourcePushTags($0) } ?? []
+        availableCategories = values.3.map { normalizedResourcePushCategories($0) } ?? []
+
+        if !sites.isEmpty {
             let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
             if let site = sites.first(where: {
                 String($0.id) == rawSite
@@ -2936,9 +3369,44 @@ struct ResourcePushSheet: View {
                     cookie = site.cookie
                 }
             }
-        } catch {
-            sites = []
         }
+    }
+
+    @MainActor private func optionalValue(_ path: String, label: String) async -> Any? {
+        do { return try await appState.api(path) }
+        catch {
+            recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func normalizedResourcePushTags(_ raw: Any) -> [String] {
+        let strings = jsonStrings(raw)
+        let values = strings.isEmpty
+            ? jsonRows(raw).compactMap { $0.string("name", "tag", "label") }
+            : strings
+        return Array(Set(values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func normalizedResourcePushCategories(_ raw: Any) -> [ResourcePushCategory] {
+        let rows = jsonRows(raw)
+        if !rows.isEmpty {
+            var seen = Set<String>()
+            return rows.compactMap { row in
+                guard let name = row.string("name", "category", "hash")?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                      !name.isEmpty,
+                      seen.insert(name.lowercased()).inserted else { return nil }
+                return ResourcePushCategory(
+                    name: name,
+                    savePath: row.string("savePath", "save_path", "path") ?? ""
+                )
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        return Array(Set(jsonStrings(raw).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .map { ResourcePushCategory(name: $0, savePath: "") }
     }
 
     private func push() async {
@@ -3157,9 +3625,10 @@ struct NewsView: View {
         cachedAt = catalogCacheDates[signature]
         let definitionKeys = Set(definitions.map(\.cacheKey))
         var previous = Dictionary(
-            uniqueKeysWithValues: collections
+            collections
                 .filter { definitionKeys.contains($0.cacheKey) }
-                .map { ($0.cacheKey, $0) }
+                .map { ($0.cacheKey, $0) },
+            uniquingKeysWith: { _, latest in latest }
         )
 
         if !restoredCatalogSignatures.contains(signature) {
@@ -3383,7 +3852,7 @@ struct NewsView: View {
         }
     }
 
-    private static func decodeCollection(
+    nonisolated private static func decodeCollection(
         _ payload: Data,
         definition: MediaCatalogDefinition
     ) -> MediaCollection? {
@@ -3475,19 +3944,44 @@ struct MediaCarousel: View {
                         ForEach(items.prefix(12)) { item in
                             Button { onSelect(item) } label: {
                                 VStack(alignment: .leading, spacing: 6) {
-                                    CachedRemoteImage(
-                                        url: URL(string: item.poster),
-                                        headers: mediaImageHeaders(source: item.source, raw: item.raw)
-                                    ) { image in
-                                        image.resizable().scaledToFill()
-                                    } placeholder: {
-                                        Color.secondary.opacity(0.12)
-                                            .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+                                    ZStack(alignment: .topLeading) {
+                                        CachedRemoteImage(
+                                            url: URL(string: item.poster),
+                                            headers: mediaImageHeaders(source: item.source, raw: item.raw)
+                                        ) { image in
+                                            image.resizable().scaledToFill()
+                                        } placeholder: {
+                                            Color.secondary.opacity(0.12)
+                                                .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+                                        }
+                                        .frame(width: 112, height: 156)
+                                        .clipped()
+
+                                        Text(item.source)
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 4)
+                                            .background(.black.opacity(0.58), in: Capsule())
+                                            .padding(6)
+
+                                        if item.score > 0 {
+                                            Text(String(format: "★ %.1f", item.score))
+                                                .font(.system(size: 9, weight: .bold))
+                                                .foregroundStyle(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 4)
+                                                .background(HarvestTheme.amber.opacity(0.88), in: Capsule())
+                                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                                                .padding(6)
+                                        }
                                     }
-                                    .frame(width: 112, height: 156)
                                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                                     Text(item.title).font(.caption.weight(.semibold)).lineLimit(1).foregroundStyle(.primary)
-                                    if item.score > 0 { Text(String(format: "★ %.1f", item.score)).font(.caption2).foregroundStyle(HarvestTheme.amber) }
+                                    let typeLabel = mediaTypeLabel(item.mediaType)
+                                    if !typeLabel.isEmpty {
+                                        Text(typeLabel).font(.caption2).foregroundStyle(.secondary)
+                                    }
                                 }
                                 .frame(width: 112, alignment: .leading)
                             }
@@ -3521,5 +4015,16 @@ private struct MediaCollectionSheet: View {
 
 struct NewsLinkRow: View {
     let title: String; let subtitle: String; let icon: String; let color: Color
-    var body: some View { HStack(spacing: 12) { SymbolBadge(icon: icon, color: color, size: 42); VStack(alignment: .leading, spacing: 4) { Text(title).font(.headline); Text(subtitle).font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary) }.cardSurface() }
+    var body: some View {
+        HStack(spacing: 12) {
+            SymbolBadge(icon: icon, color: color, size: 42)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+        }
+        .cardSurface()
+    }
 }

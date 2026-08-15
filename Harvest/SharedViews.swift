@@ -7,6 +7,9 @@ import UIKit
 actor RemoteImageDataCache {
     static let shared = RemoteImageDataCache()
 
+    private static let cachePolicyVersionKey = "images.cachePolicyVersion"
+    private static let cachePolicyVersion = 1
+
     private let memoryCache: NSCache<NSString, NSData>
     private let diskCache: URLCache
     private let persistentImageDirectory: URL?
@@ -44,6 +47,14 @@ actor RemoteImageDataCache {
         let persistentDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
             .first?
             .appendingPathComponent("HarvestPersistentImages", isDirectory: true)
+        let defaults = UserDefaults.standard
+        if defaults.integer(forKey: Self.cachePolicyVersionKey) < Self.cachePolicyVersion {
+            cache.removeAllCachedResponses()
+            if let persistentDirectory {
+                try? FileManager.default.removeItem(at: persistentDirectory)
+            }
+            defaults.set(Self.cachePolicyVersion, forKey: Self.cachePolicyVersionKey)
+        }
         if let persistentDirectory {
             try? FileManager.default.createDirectory(
                 at: persistentDirectory,
@@ -66,20 +77,24 @@ actor RemoteImageDataCache {
             throw APIError(statusCode: 0, message: "图片地址无效")
         }
         let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
+        let persistToDisk = isPublicCacheURL(normalizedURL) && !hasSensitiveImageHeaders(effectiveHeaders)
+        let persistentID = persistToDisk ? persistentCacheID : nil
+        if !persistToDisk, let persistentCacheID {
+            removePersistentData(for: persistentCacheID)
+        }
         let key = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
         let cacheKey = key as NSString
         if let cached = memoryCache.object(forKey: cacheKey) {
-            if let persistentCacheID {
-                storePersistentData(cached as Data, for: persistentCacheID)
+            if let persistentID {
+                storePersistentData(cached as Data, for: persistentID)
             }
             return cached as Data
         }
-        if let persistentCacheID, let cached = persistentData(for: persistentCacheID) {
+        if let persistentID, let cached = persistentData(for: persistentID) {
             memoryCache.setObject(cached as NSData, forKey: cacheKey, cost: cached.count)
             return cached
         }
 
-        let persistToDisk = isPublicCacheURL(normalizedURL) && !hasSensitiveImageHeaders(effectiveHeaders)
         let cachePolicy: URLRequest.CachePolicy = persistToDisk ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData
         var request = URLRequest(url: normalizedURL, cachePolicy: cachePolicy, timeoutInterval: 20)
         request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
@@ -92,8 +107,8 @@ actor RemoteImageDataCache {
             } ?? true
             let isNotHTML = !((cached.response.mimeType ?? "").lowercased().contains("html"))
             if isSuccessful, isNotHTML, !cached.data.isEmpty {
-                if let persistentCacheID {
-                    storePersistentData(cached.data, for: persistentCacheID)
+                if let persistentID {
+                    storePersistentData(cached.data, for: persistentID)
                 }
                 memoryCache.setObject(cached.data as NSData, forKey: cacheKey, cost: cached.data.count)
                 return cached.data
@@ -102,8 +117,8 @@ actor RemoteImageDataCache {
         }
         if let task = inFlight[key] {
             let data = try await task.value
-            if let persistentCacheID {
-                storePersistentData(data, for: persistentCacheID)
+            if let persistentID {
+                storePersistentData(data, for: persistentID)
             }
             return data
         }
@@ -125,8 +140,8 @@ actor RemoteImageDataCache {
                 let cached = CachedURLResponse(response: response, data: data, storagePolicy: .allowed)
                 diskCache.storeCachedResponse(cached, for: request)
             }
-            if let persistentCacheID {
-                storePersistentData(data, for: persistentCacheID)
+            if let persistentID {
+                storePersistentData(data, for: persistentID)
             }
             memoryCache.setObject(data as NSData, forKey: cacheKey, cost: data.count)
             return data
@@ -166,6 +181,18 @@ actor RemoteImageDataCache {
         return data
     }
 
+    func persistentData(
+        for cacheID: String,
+        requestURL: URL,
+        headers: [String: String]
+    ) -> Data? {
+        guard isPublicCacheURL(requestURL), !hasSensitiveImageHeaders(headers) else {
+            removePersistentData(for: cacheID)
+            return nil
+        }
+        return persistentData(for: cacheID)
+    }
+
     func removePersistentData(for cacheID: String) {
         guard let url = persistentFileURL(for: cacheID) else { return }
         try? FileManager.default.removeItem(at: url)
@@ -185,13 +212,24 @@ actor RemoteImageDataCache {
     }
 
     private func isPublicCacheURL(_ url: URL) -> Bool {
-        guard let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return true }
-        return !items.contains { item in
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil,
+              components.password == nil else { return false }
+        let containsSensitiveQuery = (components.queryItems ?? []).contains { item in
             let key = item.name.lowercased().filter { $0.isLetter || $0.isNumber }
-            return key.contains("token")
-                || key.contains("secret")
-                || ["passkey", "authkey", "apikey", "signature", "credential"].contains(key)
+            return [
+                "password", "passwd", "secret", "token", "cookie", "passkey", "authkey",
+                "authorization", "apikey", "signature", "credential", "rss", "username", "email"
+            ].contains { key.contains($0) }
         }
+        if containsSensitiveQuery { return false }
+        let containsSensitivePath = components.path.split(separator: "/").contains { rawSegment in
+            let segment = String(rawSegment)
+            let normalized = segment.lowercased().filter { $0.isLetter || $0.isNumber }
+            return ["token", "secret", "passkey", "authkey", "apikey", "credential"].contains { normalized.contains($0) }
+                || (segment.count >= 24 && segment.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" })
+        }
+        return !containsSensitivePath
     }
 
     private func hasSensitiveImageHeaders(_ headers: [String: String]) -> Bool {
@@ -214,7 +252,9 @@ private final class RemoteDecodedImageCache: @unchecked Sendable {
     func image(for key: String) -> UIImage? { cache.object(forKey: key as NSString) }
 
     func insert(_ image: UIImage, for key: String) {
-        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        let cost = clampedInt(
+            Double(image.size.width * image.size.height * image.scale * image.scale * 4)
+        )
         cache.setObject(image, forKey: key as NSString, cost: cost)
     }
 
@@ -227,7 +267,7 @@ private func decodedRemoteDisplayImage(_ data: Data, maximumPixelSize: Int = 1_2
         kCGImageSourceCreateThumbnailFromImageAlways: true,
         kCGImageSourceCreateThumbnailWithTransform: true,
         kCGImageSourceShouldCacheImmediately: true,
-        kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maximumPixelSize)
     ]
     if let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
         return UIImage(cgImage: image)
@@ -254,7 +294,7 @@ private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(1, Int(maximumPixelSize))
+            kCGImageSourceThumbnailMaxPixelSize: max(1, clampedInt(maximumPixelSize))
         ]
         var decodedFrames: [UIImage] = []
         var frameDurations: [TimeInterval] = []
@@ -287,9 +327,10 @@ private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
         frames = decodedFrames
         keyTimes = times
         duration = totalDuration
-        memoryCost = decodedFrames.reduce(0) { partial, image in
-            partial + Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        let decodedBytes = decodedFrames.reduce(0.0) { partial, image in
+            partial + Double(image.size.width * image.size.height * image.scale * image.scale * 4)
         }
+        memoryCost = clampedInt(decodedBytes)
     }
 
     private static func frameDuration(source: CGImageSource, index: Int) -> TimeInterval {
@@ -621,7 +662,7 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
 
     private var requestKey: String {
         guard candidateIndex < candidates.count else { return "\(candidateKey)|exhausted" }
-        return "\(candidateKey)|\(candidateIndex)|\(Int(maximumPixelSize.rounded(.up)))"
+        return "\(candidateKey)|\(candidateIndex)|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
     }
 
     @MainActor private func loadCurrentCandidate() async {
@@ -639,7 +680,7 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
         }
         let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
         let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
-        let decodedCacheKey = "\(dataCacheKey)|animated|\(Int(maximumPixelSize.rounded(.up)))"
+        let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
         if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
             loadedImage = cached
             return
@@ -675,13 +716,17 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
     @MainActor private func loadFirstPersistedCandidate() async -> Bool {
         for candidate in candidates {
             guard let persistentCacheID = candidate.persistentCacheID,
-                  let data = await RemoteImageDataCache.shared.persistentData(for: persistentCacheID),
                   let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
                 continue
             }
             let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
+            guard let data = await RemoteImageDataCache.shared.persistentData(
+                for: persistentCacheID,
+                requestURL: normalizedURL,
+                headers: effectiveHeaders
+            ) else { continue }
             let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
-            let decodedCacheKey = "\(dataCacheKey)|animated|\(Int(maximumPixelSize.rounded(.up)))"
+            let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
             if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
                 loadedImage = cached
                 return true
@@ -968,7 +1013,23 @@ struct SetupWizardView: View {
                     Button(step == 2 ? "完成" : "下一步") { Task { await advance() } }.disabled(isSubmitting)
                 }
             }
-            .overlay { if isSubmitting { ZStack { Color.black.opacity(0.12).ignoresSafeArea(); ProgressView().controlSize(.large).padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)) } } }
+        .overlay {
+            if isSubmitting {
+                ZStack {
+                    Color.black.opacity(0.12).ignoresSafeArea()
+                    ProgressView()
+                        .controlSize(.large)
+                        .padding(24)
+                        .background(
+                            .regularMaterial,
+                            in: RoundedRectangle(
+                                cornerRadius: HarvestTheme.cardCornerRadius,
+                                style: .continuous
+                            )
+                        )
+                }
+            }
+        }
         }
     }
 
@@ -1423,21 +1484,23 @@ struct CurrentScreenShareButton: View {
 
     @MainActor private func captureAndShare() async {
         guard !isCapturing else { return }
-        isCapturing = true
-        let restorePrivacy = !appState.privacyMode
-        if restorePrivacy { appState.setPrivacyMode(true) }
-        try? await Task.sleep(for: .milliseconds(180))
-
-        defer {
-            if restorePrivacy { appState.setPrivacyMode(false) }
-            isCapturing = false
-        }
         guard let window = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .flatMap({ $0.windows })
             .first(where: { $0.isKeyWindow }) else {
             appState.presentedError = "无法获取当前页面截图"
             return
+        }
+        isCapturing = true
+        let restorePrivacy = !appState.privacyMode
+        if restorePrivacy {
+            appState.setPrivacyMode(true)
+            await waitForScreenUpdate(window)
+        }
+
+        defer {
+            if restorePrivacy { appState.setPrivacyMode(false) }
+            isCapturing = false
         }
 
         let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
@@ -1448,6 +1511,20 @@ struct CurrentScreenShareButton: View {
         }
         shareImage = image
         showingShare = true
+    }
+
+    @MainActor private func waitForScreenUpdate(_ window: UIWindow) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                window.setNeedsLayout()
+                window.layoutIfNeeded()
+                DispatchQueue.main.async {
+                    window.setNeedsLayout()
+                    window.layoutIfNeeded()
+                    continuation.resume()
+                }
+            }
+        }
     }
 }
 
