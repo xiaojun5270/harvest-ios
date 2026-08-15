@@ -81,12 +81,13 @@ struct TaskResultItem: Identifiable {
         } else if !taskID.isEmpty {
             self.id = taskID
         } else {
-            self.id = "fallback-\(stableIdentifier(
+            let fallbackID = stableIdentifier(
                 resolvedName,
                 resolvedCreatedAt,
                 json.string("args") ?? "",
                 json.string("kwargs") ?? ""
-            ))"
+            )
+            self.id = "fallback-\(fallbackID)"
         }
         self.taskID = taskID.isEmpty ? self.id : taskID
         name = resolvedName

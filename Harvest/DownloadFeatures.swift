@@ -362,14 +362,15 @@ struct TorrentItem: Identifiable, @unchecked Sendable {
         } else if numericID > 0 {
             torrentHash = String(numericID)
         } else {
-            torrentHash = "fallback-\(stableIdentifier(
+            let fallbackID = stableIdentifier(
                 String(resolvedDownloaderID),
                 resolvedName,
                 json.string("save_path", "savePath", "downloadDir", "download_dir") ?? "",
                 json.string("addedDate", "added_on", "added_at") ?? "",
                 json.string("sizeWhenDone", "totalSize", "total_size", "size") ?? "",
                 json.string("magnetLink", "magnet_link", "magnet_uri", "magnet") ?? ""
-            ))"
+            )
+            torrentHash = "fallback-\(fallbackID)"
         }
         name = resolvedName
         downloaderID = resolvedDownloaderID
