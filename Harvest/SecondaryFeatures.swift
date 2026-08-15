@@ -1182,9 +1182,10 @@ final class SearchViewModel: ObservableObject {
                     trimMediaSearchCache()
                 }
                 if errors.count == 2, media.isEmpty {
-                    appState.presentedError = [errors["TMDB"], errors["豆瓣"]]
+                    let message = [errors["TMDB"], errors["豆瓣"]]
                         .compactMap { $0 }
-                        .joined(separator: "\n")
+                        .joined(separator: " · ")
+                    statusMessage = message.isEmpty ? "影视搜索暂不可用" : message
                 } else if errors["豆瓣"] != nil {
                     statusMessage += " · 豆瓣搜索暂不可用"
                 } else if errors["TMDB"] != nil {
@@ -1193,6 +1194,7 @@ final class SearchViewModel: ObservableObject {
                     statusMessage = "未找到相关影视信息"
                 }
             } else {
+                var resourceWarnings: [String] = []
                 for try await event in APIClient.shared.streamSSE(
                     baseURL: appState.baseURL,
                     path: APIPath.siteSearch,
@@ -1207,8 +1209,14 @@ final class SearchViewModel: ObservableObject {
                     if let message = jsonMessage(event), !message.isEmpty {
                         statusMessage = message
                     }
-                    guard (event.bool("succeed") ?? (event.int("code") == 0)) else {
-                        if let message = jsonMessage(event), !message.isEmpty { appState.presentedError = message }
+                    let explicitlyFailed = event.bool("succeed", "success") == false
+                        || event.int("code").map { $0 != 0 } == true
+                    if explicitlyFailed {
+                        if let message = jsonMessage(event), !message.isEmpty,
+                           !resourceWarnings.contains(message) {
+                            resourceWarnings.append(message)
+                            recordAppLog(.warning, "资源搜索子任务失败：\(message)")
+                        }
                         continue
                     }
                     if let data = event["data"] {
@@ -1217,11 +1225,25 @@ final class SearchViewModel: ObservableObject {
                         else { appendResourceRows(rows) }
                     }
                 }
+                guard searchGeneration == generation, !Task.isCancelled else { return }
+                if resources.isEmpty {
+                    statusMessage = resourceWarnings.last ?? "未找到相关资源"
+                } else {
+                    statusMessage = resourceWarnings.isEmpty
+                        ? "已找到 \(resources.count) 条资源"
+                        : "已找到 \(resources.count) 条资源，部分站点搜索失败"
+                }
             }
         } catch is CancellationError {
             return
         } catch {
-            if searchGeneration == generation { appState.presentedError = error.localizedDescription }
+            guard searchGeneration == generation else { return }
+            recordAppLog(.warning, "搜索请求未完整结束：\(error.localizedDescription)")
+            if searchMode == "资源", !resources.isEmpty {
+                statusMessage = "已找到 \(resources.count) 条资源，部分站点搜索未完成"
+            } else {
+                statusMessage = "搜索失败：\(error.localizedDescription)"
+            }
         }
     }
 
@@ -1785,6 +1807,10 @@ struct SearchView: View {
     }
 
     private var emptyMessage: String {
+        if !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !model.statusMessage.isEmpty {
+            return model.statusMessage
+        }
         model.mode == "影视" ? "输入影视名称开始搜索" : "输入资源关键词开始搜索"
     }
 
@@ -2607,13 +2633,14 @@ struct ResourcePushSheet: View {
         NavigationStack {
             Form {
                 Section("下载器") {
-                    DownloaderIdentityRow(downloader: downloader)
+                    DownloaderIdentityRow(downloader: downloader, compact: true)
+                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14))
                 }
 
                 Section("链接") {
                     resourceSummaryCard
                     TextField("磁力链接或种子地址", text: $url, axis: .vertical)
-                        .lineLimit(3...6)
+                        .lineLimit(1...3)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 }
@@ -2631,12 +2658,12 @@ struct ResourcePushSheet: View {
                                     savePath = path
                                 } label: {
                                     Text(pathLabel(path))
-                                        .font(.subheadline.weight(savePath == path ? .semibold : .regular))
+                                        .font(.caption.weight(savePath == path ? .semibold : .regular))
                                         .foregroundStyle(savePath == path ? HarvestTheme.blue : Color.primary)
                                         .lineLimit(1)
-                                        .frame(maxWidth: 180)
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 8)
+                                        .frame(maxWidth: 150)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
                                         .background(
                                             savePath == path ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
                                             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -2729,6 +2756,8 @@ struct ResourcePushSheet: View {
                     }
                 }
             }
+            .listSectionSpacing(8)
+            .contentMargins(.top, 2, for: .scrollContent)
             .scrollContentBackground(.hidden)
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("添加种子")
@@ -2754,13 +2783,13 @@ struct ResourcePushSheet: View {
                     .frame(maxWidth: .infinity)
                     .disabled(isLoading || isSaving || downloaderID == 0 || url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
                 .background(.ultraThinMaterial)
             }
             .task { await load() }
         }
-        .presentationDetents([.large])
+        .presentationDetents([.fraction(0.84), .large])
         .presentationDragIndicator(.visible)
     }
 
@@ -2770,45 +2799,50 @@ struct ResourcePushSheet: View {
     }
 
     private var resourceSummaryCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 9) {
                 Image(systemName: "doc")
-                    .font(.title3.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(HarvestTheme.blue)
-                    .frame(width: 34, height: 34)
-                    .background(HarvestTheme.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                VStack(alignment: .leading, spacing: 5) {
+                    .frame(width: 30, height: 30)
+                    .background(HarvestTheme.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
                     Text(resourceTitle)
-                        .font(.headline)
-                        .lineLimit(3)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(2)
                     if !resourceSubtitle.isEmpty {
                         Text(resourceSubtitle)
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            .lineLimit(1)
                     }
                 }
             }
-            CompactFlowLayout(spacing: 7) {
-                resourceChip(resourceSize, icon: "externaldrive", color: HarvestTheme.blue)
-                resourceChip("\(seeders)", icon: "arrow.up", color: HarvestTheme.green)
-                resourceChip("\(leechers)", icon: "arrow.down", color: HarvestTheme.coral)
-                resourceChip("\(completers)", icon: "checkmark", color: .secondary)
-                ForEach(Array(summaryLabels.enumerated()), id: \.offset) { _, label in
-                    Text(label)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(label == "HR" ? HarvestTheme.amber : HarvestTheme.blue)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(
-                            (label == "HR" ? HarvestTheme.amber : HarvestTheme.blue).opacity(0.09),
-                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        )
-                }
+            HStack(spacing: 6) {
+                resourceMetric("大小", value: resourceSize, icon: "externaldrive", color: HarvestTheme.blue)
+                resourceMetric("做种", value: "\(seeders)", icon: "arrow.up", color: HarvestTheme.green)
+                resourceMetric("下载", value: "\(leechers)", icon: "arrow.down", color: HarvestTheme.coral)
+                resourceMetric("完成", value: "\(completers)", icon: "checkmark", color: .secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            if !summaryLabels.isEmpty {
+                CompactFlowLayout(spacing: 6) {
+                    ForEach(Array(summaryLabels.enumerated()), id: \.offset) { _, label in
+                        Text(label)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(label == "HR" ? HarvestTheme.amber : HarvestTheme.blue)
+                            .lineLimit(1)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background(
+                                (label == "HR" ? HarvestTheme.amber : HarvestTheme.blue).opacity(0.09),
+                                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .padding(12)
+        .padding(10)
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -2816,13 +2850,23 @@ struct ResourcePushSheet: View {
         }
     }
 
-    private func resourceChip(_ value: String, icon: String, color: Color) -> some View {
-        Label(value, systemImage: icon)
-            .font(.caption2.weight(.semibold))
+    private func resourceMetric(_ label: String, value: String, icon: String, color: Color) -> some View {
+        VStack(spacing: 3) {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                Text(label)
+            }
+            .font(.system(size: 10, weight: .semibold))
             .foregroundStyle(color)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(color.opacity(0.09), in: Capsule())
+            Text(value)
+                .font(.caption2.weight(.semibold).monospacedDigit())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.55)
+        }
+        .frame(maxWidth: .infinity, minHeight: 42)
+        .padding(.horizontal, 3)
+        .background(color.opacity(0.075), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var resourceTitle: String { item.string("title", "name") ?? "未命名资源" }
@@ -2841,7 +2885,9 @@ struct ResourcePushSheet: View {
         if let value = item.string("category", "category_name"), !value.isEmpty, value != "无分类" { values.append(value) }
         if let value = item.string("sale_status", "saleStatus", "promotion"), !value.isEmpty, value != "无优惠" { values.append(value) }
         if !(item.bool("hr") ?? false) { values.append("HR") }
-        if let value = item.string("published", "pubdate", "created_at", "date"), !value.isEmpty { values.append(value) }
+        if let value = item.string("published", "pubdate", "created_at", "date"), !value.isEmpty {
+            values.append(String(value.prefix(10)))
+        }
         return values
     }
 

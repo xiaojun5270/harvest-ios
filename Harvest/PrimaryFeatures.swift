@@ -43,6 +43,12 @@ private enum DashboardChartDefaults {
     static let heightRange = 120.0...480.0
 }
 
+private enum DashboardMonthlyDefaults {
+    static let visibleMonthCount = 3
+    static let minimumHistoryDays = 93
+    static let chartHeight = 176.0
+}
+
 private enum DashboardListLayout {
     static let visibleRows = 10
     static let siteRowHeight: CGFloat = 52
@@ -226,8 +232,9 @@ private func dashboardMonthlyHistory(_ series: [DashboardSiteHistorySeries]) -> 
     var totals: [String: (uploaded: Double, downloaded: Double, published: Double)] = [:]
     for site in series {
         for point in site.points {
-            let current = totals[point.key] ?? (0, 0, 0)
-            totals[point.key] = (
+            guard let monthKey = dashboardMonthKey(point.key) else { continue }
+            let current = totals[monthKey] ?? (0, 0, 0)
+            totals[monthKey] = (
                 current.uploaded + point.uploaded,
                 current.downloaded + point.downloaded,
                 current.published + point.published
@@ -236,6 +243,76 @@ private func dashboardMonthlyHistory(_ series: [DashboardSiteHistorySeries]) -> 
     }
     return totals.keys.sorted().compactMap { key in
         guard let value = totals[key] else { return nil }
+        return DashboardMonthlyPoint(
+            key: key,
+            uploaded: value.uploaded,
+            downloaded: value.downloaded,
+            published: value.published
+        )
+    }
+}
+
+private func dashboardMonthKey(_ value: String) -> String? {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+
+    if let timestamp = Double(trimmed), timestamp >= 100_000_000 {
+        let date = Date(timeIntervalSince1970: timestamp > 100_000_000_000 ? timestamp / 1_000 : timestamp)
+        let components = Calendar.current.dateComponents([.year, .month], from: date)
+        if let year = components.year, let month = components.month {
+            return String(format: "%04d-%02d", year, month)
+        }
+    }
+
+    let normalized = trimmed
+        .replacingOccurrences(of: "年", with: "-")
+        .replacingOccurrences(of: "月", with: "-")
+        .replacingOccurrences(of: "/", with: "-")
+        .replacingOccurrences(of: ".", with: "-")
+    let components = normalized.split(separator: "-", omittingEmptySubsequences: true)
+    if components.count >= 2,
+       let year = Int(components[0]),
+       let month = Int(String(components[1].prefix { $0.isNumber })),
+       (1...12).contains(month) {
+        return String(format: "%04d-%02d", year, month)
+    }
+
+    guard let date = parseDate(trimmed) else { return nil }
+    let dateComponents = Calendar.current.dateComponents([.year, .month], from: date)
+    guard let year = dateComponents.year, let month = dateComponents.month else { return nil }
+    return String(format: "%04d-%02d", year, month)
+}
+
+private func dashboardMonthKey(_ key: String, offset: Int) -> String? {
+    let components = key.split(separator: "-")
+    guard components.count == 2,
+          let year = Int(components[0]),
+          let month = Int(components[1]),
+          (1...12).contains(month) else { return nil }
+    let absoluteMonth = year * 12 + month - 1 + offset
+    guard absoluteMonth >= 0 else { return nil }
+    return String(format: "%04d-%02d", absoluteMonth / 12, absoluteMonth % 12 + 1)
+}
+
+private func dashboardRecentMonthlyPoints(
+    _ points: [DashboardMonthlyPoint],
+    count: Int = DashboardMonthlyDefaults.visibleMonthCount
+) -> [DashboardMonthlyPoint] {
+    guard count > 0 else { return [] }
+    var valuesByMonth: [String: (uploaded: Double, downloaded: Double, published: Double)] = [:]
+    for point in points {
+        guard let monthKey = dashboardMonthKey(point.key) else { continue }
+        let current = valuesByMonth[monthKey] ?? (0, 0, 0)
+        valuesByMonth[monthKey] = (
+            current.uploaded + point.uploaded,
+            current.downloaded + point.downloaded,
+            current.published + point.published
+        )
+    }
+    guard let latestMonth = valuesByMonth.keys.max() else { return [] }
+    return (0..<count).reversed().compactMap { distance in
+        guard let key = dashboardMonthKey(latestMonth, offset: -distance) else { return nil }
+        let value = valuesByMonth[key] ?? (0, 0, 0)
         return DashboardMonthlyPoint(
             key: key,
             uploaded: value.uploaded,
@@ -433,7 +510,8 @@ final class DashboardViewModel: ObservableObject {
     private var downloaders: [DownloaderItem] = []
 
     func load(_ appState: AppState, days: Int? = nil) async {
-        let cacheKey = "dashboard.data.\(days ?? 0)"
+        let historyDays = max(days ?? 0, DashboardMonthlyDefaults.minimumHistoryDays)
+        let cacheKey = "dashboard.data.\(historyDays)"
         if restoredCacheKey != cacheKey {
             restoredCacheKey = cacheKey
             if let cached = await appState.readSessionCache(cacheKey) {
@@ -446,7 +524,7 @@ final class DashboardViewModel: ObservableObject {
         isLoading = snapshot.siteCount == 0 && !usingCachedData
         defer { isLoading = false }
         do {
-            let query: [String: Any] = days.map { ["days": $0] } ?? [:]
+            let query: [String: Any] = ["days": historyDays]
             let raw = try await appState.api(APIPath.dashboard, query: query)
             var updatedSnapshot = DashboardSnapshot(raw)
             updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
@@ -1211,7 +1289,7 @@ struct DashboardView: View {
             if showTrend && !model.snapshot.trends.isEmpty {
                 VStack(alignment: .leading, spacing: 14) {
                     SectionHeader(title: "流量趋势", subtitle: "最近同步周期")
-                    Chart(model.snapshot.trends) { point in
+                    Chart(Array(model.snapshot.trends.suffix(max(1, trendDays)))) { point in
                         LineMark(x: .value("时间", point.date), y: .value("上传", point.upload))
                             .foregroundStyle(HarvestTheme.green).interpolationMethod(.catmullRom)
                         LineMark(x: .value("时间", point.date), y: .value("下载", point.download))
@@ -1385,15 +1463,15 @@ struct DashboardView: View {
             }
         case .monthlyUpload:
             if showMonthlyUpload && !model.snapshot.monthlyHistory.isEmpty {
-                DashboardMonthlyMetricView(metric: .upload, points: model.snapshot.monthlyHistory, chartHeight: chartHeight)
+                DashboardMonthlyMetricView(metric: .upload, points: model.snapshot.monthlyHistory)
             }
         case .monthlyDownload:
             if showMonthlyDownload && !model.snapshot.monthlyHistory.isEmpty {
-                DashboardMonthlyMetricView(metric: .download, points: model.snapshot.monthlyHistory, chartHeight: chartHeight)
+                DashboardMonthlyMetricView(metric: .download, points: model.snapshot.monthlyHistory)
             }
         case .monthlyPublish:
             if showMonthlyPublish && !model.snapshot.monthlyHistory.isEmpty {
-                DashboardMonthlyMetricView(metric: .publish, points: model.snapshot.monthlyHistory, chartHeight: chartHeight)
+                DashboardMonthlyMetricView(metric: .publish, points: model.snapshot.monthlyHistory)
             }
         }
     }
@@ -2148,13 +2226,12 @@ private func dashboardMonthLabel(_ value: String) -> String {
 private struct DashboardMonthlyMetricView: View {
     let metric: DashboardMonthlyMetric
     let points: [DashboardMonthlyPoint]
-    let chartHeight: Double
 
-    private var visiblePoints: [DashboardMonthlyPoint] { Array(points.suffix(3)) }
+    private var visiblePoints: [DashboardMonthlyPoint] { dashboardRecentMonthlyPoints(points) }
     private var total: Double { visiblePoints.reduce(0) { $0 + metric.value($1) } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .lastTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(metric.title).font(.title3.weight(.bold))
@@ -2174,7 +2251,7 @@ private struct DashboardMonthlyMetricView: View {
                 )
                 .foregroundStyle(metric.color)
                 .cornerRadius(7)
-                .annotation(position: .top, spacing: 6) {
+                .annotation(position: .top, spacing: 4) {
                     Text(metric.format(metric.value(point)))
                         .font(.caption2.weight(.semibold).monospacedDigit())
                         .foregroundStyle(metric.color)
@@ -2197,7 +2274,7 @@ private struct DashboardMonthlyMetricView: View {
                     AxisValueLabel().font(.caption.weight(.medium))
                 }
             }
-            .frame(height: CGFloat(chartHeight))
+            .frame(height: CGFloat(DashboardMonthlyDefaults.chartHeight))
         }
         .cardSurface()
     }
@@ -2831,9 +2908,10 @@ private struct DashboardShareContent: View {
                     shareMetric("下载速度", formatSpeed(serverPoint.downloadSpeed), HarvestTheme.blue)
                 }
             }
-            if !snapshot.trends.isEmpty {
+            let visibleTrends = Array(snapshot.trends.suffix(max(1, rangeDays)))
+            if !visibleTrends.isEmpty {
                 shareSectionTitle("流量趋势", subtitle: rangeDays == 1 ? "今日" : "最近 \(rangeDays) 天")
-                Chart(snapshot.trends) { point in
+                Chart(visibleTrends) { point in
                     LineMark(x: .value("日期", point.date), y: .value("上传", point.upload)).foregroundStyle(HarvestTheme.green)
                     LineMark(x: .value("日期", point.date), y: .value("下载", point.download)).foregroundStyle(HarvestTheme.blue)
                 }
@@ -3010,7 +3088,7 @@ private struct DashboardShareContent: View {
     }
 
     private func shareMonthlyMetric(_ metric: DashboardMonthlyMetric) -> some View {
-        let points = Array(snapshot.monthlyHistory.suffix(3))
+        let points = dashboardRecentMonthlyPoints(snapshot.monthlyHistory)
         return VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text(metric.title).font(.headline)

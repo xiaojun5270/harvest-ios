@@ -125,6 +125,17 @@ private func downloaderIsTransmission(_ category: String) -> Bool {
     return value == "tr" || value.contains("transmission")
 }
 
+private func downloaderDisplayAddress(_ downloader: DownloaderItem) -> String {
+    let host = downloader.host.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !host.isEmpty else { return "" }
+    let protocolName = downloader.networkProtocol.trimmingCharacters(in: .whitespacesAndNewlines)
+    let baseAddress = host.contains("://") || protocolName.isEmpty ? host : "\(protocolName)://\(host)"
+    guard downloader.port > 0 else { return baseAddress }
+    guard var components = URLComponents(string: baseAddress), components.port == nil else { return baseAddress }
+    components.port = downloader.port
+    return components.string ?? "\(baseAddress):\(downloader.port)"
+}
+
 private let downloaderActiveCountKeys = [
     "activeTorrentCount", "active_torrent_count", "activeTorrents", "active_torrents", "active_count"
 ]
@@ -1777,7 +1788,7 @@ struct DownloadsView: View {
                         }
                         .frame(minHeight: 260)
                     } else {
-                        LazyVStack(spacing: 12) {
+                        LazyVStack(spacing: 8) {
                             ForEach(model.downloaders) { downloader in
                                 DownloaderCard(
                                     item: downloader,
@@ -2136,6 +2147,7 @@ struct CompactFlowLayout: Layout {
 struct DownloaderIdentityRow: View {
     let downloader: DownloaderItem
     var showsChevron = false
+    var compact = false
 
     private var isTransmission: Bool { downloaderIsTransmission(downloader.category) }
     private var accentColor: Color { isTransmission ? HarvestTheme.coral : HarvestTheme.blue }
@@ -2143,16 +2155,23 @@ struct DownloaderIdentityRow: View {
         isTransmission ? "arrow.triangle.2.circlepath" : "bolt.horizontal.circle.fill"
     }
     private var typeName: String { isTransmission ? "Transmission" : "qBittorrent" }
+    private var detailText: String {
+        let address = downloaderDisplayAddress(downloader)
+        guard !address.isEmpty else { return typeName }
+        return "\(typeName) · \(address)"
+    }
 
     var body: some View {
-        HStack(spacing: 12) {
-            SymbolBadge(icon: icon, color: accentColor, size: 44)
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: compact ? 9 : 12) {
+            SymbolBadge(icon: icon, color: accentColor, size: compact ? 36 : 44)
+            VStack(alignment: .leading, spacing: compact ? 2 : 3) {
                 HStack(spacing: 7) {
                     Text(downloader.name)
-                        .font(.headline)
+                        .font(compact ? Font.subheadline.weight(.semibold) : Font.headline)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .layoutPriority(1)
                     if downloader.main {
                         Text("主下载器")
                             .font(.caption2.weight(.semibold))
@@ -2162,17 +2181,20 @@ struct DownloaderIdentityRow: View {
                             .background(HarvestTheme.amber.opacity(0.11), in: Capsule())
                     }
                 }
-                Text(typeName)
-                    .font(.subheadline)
+                Text(detailText)
+                    .font(compact ? .caption : .subheadline)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
             }
-            Spacer(minLength: 8)
+            Spacer(minLength: compact ? 4 : 8)
             if showsChevron {
                 Image(systemName: "chevron.right")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.tertiary)
             }
         }
+        .frame(minHeight: compact ? 38 : 44)
         .contentShape(Rectangle())
     }
 }
@@ -2226,14 +2248,15 @@ struct DownloaderSelectionSheet: View {
                     }
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 10) {
+                        LazyVStack(spacing: 8) {
                             ForEach(orderedDownloaders) { downloader in
                                 Button {
                                     onSelect(downloader, orderedDownloaders)
                                     dismiss()
                                 } label: {
-                                    DownloaderIdentityRow(downloader: downloader, showsChevron: true)
-                                        .padding(14)
+                                    DownloaderIdentityRow(downloader: downloader, showsChevron: true, compact: true)
+                                        .padding(.horizontal, 11)
+                                        .padding(.vertical, 7)
                                         .background(
                                             Color(uiColor: .secondarySystemGroupedBackground),
                                             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
@@ -2246,7 +2269,7 @@ struct DownloaderSelectionSheet: View {
                                 .buttonStyle(.plain)
                             }
                         }
-                        .padding(16)
+                        .padding(12)
                     }
                     .background(Color(uiColor: .systemGroupedBackground))
                 }
@@ -2262,8 +2285,14 @@ struct DownloaderSelectionSheet: View {
                 if downloaders.isEmpty { await loadDownloaders() }
             }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.height(selectionSheetHeight), .large])
         .presentationDragIndicator(.visible)
+    }
+
+    private var selectionSheetHeight: CGFloat {
+        guard !isLoading, !orderedDownloaders.isEmpty else { return 260 }
+        let rowCount = CGFloat(orderedDownloaders.count)
+        return min(480, max(190, 92 + rowCount * 52 + max(0, rowCount - 1) * 8))
     }
 
     @MainActor private func loadDownloaders() async {
@@ -2304,12 +2333,12 @@ struct DownloaderCard: View {
         return item.hasLiveStatus && !state.contains("disconnected") && !state.contains("offline")
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 10) {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .center, spacing: 9) {
                 SymbolBadge(
                     icon: downloaderIcon,
                     color: accentColor,
-                    size: 42
+                    size: 40
                 )
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.name).font(.headline).lineLimit(1)
@@ -2320,7 +2349,21 @@ struct DownloaderCard: View {
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
                 }
-                Spacer(minLength: 6)
+                .layoutPriority(1)
+                Spacer(minLength: 4)
+                HStack(spacing: 4) {
+                    Image(systemName: "link")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(accentColor)
+                    Text(displayAddress)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                }
+                .frame(maxWidth: 160, alignment: .trailing)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("下载器地址 \(displayAddress)")
                 Menu {
                     Button(action: onOpenTorrents) { Label("种子列表", systemImage: "list.bullet.rectangle") }
                     Button(action: onAddTorrent) { Label("添加种子", systemImage: "link.badge.plus") }
@@ -2347,21 +2390,6 @@ struct DownloaderCard: View {
                 }
                 .accessibilityLabel("下载器操作")
             }
-            HStack(spacing: 7) {
-                Image(systemName: "link")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(accentColor)
-                    .frame(width: 20)
-                Text("\(item.networkProtocol)://\(item.host)\(item.port > 0 ? ":\(item.port)" : "")")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 7)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
             CompactFlowLayout(spacing: 7) {
                 statusChip(
                     connected ? "已连接" : "未连接",
@@ -2381,7 +2409,7 @@ struct DownloaderCard: View {
                 if item.main { statusChip("主下载器", icon: "star.fill", color: HarvestTheme.amber) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 8) {
+            HStack(spacing: 7) {
                 transferMetric(
                     "已下载",
                     value: formatBytes(item.downloadedSession),
@@ -2412,8 +2440,8 @@ struct DownloaderCard: View {
                     Image(systemName: "gauge.with.dots.needle.33percent")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(HarvestTheme.amber)
-                        .frame(width: 28, height: 28)
-                        .background(HarvestTheme.amber.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .frame(width: 24, height: 24)
+                        .background(HarvestTheme.amber.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     Text(item.alternativeSpeedEnabled ? "备用限速" : "速度限制")
                         .font(.caption.weight(.semibold))
                     Spacer(minLength: 6)
@@ -2427,7 +2455,7 @@ struct DownloaderCard: View {
                     }
                 }
                 .padding(.horizontal, 9)
-                .padding(.vertical, 7)
+                .padding(.vertical, 5)
                 .background(HarvestTheme.amber.opacity(0.055), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -2435,7 +2463,8 @@ struct DownloaderCard: View {
                 }
             }
         }
-        .padding(13)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
@@ -2457,57 +2486,67 @@ struct DownloaderCard: View {
         }
         .foregroundStyle(color)
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.vertical, 4)
         .background(color.opacity(0.10), in: Capsule())
     }
 
     private func transferMetric(_ label: String, value: String, speed: String, icon: String, color: Color) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: icon)
-                .font(.caption.weight(.bold))
-                .foregroundStyle(color)
-                .frame(width: 28, height: 28)
-                .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 3) {
-                Text(label).font(.caption2.weight(.medium)).foregroundStyle(.secondary)
-                Text(value)
-                    .font(.subheadline.weight(.bold).monospacedDigit())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(color)
+                    .frame(width: 22, height: 22)
+                    .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Text(label)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
                 Text(speed)
                     .font(.caption2.weight(.medium).monospacedDigit())
                     .foregroundStyle(color)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
             }
+            Text(value)
+                .font(.subheadline.weight(.bold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(minHeight: 68, alignment: .topLeading)
-        .padding(9)
-        .background(color.opacity(0.045), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .background(color.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(color.opacity(0.12), lineWidth: 0.8)
         }
     }
 
     private func smallMetric(_ label: String, value: String, icon: String, color: Color) -> some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(color)
-                .frame(height: 14)
-            Text(label).font(.caption2).foregroundStyle(.secondary)
+        VStack(spacing: 5) {
+            HStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(color)
+                    .frame(width: 15)
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             Text(value)
                 .font(.caption.weight(.bold).monospacedDigit())
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity)
-        .frame(minHeight: 58)
         .padding(.horizontal, 5)
-        .padding(.vertical, 7)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private var displayAddress: String {
+        downloaderDisplayAddress(item)
     }
 
     private func limitValue(_ icon: String, value: String, color: Color) -> some View {

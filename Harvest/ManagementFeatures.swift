@@ -3980,11 +3980,19 @@ final class BrowserSessionModel: ObservableObject {
     @Published private(set) var canGoForward = false
     @Published private(set) var currentURL: URL?
     @Published private(set) var isLoading = false
+    @Published private(set) var loadProgress = 0.0
     @Published private(set) var loadError: String?
     @Published var pendingTorrent: BrowserTorrentRequest?
     weak var webView: WKWebView?
+    private var progressObservation: NSKeyValueObservation?
 
     func attach(_ webView: WKWebView) {
+        if self.webView !== webView {
+            progressObservation?.invalidate()
+            progressObservation = webView.observe(\.estimatedProgress, options: [.initial, .new]) { [weak self] view, _ in
+                self?.refreshProgress(view)
+            }
+        }
         self.webView = webView
         refreshState(webView)
     }
@@ -3995,6 +4003,12 @@ final class BrowserSessionModel: ObservableObject {
         canGoForward = view.canGoForward
         currentURL = view.url
         isLoading = view.isLoading
+        refreshProgress(view)
+    }
+
+    private func refreshProgress(_ webView: WKWebView) {
+        let progress = min(max(webView.estimatedProgress, 0), 1)
+        loadProgress = webView.isLoading ? min(max(progress, 0.02), 0.995) : 1
     }
 
     func goBack() {

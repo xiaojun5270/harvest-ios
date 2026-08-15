@@ -857,29 +857,39 @@ struct SitesView: View {
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Menu {
-                    Section("站点数据") {
-                        Button { Task { await runGlobalAction(APIPath.siteStatus) } } label: {
-                            Label("刷新全部站点", systemImage: "arrow.clockwise")
-                        }
-                        Button { Task { await runGlobalAction(APIPath.siteSign) } } label: {
-                            Label("全部站点签到", systemImage: "checkmark.seal")
-                        }
+                    Button { Task { await runGlobalAction(APIPath.siteStatus) } } label: {
+                        Label("刷新全部站点", systemImage: "arrow.clockwise")
                     }
-                    Section("配置") {
-                    Button { showAdd = true } label: { Label("添加站点", systemImage: "plus") }
-                    Button { showImport = true } label: { Label("导入站点", systemImage: "square.and.arrow.down") }
-                    Button { showGenerator = true } label: { Label("配置生成器", systemImage: "doc.badge.gearshape") }
-                    Button { showTimeline = true } label: { Label("站点时间轴", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }
+                    Button { Task { await runGlobalAction(APIPath.siteSign) } } label: {
+                        Label("全部站点签到", systemImage: "checkmark.seal")
                     }
                 } label: {
                     if isRunningGlobalAction {
                         ProgressView().controlSize(.small)
                     } else {
-                        Image(systemName: "ellipsis.circle")
+                        Image(systemName: "arrow.triangle.2.circlepath")
                     }
                 }
                 .disabled(isRunningGlobalAction)
-                .accessibilityLabel("站点工具")
+                .accessibilityLabel("批量站点操作")
+
+                Menu {
+                    Button { showAdd = true } label: {
+                        Label("添加站点", systemImage: "plus")
+                    }
+                    Button { showImport = true } label: {
+                        Label("上传配置", systemImage: "square.and.arrow.up")
+                    }
+                    Button { showGenerator = true } label: {
+                        Label("生成配置", systemImage: "doc.badge.gearshape")
+                    }
+                    Button { showTimeline = true } label: {
+                        Label("站点时间轴", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("新增与配置")
             }
         }
         .task { if model.isLoading { await model.load(appState) } }
@@ -5414,12 +5424,19 @@ struct SiteBrowserScreen: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(.regularMaterial)
             }
-            if session.isLoading {
-                ProgressView()
-                    .progressViewStyle(.linear)
-                    .tint(HarvestTheme.green)
-                    .frame(maxWidth: .infinity)
-            }
+            ProgressView(value: session.loadProgress, total: 1)
+                .progressViewStyle(.linear)
+                .tint(HarvestTheme.green)
+                .frame(maxWidth: .infinity)
+                .scaleEffect(x: 1, y: 0.7, anchor: .top)
+                .background(HarvestTheme.green.opacity(0.10))
+                .opacity(session.isLoading ? 1 : 0)
+                .animation(.linear(duration: 0.12), value: session.loadProgress)
+                .animation(.easeOut(duration: 0.2), value: session.isLoading)
+                .allowsHitTesting(false)
+                .zIndex(2)
+                .accessibilityLabel("网页加载进度")
+                .accessibilityValue(session.loadProgress.formatted(.percent.precision(.fractionLength(0))))
         }
         .overlay(alignment: .bottomTrailing) {
             if hasTorrentListRules {
@@ -6135,7 +6152,7 @@ private struct BrowserTorrentExtractionSheet: View {
     @State private var tags: Set<String> = []
     @State private var sort = BrowserTorrentSort.seeders
     @State private var ascending = false
-    @State private var showFilters = true
+    @State private var showFilters = false
 
     init(items: [BrowserExtractedTorrent], onPush: @escaping ([BrowserExtractedTorrent]) -> Void) {
         self.items = items
@@ -6175,23 +6192,23 @@ private struct BrowserTorrentExtractionSheet: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("种子列表")
-                        .font(.title2.weight(.bold))
-                    Text("共 \(items.count) 条，当前 \(filtered.count) 条，可推送 \(pushableCount) 条，已选 \(selected.count) 条")
+                Text("共 \(items.count) · 当前 \(filtered.count) · 可推送 \(pushableCount) · 已选 \(selected.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
+
+                HStack(spacing: 7) {
+                    Image(systemName: "magnifyingglass")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .padding(.bottom, 14)
-
-                HStack(spacing: 9) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
                     TextField("搜索种子名称或副标题", text: $query)
+                        .font(.subheadline)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     if !query.isEmpty {
@@ -6202,15 +6219,15 @@ private struct BrowserTorrentExtractionSheet: View {
                         .accessibilityLabel("清空搜索")
                     }
                 }
-                .padding(.horizontal, 12)
-                .frame(height: 42)
-                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .padding(.horizontal, 10)
+                .frame(height: 36)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .stroke(Color.primary.opacity(0.07), lineWidth: 0.8)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 12)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
 
                 Divider().opacity(0.45)
 
@@ -6219,21 +6236,23 @@ private struct BrowserTorrentExtractionSheet: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 10) {
+                        LazyVStack(spacing: 6) {
                             ForEach(filtered) { item in
                                 torrentCard(item)
                             }
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 12)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
                     }
                 }
             }
             .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("种子列表")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { dismiss() }
+                    Button { dismiss() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("关闭")
                 }
             }
             .safeAreaInset(edge: .bottom) {
@@ -6250,28 +6269,28 @@ private struct BrowserTorrentExtractionSheet: View {
             if isSelected { selected.remove(item.id) }
             else { selected.insert(item.id) }
         } label: {
-            VStack(alignment: .leading, spacing: 9) {
-                HStack(alignment: .top, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text(item.title)
-                            .font(.headline)
+                            .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(2)
                         if !item.subtitle.isEmpty {
                             Text(item.subtitle)
-                                .font(.subheadline)
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .lineLimit(2)
+                                .lineLimit(1)
                         }
                     }
-                    Spacer(minLength: 6)
+                    Spacer(minLength: 4)
                     Image(systemName: isSelected ? "paperplane.fill" : "paperplane")
-                        .font(.title3.weight(.semibold))
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(isSelected ? HarvestTheme.blue : Color.secondary)
-                        .frame(width: 34, height: 34)
+                        .frame(width: 28, height: 28)
                 }
 
-                CompactFlowLayout(spacing: 7) {
+                CompactFlowLayout(spacing: 5) {
                     if !item.category.isEmpty {
                         metadataChip(item.category, icon: "folder", color: .secondary)
                     }
@@ -6302,7 +6321,8 @@ private struct BrowserTorrentExtractionSheet: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 isSelected ? HarvestTheme.blue.opacity(0.105) : Color(uiColor: .secondarySystemGroupedBackground),
@@ -6324,7 +6344,7 @@ private struct BrowserTorrentExtractionSheet: View {
                 filterPanel
                 Divider().opacity(0.45)
             }
-            HStack(spacing: 12) {
+            HStack(spacing: 8) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) { showFilters.toggle() }
                 } label: {
@@ -6349,31 +6369,33 @@ private struct BrowserTorrentExtractionSheet: View {
                     Button("反选当前结果") { invertCurrentSelection() }
                     Button("清空选择") { selected = [] }
                 } label: {
-                    Text("选择操作")
+                    Image(systemName: "checklist")
                         .font(.subheadline.weight(.semibold))
+                        .frame(width: 30, height: 30)
                 }
+                .accessibilityLabel("选择操作")
 
                 Button {
                     onPush(items.filter { selected.contains($0.id) })
                 } label: {
                     Label("推送已选 (\(selected.count))", systemImage: "paperplane.fill")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.caption.weight(.semibold))
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(HarvestTheme.blue)
                 .disabled(selected.isEmpty)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
         }
         .background(.ultraThinMaterial)
     }
 
     private var filterPanel: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 10) {
                 filterSection("排序") {
-                    CompactFlowLayout(spacing: 8) {
+                    CompactFlowLayout(spacing: 6) {
                         ForEach(BrowserTorrentSort.allCases) { option in
                             filterChip(option.rawValue, selected: sort == option) { sort = option }
                         }
@@ -6381,10 +6403,10 @@ private struct BrowserTorrentExtractionSheet: View {
                             ascending.toggle()
                         } label: {
                             Label(ascending ? "升序" : "降序", systemImage: ascending ? "arrow.up" : "arrow.down")
-                                .font(.subheadline.weight(.semibold))
+                                .font(.caption.weight(.semibold))
                                 .foregroundStyle(HarvestTheme.blue)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 6)
                                 .background(HarvestTheme.blue.opacity(0.10), in: Capsule())
                         }
                         .buttonStyle(.plain)
@@ -6393,7 +6415,7 @@ private struct BrowserTorrentExtractionSheet: View {
 
                 if !promotions.isEmpty {
                     filterSection("优惠") {
-                        CompactFlowLayout(spacing: 8) {
+                        CompactFlowLayout(spacing: 6) {
                             filterChip("全部", selected: promotion.isEmpty) { promotion = "" }
                             ForEach(promotions, id: \.self) { value in
                                 filterChip(value, selected: promotion == value) { promotion = value }
@@ -6404,7 +6426,7 @@ private struct BrowserTorrentExtractionSheet: View {
 
                 if !categories.isEmpty {
                     filterSection("分类") {
-                        CompactFlowLayout(spacing: 8) {
+                        CompactFlowLayout(spacing: 6) {
                             filterChip("全部", selected: category.isEmpty) { category = "" }
                             ForEach(categories, id: \.self) { value in
                                 filterChip(value, selected: category == value) { category = value }
@@ -6415,7 +6437,7 @@ private struct BrowserTorrentExtractionSheet: View {
 
                 if !allTags.isEmpty {
                     filterSection("标签") {
-                        CompactFlowLayout(spacing: 8) {
+                        CompactFlowLayout(spacing: 6) {
                             filterChip("全部", selected: tags.isEmpty) { tags = [] }
                             ForEach(allTags, id: \.self) { tag in
                                 filterChip(tag, selected: tags.contains(tag)) {
@@ -6427,18 +6449,18 @@ private struct BrowserTorrentExtractionSheet: View {
                     }
                 }
             }
-            .padding(16)
+            .padding(12)
         }
-        .frame(maxHeight: 335)
+        .frame(maxHeight: 250)
     }
 
     private func filterSection<Content: View>(
         _ title: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.subheadline.weight(.semibold))
+                .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
             content()
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -6448,12 +6470,12 @@ private struct BrowserTorrentExtractionSheet: View {
     private func filterChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.subheadline.weight(selected ? .semibold : .regular))
+                .font(.caption.weight(selected ? .semibold : .regular))
                 .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
                 .lineLimit(1)
                 .frame(maxWidth: 250)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
                 .background(selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.035), in: Capsule())
                 .overlay {
                     Capsule().stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07), lineWidth: 0.8)
@@ -6463,7 +6485,7 @@ private struct BrowserTorrentExtractionSheet: View {
     }
 
     private func metadataChip(_ value: String, icon: String?, color: Color) -> some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 4) {
             if let icon { Image(systemName: icon) }
             Text(value)
                 .lineLimit(1)
@@ -6471,8 +6493,8 @@ private struct BrowserTorrentExtractionSheet: View {
         }
         .font(.caption2.weight(.semibold))
         .foregroundStyle(color)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
         .background(color.opacity(0.09), in: Capsule())
     }
 
