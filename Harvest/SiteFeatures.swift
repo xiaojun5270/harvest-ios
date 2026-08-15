@@ -4788,6 +4788,7 @@ private struct BrowserPushPayload: Identifiable {
     let id = UUID()
     let input: String
     let cookie: String
+    let downloaderID: Int?
 }
 
 private struct BrowserExtractedTorrent: Identifiable {
@@ -5352,6 +5353,8 @@ struct SiteBrowserScreen: View {
     @State private var siteConfig: [String: Any]
     @State private var downloaders: [DownloaderItem] = []
     @State private var pushPayload: BrowserPushPayload?
+    @State private var downloaderChoicePayload: BrowserPushPayload?
+    @State private var pendingPushPayload: BrowserPushPayload?
     @State private var extractedTorrents: [BrowserExtractedTorrent] = []
     @State private var showExtractedTorrents = false
     @State private var profileMetrics: [BrowserProfileMetric] = []
@@ -5416,6 +5419,32 @@ struct SiteBrowserScreen: View {
                     .progressViewStyle(.linear)
                     .tint(HarvestTheme.green)
                     .frame(maxWidth: .infinity)
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if hasTorrentListRules {
+                Button {
+                    Task { await extractTorrentList() }
+                } label: {
+                    Group {
+                        if isWorking {
+                            ProgressView().tint(.white)
+                        } else {
+                            Image(systemName: "checklist")
+                                .font(.system(size: 23, weight: .semibold))
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 56, height: 56)
+                    .background(HarvestTheme.blue, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .shadow(color: HarvestTheme.blue.opacity(0.28), radius: 10, y: 5)
+                }
+                .buttonStyle(.plain)
+                .disabled(isWorking || session.isLoading)
+                .opacity(session.isLoading ? 0.55 : 1)
+                .accessibilityLabel("提取种子列表")
+                .padding(.trailing, 18)
+                .padding(.bottom, 18)
             }
         }
         .navigationTitle(title)
@@ -5534,6 +5563,17 @@ struct SiteBrowserScreen: View {
             session.pendingTorrent = nil
             Task { await presentPush(input: request.url.absoluteString) }
         }
+        .sheet(item: $downloaderChoicePayload, onDismiss: presentPendingBrowserPush) { payload in
+            DownloaderSelectionSheet(downloaders: downloaders) { downloader, availableDownloaders in
+                downloaders = availableDownloaders
+                pendingPushPayload = BrowserPushPayload(
+                    input: payload.input,
+                    cookie: payload.cookie,
+                    downloaderID: downloader.id
+                )
+            }
+            .environmentObject(appState)
+        }
         .sheet(item: $pushPayload) { payload in
             AddTorrentSheet(
                 downloaders: downloaders,
@@ -5541,6 +5581,8 @@ struct SiteBrowserScreen: View {
                 initialCookie: payload.cookie,
                 initialSiteID: site.id,
                 initialSiteKey: site.siteKey,
+                initialDownloaderID: payload.downloaderID,
+                locksDownloader: payload.downloaderID != nil,
                 onSaved: { }
             )
             .environmentObject(appState)
@@ -5764,6 +5806,7 @@ struct SiteBrowserScreen: View {
 
     private var hasTorrentListRules: Bool {
         !(firstConfigString(siteConfig["torrents_rule"]) ?? "").isEmpty
+            || !site.torrentsURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var hasTorrentDetailRules: Bool {
@@ -5846,7 +5889,13 @@ struct SiteBrowserScreen: View {
         guard !value.isEmpty else { return }
         await loadDownloaders()
         let cookie = (try? await session.captureStorage())?.cookie ?? site.cookie
-        pushPayload = BrowserPushPayload(input: value, cookie: cookie)
+        downloaderChoicePayload = BrowserPushPayload(input: value, cookie: cookie, downloaderID: nil)
+    }
+
+    @MainActor private func presentPendingBrowserPush() {
+        guard let pendingPushPayload else { return }
+        self.pendingPushPayload = nil
+        pushPayload = pendingPushPayload
     }
 
     @MainActor private func loadConfiguredActionPage(
@@ -6086,6 +6135,7 @@ private struct BrowserTorrentExtractionSheet: View {
     @State private var tags: Set<String> = []
     @State private var sort = BrowserTorrentSort.seeders
     @State private var ascending = false
+    @State private var showFilters = true
 
     init(items: [BrowserExtractedTorrent], onPush: @escaping ([BrowserExtractedTorrent]) -> Void) {
         self.items = items
@@ -6096,6 +6146,7 @@ private struct BrowserTorrentExtractionSheet: View {
     private var promotions: [String] { Array(Set(items.map(\.promotion).filter { !$0.isEmpty })).sorted() }
     private var categories: [String] { Array(Set(items.map(\.category).filter { !$0.isEmpty })).sorted() }
     private var allTags: [String] { Array(Set(items.flatMap(\.tags))).sorted() }
+    private var pushableCount: Int { items.filter { !$0.pushURL.isEmpty }.count }
     private var filtered: [BrowserExtractedTorrent] {
         var result = items.filter { item in
             let queryMatch = query.isEmpty
@@ -6123,96 +6174,317 @@ private struct BrowserTorrentExtractionSheet: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section("筛选与排序") {
-                    if !promotions.isEmpty {
-                        Picker("优惠", selection: $promotion) {
-                            Text("全部").tag("")
-                            ForEach(promotions, id: \.self) { Text($0).tag($0) }
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("种子列表")
+                        .font(.title2.weight(.bold))
+                    Text("共 \(items.count) 条，当前 \(filtered.count) 条，可推送 \(pushableCount) 条，已选 \(selected.count) 条")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 14)
+
+                HStack(spacing: 9) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("搜索种子名称或副标题", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if !query.isEmpty {
+                        Button { query = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("清空搜索")
+                    }
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 42)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.07), lineWidth: 0.8)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 12)
+
+                Divider().opacity(0.45)
+
+                if filtered.isEmpty {
+                    ContentUnavailableView.search(text: query)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(filtered) { item in
+                                torrentCard(item)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 12)
+                    }
+                }
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { dismiss() }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                bottomControls
+            }
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private func torrentCard(_ item: BrowserExtractedTorrent) -> some View {
+        let isSelected = selected.contains(item.id)
+        return Button {
+            if isSelected { selected.remove(item.id) }
+            else { selected.insert(item.id) }
+        } label: {
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(item.title)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(2)
+                        if !item.subtitle.isEmpty {
+                            Text(item.subtitle)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
                         }
                     }
-                    if !categories.isEmpty {
-                        Picker("分类", selection: $category) {
-                            Text("全部").tag("")
-                            ForEach(categories, id: \.self) { Text($0).tag($0) }
+                    Spacer(minLength: 6)
+                    Image(systemName: isSelected ? "paperplane.fill" : "paperplane")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(isSelected ? HarvestTheme.blue : Color.secondary)
+                        .frame(width: 34, height: 34)
+                }
+
+                CompactFlowLayout(spacing: 7) {
+                    if !item.category.isEmpty {
+                        metadataChip(item.category, icon: "folder", color: .secondary)
+                    }
+                    if !item.size.isEmpty {
+                        metadataChip(item.size, icon: "externaldrive", color: HarvestTheme.blue)
+                    }
+                    if !item.progress.isEmpty {
+                        metadataChip(item.progress, icon: "chart.bar.fill", color: HarvestTheme.blue)
+                    }
+                    if !item.seeders.isEmpty {
+                        metadataChip(item.seeders, icon: "arrow.up", color: HarvestTheme.green)
+                    }
+                    if !item.leechers.isEmpty {
+                        metadataChip(item.leechers, icon: "arrow.down", color: HarvestTheme.amber)
+                    }
+                    if !item.completers.isEmpty {
+                        metadataChip(item.completers, icon: "checkmark", color: .secondary)
+                    }
+                    if !item.promotion.isEmpty {
+                        metadataChip(item.promotion, icon: "tag.fill", color: HarvestTheme.green)
+                    }
+                    if showsHR(item.hr) {
+                        metadataChip("HR", icon: "exclamationmark.circle.fill", color: HarvestTheme.amber)
+                    }
+                    ForEach(item.tags, id: \.self) { tag in
+                        metadataChip(tag, icon: nil, color: HarvestTheme.blue)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                isSelected ? HarvestTheme.blue.opacity(0.105) : Color(uiColor: .secondarySystemGroupedBackground),
+                in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                    .stroke(isSelected ? HarvestTheme.blue.opacity(0.45) : Color.primary.opacity(0.07), lineWidth: isSelected ? 1.2 : 0.8)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(item.pushURL.isEmpty)
+        .opacity(item.pushURL.isEmpty ? 0.5 : 1)
+    }
+
+    private var bottomControls: some View {
+        VStack(spacing: 0) {
+            if showFilters {
+                filterPanel
+                Divider().opacity(0.45)
+            }
+            HStack(spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { showFilters.toggle() }
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Text("筛选与排序").font(.subheadline.weight(.semibold))
+                            Image(systemName: showFilters ? "chevron.down" : "chevron.up")
+                                .font(.caption.weight(.bold))
+                        }
+                        Text("排序：\(sort.rawValue)\(ascending ? "↑" : "↓")")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 0)
+
+                Menu {
+                    Button("选择当前结果") { selected.formUnion(filtered.map(\.id)) }
+                    Button("选择全部可推送") { selected = Set(items.filter { !$0.pushURL.isEmpty }.map(\.id)) }
+                    Button("反选当前结果") { invertCurrentSelection() }
+                    Button("清空选择") { selected = [] }
+                } label: {
+                    Text("选择操作")
+                        .font(.subheadline.weight(.semibold))
+                }
+
+                Button {
+                    onPush(items.filter { selected.contains($0.id) })
+                } label: {
+                    Label("推送已选 (\(selected.count))", systemImage: "paperplane.fill")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(HarvestTheme.blue)
+                .disabled(selected.isEmpty)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 11)
+        }
+        .background(.ultraThinMaterial)
+    }
+
+    private var filterPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                filterSection("排序") {
+                    CompactFlowLayout(spacing: 8) {
+                        ForEach(BrowserTorrentSort.allCases) { option in
+                            filterChip(option.rawValue, selected: sort == option) { sort = option }
+                        }
+                        Button {
+                            ascending.toggle()
+                        } label: {
+                            Label(ascending ? "升序" : "降序", systemImage: ascending ? "arrow.up" : "arrow.down")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(HarvestTheme.blue)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(HarvestTheme.blue.opacity(0.10), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                if !promotions.isEmpty {
+                    filterSection("优惠") {
+                        CompactFlowLayout(spacing: 8) {
+                            filterChip("全部", selected: promotion.isEmpty) { promotion = "" }
+                            ForEach(promotions, id: \.self) { value in
+                                filterChip(value, selected: promotion == value) { promotion = value }
+                            }
                         }
                     }
-                    Picker("排序", selection: $sort) {
-                        ForEach(BrowserTorrentSort.allCases) { Text($0.rawValue).tag($0) }
+                }
+
+                if !categories.isEmpty {
+                    filterSection("分类") {
+                        CompactFlowLayout(spacing: 8) {
+                            filterChip("全部", selected: category.isEmpty) { category = "" }
+                            ForEach(categories, id: \.self) { value in
+                                filterChip(value, selected: category == value) { category = value }
+                            }
+                        }
                     }
-                    Picker("方向", selection: $ascending) {
-                        Text("升序").tag(true)
-                        Text("降序").tag(false)
-                    }
-                    .pickerStyle(.segmented)
                 }
 
                 if !allTags.isEmpty {
-                    Section("标签") {
-                        ForEach(allTags, id: \.self) { tag in
-                            Toggle(tag, isOn: Binding(
-                                get: { tags.contains(tag) },
-                                set: { enabled in
-                                    if enabled { tags.insert(tag) } else { tags.remove(tag) }
-                                }
-                            ))
-                        }
-                    }
-                }
-
-                Section("种子（\(filtered.count)）") {
-                    ForEach(filtered) { item in
-                        Button {
-                            if selected.contains(item.id) { selected.remove(item.id) }
-                            else { selected.insert(item.id) }
-                        } label: {
-                            HStack(alignment: .top, spacing: 11) {
-                                Image(systemName: selected.contains(item.id) ? "checkmark.circle.fill" : "circle")
-                                    .foregroundStyle(selected.contains(item.id) ? HarvestTheme.green : .secondary)
-                                if let posterURL = URL(string: item.posterURL), !item.posterURL.isEmpty {
-                                    CachedRemoteImage(url: posterURL) { image in
-                                        image.resizable().scaledToFill()
-                                    } placeholder: {
-                                        Color.secondary.opacity(0.1)
-                                            .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
-                                    }
-                                    .frame(width: 48, height: 68)
-                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                }
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(item.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary).lineLimit(2)
-                                    if !item.subtitle.isEmpty { Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
-                                    HStack(spacing: 9) {
-                                        if !item.size.isEmpty { Label(item.size, systemImage: "externaldrive") }
-                                        if !item.progress.isEmpty { Label(item.progress, systemImage: "chart.bar.fill") }
-                                        if !item.seeders.isEmpty { Label(item.seeders, systemImage: "arrow.up") }
-                                        if !item.promotion.isEmpty { Text(item.promotion).foregroundStyle(HarvestTheme.green) }
-                                    }
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                    filterSection("标签") {
+                        CompactFlowLayout(spacing: 8) {
+                            filterChip("全部", selected: tags.isEmpty) { tags = [] }
+                            ForEach(allTags, id: \.self) { tag in
+                                filterChip(tag, selected: tags.contains(tag)) {
+                                    if tags.contains(tag) { tags.remove(tag) }
+                                    else { tags.insert(tag) }
                                 }
                             }
                         }
-                        .disabled(item.pushURL.isEmpty)
                     }
                 }
             }
-            .searchable(text: $query, prompt: "搜索提取结果")
-            .navigationTitle("提取种子")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
-                ToolbarItemGroup(placement: .confirmationAction) {
-                    Menu {
-                        Button("选择当前结果") { selected.formUnion(filtered.map(\.id)) }
-                        Button("清空选择") { selected = [] }
-                    } label: { Image(systemName: "checklist") }
-                    Button("推送 \(selected.count)") {
-                        onPush(items.filter { selected.contains($0.id) })
-                    }
-                    .disabled(selected.isEmpty)
+            .padding(16)
+        }
+        .frame(maxHeight: 335)
+    }
+
+    private func filterSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func filterChip(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.subheadline.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
+                .lineLimit(1)
+                .frame(maxWidth: 250)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.035), in: Capsule())
+                .overlay {
+                    Capsule().stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07), lineWidth: 0.8)
                 }
-            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func metadataChip(_ value: String, icon: String?, color: Color) -> some View {
+        HStack(spacing: 5) {
+            if let icon { Image(systemName: icon) }
+            Text(value)
+                .lineLimit(1)
+                .frame(maxWidth: 240)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.09), in: Capsule())
+    }
+
+    private func showsHR(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !normalized.isEmpty && !["0", "false", "no", "none", "无"].contains(normalized)
+    }
+
+    private func invertCurrentSelection() {
+        for id in filtered.map(\.id) {
+            if selected.contains(id) { selected.remove(id) }
+            else { selected.insert(id) }
         }
     }
 }
