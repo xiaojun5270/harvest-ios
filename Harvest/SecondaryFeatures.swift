@@ -1811,7 +1811,7 @@ struct SearchView: View {
            !model.statusMessage.isEmpty {
             return model.statusMessage
         }
-        model.mode == "影视" ? "输入影视名称开始搜索" : "输入资源关键词开始搜索"
+        return model.mode == "影视" ? "输入影视名称开始搜索" : "输入资源关键词开始搜索"
     }
 
     private func consumePendingResourceSearch() {
