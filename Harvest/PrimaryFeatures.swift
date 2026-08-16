@@ -1487,7 +1487,7 @@ struct DashboardView: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Spacer()
                 Button { showSettings = true } label: {
                     Image(systemName: "slider.horizontal.3")
@@ -1504,6 +1504,21 @@ struct DashboardView: View {
                 }
                 .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
                 .accessibilityLabel("仪表盘卡片设置")
+                Button { showCacheClear = true } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color.primary)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .background(.regularMaterial, in: Circle())
+                .overlay {
+                    Circle()
+                        .stroke(Color.white.opacity(0.58), lineWidth: 0.8)
+                }
+                .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
+                .accessibilityLabel("缓存清理")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
