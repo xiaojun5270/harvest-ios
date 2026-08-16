@@ -3923,6 +3923,12 @@ private func isVirtualTorrentTracker(_ tracker: [String: Any]) -> Bool {
     }
 }
 
+private struct AddTorrentCategoryOption: Identifiable {
+    let name: String
+    let savePath: String
+    var id: String { name }
+}
+
 struct AddTorrentSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -3935,6 +3941,9 @@ struct AddTorrentSheet: View {
     @State private var category = ""
     @State private var savePath = ""
     @State private var suggestedPaths: [String] = []
+    @State private var availableCategories: [AddTorrentCategoryOption] = []
+    @State private var defaultSavePath = ""
+    @State private var isLoadingDownloaderOptions = false
     @State private var sites: [SiteItem] = []
     @State private var siteIdentifier: String
     @State private var cookie: String
@@ -3993,17 +4002,85 @@ struct AddTorrentSheet: View {
                     } else {
                         Picker("下载器", selection: $downloaderID) { ForEach(downloaders) { Text($0.name).tag($0.id) } }
                     }
-                    if !suggestedPaths.isEmpty {
-                        Picker("常用路径", selection: $savePath) { Text("不指定").tag(""); ForEach(suggestedPaths, id: \.self) { Text($0).tag($0) } }
-                    }
-                    TextField("保存路径（可选）", text: $savePath)
-                    TextField("分类（可选）", text: $category)
                     TextField("标签，使用逗号分隔", text: $tags)
                     Toggle("添加后暂停", isOn: $paused)
                     Toggle("跳过文件校验", isOn: $skipChecking)
                     Toggle("高级设置", isOn: $showAdvanced)
                 }
+                Section("下载器分类") {
+                    VStack(alignment: .leading, spacing: 9) {
+                        if isLoadingDownloaderOptions {
+                            HStack(spacing: 9) {
+                                ProgressView()
+                                Text("正在读取分类与目录")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else if availableCategories.isEmpty {
+                            Text("暂无下载器分类")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            CompactFlowLayout(spacing: 8) {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.18)) {
+                                        category = ""
+                                        savePath = ""
+                                    }
+                                } label: {
+                                    addTorrentCategoryLabel("不指定", selected: category.isEmpty)
+                                }
+                                .buttonStyle(.plain)
+                                ForEach(availableCategories) { item in
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            category = item.name
+                                            savePath = ""
+                                        }
+                                    } label: {
+                                        addTorrentCategoryLabel(item.name, selected: category == item.name)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        VStack(alignment: .leading, spacing: 5) {
+                            Label("目录地址", systemImage: "folder")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text(selectedCategoryPath.isEmpty ? "使用下载器默认保存路径" : selectedCategoryPath)
+                                .font(.subheadline.monospaced())
+                                .foregroundStyle(selectedCategoryPath.isEmpty ? Color.secondary : Color.primary)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.72)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 10)
+                                .background(
+                                    Color(uiColor: .systemBackground),
+                                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                )
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+                                }
+                        }
+                    }
+                }
                 if showAdvanced {
+                    Section("保存路径") {
+                        if !suggestedPaths.isEmpty {
+                            Picker("常用路径", selection: $savePath) {
+                                Text("跟随下载器分类").tag("")
+                                ForEach(suggestedPaths, id: \.self) { Text($0).tag($0) }
+                            }
+                        }
+                        TextField("自定义保存路径（可选）", text: $savePath)
+                        Text("留空时使用上方分类对应目录；未选择分类时使用下载器默认目录。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Section("下载链接") {
                         Toggle(
                             "自动生成下载链接",
@@ -4081,12 +4158,10 @@ struct AddTorrentSheet: View {
             .onChange(of: downloaders.map(\.id)) { _, _ in
                 if !downloaders.contains(where: { $0.id == downloaderID }) { downloaderID = downloaders.first?.id ?? 0 }
             }
+            .task(id: downloaderID) {
+                await loadDownloaderOptions()
+            }
             .task {
-                do {
-                    suggestedPaths = jsonPathStrings(try await appState.api(APIPath.downloaderPaths))
-                } catch {
-                    suggestedPaths = []
-                }
                 do {
                     sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
                     if let initialSiteID,
@@ -4108,6 +4183,148 @@ struct AddTorrentSheet: View {
 
     private var selectedDownloader: DownloaderItem? {
         downloaders.first { $0.id == downloaderID }
+    }
+
+    private var selectedCategoryPath: String {
+        let manualPath = savePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !manualPath.isEmpty { return manualPath }
+        guard !category.isEmpty else { return defaultSavePath }
+        let categoryPath = availableCategories.first {
+            $0.name.caseInsensitiveCompare(category) == .orderedSame
+        }?.savePath.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return categoryPath.isEmpty ? defaultSavePath : categoryPath
+    }
+
+    private func addTorrentCategoryLabel(_ title: String, selected: Bool) -> some View {
+        Text(title)
+            .font(.caption.weight(selected ? .semibold : .regular))
+            .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
+            .lineLimit(1)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+            }
+    }
+
+    @MainActor private func loadDownloaderOptions() async {
+        guard downloaderID > 0 else {
+            availableCategories = []
+            defaultSavePath = ""
+            suggestedPaths = []
+            category = ""
+            savePath = ""
+            return
+        }
+        let requestedDownloaderID = downloaderID
+        isLoadingDownloaderOptions = true
+        defer {
+            if downloaderID == requestedDownloaderID {
+                isLoadingDownloaderOptions = false
+            }
+        }
+        availableCategories = []
+        defaultSavePath = ""
+        suggestedPaths = []
+        category = ""
+        savePath = ""
+        async let categoriesValue = optionalAddTorrentValue(
+            APIPath.downloaderCategories + "\(requestedDownloaderID)",
+            label: "下载器分类"
+        )
+        async let preferencesValue = optionalAddTorrentValue(
+            APIPath.downloaderPreferences + "\(requestedDownloaderID)",
+            label: "下载器默认目录",
+            timeoutInterval: 8
+        )
+        async let pathsValue = optionalAddTorrentValue(APIPath.downloaderPaths, label: "常用路径")
+        let values = await (categoriesValue, preferencesValue, pathsValue)
+        guard !Task.isCancelled, downloaderID == requestedDownloaderID else { return }
+        availableCategories = values.0.map(normalizedAddTorrentCategories) ?? []
+        defaultSavePath = values.1.map(addTorrentDefaultSavePath) ?? ""
+        suggestedPaths = values.2.map(jsonPathStrings) ?? []
+        if !category.isEmpty,
+           !availableCategories.contains(where: { $0.name.caseInsensitiveCompare(category) == .orderedSame }) {
+            category = ""
+        }
+    }
+
+    @MainActor private func optionalAddTorrentValue(
+        _ path: String,
+        label: String,
+        timeoutInterval: TimeInterval? = nil
+    ) async -> Any? {
+        do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
+        catch {
+            guard !Task.isCancelled else { return nil }
+            recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private func normalizedAddTorrentCategories(_ raw: Any) -> [AddTorrentCategoryOption] {
+        let payload: Any = jsonPayloadDictionary(raw) ?? raw
+        let rows = jsonRows(payload)
+        if !rows.isEmpty {
+            var seen = Set<String>()
+            return rows.compactMap { row -> AddTorrentCategoryOption? in
+                guard let name = normalizedAddTorrentCategoryName(row.string("name", "category", "hash") ?? ""),
+                      seen.insert(name.lowercased()).inserted else { return nil }
+                return AddTorrentCategoryOption(
+                    name: name,
+                    savePath: row.string("savePath", "save_path", "path", "downloadDir", "download_dir") ?? ""
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        if let dictionary = payload as? [String: Any] {
+            var seen = Set<String>()
+            let values = dictionary.compactMap { key, value -> AddTorrentCategoryOption? in
+                let nested = value as? [String: Any]
+                guard let name = normalizedAddTorrentCategoryName(nested?.string("name", "category") ?? key),
+                      seen.insert(name.lowercased()).inserted else { return nil }
+                let path = nested?.string("savePath", "save_path", "path", "downloadDir", "download_dir")
+                    ?? (value as? String)
+                    ?? ""
+                return AddTorrentCategoryOption(name: name, savePath: path)
+            }
+            if !values.isEmpty {
+                return values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }
+        }
+        var seen = Set<String>()
+        return jsonStrings(payload).compactMap(normalizedAddTorrentCategoryName)
+            .filter { seen.insert($0.lowercased()).inserted }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .map { AddTorrentCategoryOption(name: $0, savePath: "") }
+    }
+
+    private func normalizedAddTorrentCategoryName(_ value: String) -> String? {
+        let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return String(name.prefix(128))
+    }
+
+    private func addTorrentDefaultSavePath(_ raw: Any) -> String {
+        guard let dictionary = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return "" }
+        for key in ["save_path", "savePath", "download-dir", "download_dir", "downloadDir"] {
+            if let value = dictionary[key] as? String {
+                let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty { return path }
+            }
+        }
+        for key in ["preferences", "prefs", "data"] {
+            if let nested = dictionary[key] {
+                let path = addTorrentDefaultSavePath(nested)
+                if !path.isEmpty { return path }
+            }
+        }
+        return ""
     }
 
     private var isQBittorrent: Bool {
