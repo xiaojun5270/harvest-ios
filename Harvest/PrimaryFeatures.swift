@@ -398,6 +398,7 @@ struct DashboardSnapshot {
     }
 }
 
+@MainActor
 private func dashboardBootstrapCacheKey(_ appState: AppState) -> String? {
     let username = appState.profile?.username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
     guard !appState.baseURL.isEmpty, !username.isEmpty else { return nil }
@@ -409,6 +410,7 @@ private func dashboardBootstrapCacheKey(_ appState: AppState) -> String? {
     return "\(DashboardMonthlyDefaults.bootstrapCachePrefix).\(String(hash, radix: 16))"
 }
 
+@MainActor
 private func readDashboardBootstrapCache(_ appState: AppState) -> (snapshot: DashboardSnapshot, cachedAt: Date?)? {
     guard let key = dashboardBootstrapCacheKey(appState),
           let data = UserDefaults.standard.data(forKey: key),
@@ -419,6 +421,7 @@ private func readDashboardBootstrapCache(_ appState: AppState) -> (snapshot: Das
     return (snapshot, timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil)
 }
 
+@MainActor
 private func writeDashboardBootstrapCache(_ snapshot: DashboardSnapshot, appState: AppState, cachedAt: Date) {
     guard snapshot.hasDisplayableData,
           let key = dashboardBootstrapCacheKey(appState),
@@ -428,6 +431,7 @@ private func writeDashboardBootstrapCache(_ snapshot: DashboardSnapshot, appStat
     UserDefaults.standard.set(cachedAt.timeIntervalSince1970, forKey: "\(key).cachedAt")
 }
 
+@MainActor
 private func removeDashboardBootstrapCache(_ appState: AppState) {
     guard let key = dashboardBootstrapCacheKey(appState) else { return }
     UserDefaults.standard.removeObject(forKey: key)
