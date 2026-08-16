@@ -1019,15 +1019,15 @@ private struct SiteSearchFilterBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 9) {
-                HStack(spacing: 7) {
+            HStack(spacing: 6) {
+                HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
                     SiteSearchTextField(
                         text: $model.query,
-                        placeholder: "搜索站点、镜像、账号、标签"
+                        placeholder: "搜索站点、账号、标签"
                     )
-                    .frame(height: 24)
+                    .frame(height: 22)
                     if !model.query.isEmpty {
                         Button { model.query = "" } label: {
                             Image(systemName: "xmark.circle.fill")
@@ -1037,18 +1037,64 @@ private struct SiteSearchFilterBar: View {
                         .accessibilityLabel("清除搜索")
                     }
                 }
-                .padding(.horizontal, 10)
-                .frame(minHeight: 36)
+                .padding(.horizontal, 9)
+                .frame(minHeight: 32)
                 .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                Button(action: openFilters) {
-                    Label(
-                        model.activeFilterCount == 0 ? "筛选" : "筛选 \(model.activeFilterCount)",
-                        systemImage: model.hasFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle"
-                    )
-                    .font(.subheadline.weight(.semibold))
+                Menu {
+                    Section("排序维度") {
+                        ForEach(SiteSortField.allCases) { field in
+                            Button {
+                                model.setSortField(field)
+                            } label: {
+                                if model.sortField == field {
+                                    Label(field.rawValue, systemImage: "checkmark")
+                                } else {
+                                    Label(field.rawValue, systemImage: field.icon)
+                                }
+                            }
+                        }
+                    }
+                    Button {
+                        model.ascending.toggle()
+                    } label: {
+                        Label(
+                            model.ascending ? "改为降序" : "改为升序",
+                            systemImage: model.ascending ? "arrow.down" : "arrow.up"
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(model.sortField.rawValue)
+                            .lineLimit(1)
+                        Image(systemName: model.ascending ? "arrow.up" : "arrow.down")
+                    }
+                    .font(.caption.weight(.semibold))
                 }
                 .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(HarvestTheme.blue)
+                .accessibilityLabel("排序：\(model.sortField.rawValue)，\(model.ascending ? "升序" : "降序")")
+
+                Button(action: openFilters) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: model.hasFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 15, weight: .semibold))
+                        if model.activeFilterCount > 0 {
+                            Text("\(min(model.activeFilterCount, 99))")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(minWidth: 13, minHeight: 13)
+                                .background(HarvestTheme.coral, in: Circle())
+                                .offset(x: 6, y: -6)
+                        }
+                    }
+                    .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
                 .tint(model.hasFilters ? HarvestTheme.blue : .secondary)
                 .accessibilityLabel("筛选，已启用 \(model.activeFilterCount) 项")
 
@@ -1067,93 +1113,71 @@ private struct SiteSearchFilterBar: View {
                     }
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 16, weight: .semibold))
-                        .frame(width: 34, height: 34)
+                        .font(.system(size: 15, weight: .semibold))
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.bordered)
                 .buttonBorderShape(.circle)
                 .controlSize(.small)
                 .accessibilityLabel("新增与配置")
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, showsFilterTokens ? 3 : 5)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 7) {
-                    Menu {
-                        ForEach(SiteSortField.allCases) { field in
-                            Button {
-                                model.setSortField(field)
-                            } label: {
-                                if model.sortField == field {
-                                    Label(field.rawValue, systemImage: "checkmark")
-                                } else {
-                                    Label(field.rawValue, systemImage: field.icon)
-                                }
+            if showsFilterTokens {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        if model.availability != .alive {
+                            filterToken(model.availability.rawValue)
+                        }
+                        if model.condition != .all {
+                            filterToken(model.condition.rawValue)
+                        }
+                        ForEach(model.selectedTypes.sorted(), id: \.self) { type in
+                            filterToken(type)
+                        }
+                        if !model.selectedTags.isEmpty {
+                            selectableTagToken("全部", isSelected: model.activeTags.isEmpty) {
+                                model.activeTags = []
                             }
                         }
-                    } label: {
-                        Text(model.sortField.rawValue)
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.small)
-                    .tint(HarvestTheme.blue)
-                    .accessibilityLabel("排序维度：\(model.sortField.rawValue)")
-
-                    Button {
-                        model.ascending.toggle()
-                    } label: {
-                        Label(model.ascending ? "升序" : "降序", systemImage: model.ascending ? "arrow.up" : "arrow.down")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.bordered)
-                    .buttonBorderShape(.capsule)
-                    .controlSize(.small)
-                    .tint(HarvestTheme.blue)
-                    .accessibilityLabel("当前\(model.ascending ? "升序" : "降序")，点击切换")
-
-                    if model.availability != .alive {
-                        filterToken(model.availability.rawValue)
-                    }
-                    if model.condition != .all {
-                        filterToken(model.condition.rawValue)
-                    }
-                    ForEach(model.selectedTypes.sorted(), id: \.self) { type in
-                        filterToken(type)
-                    }
-                    if !model.selectedTags.isEmpty {
-                        selectableTagToken("全部", isSelected: model.activeTags.isEmpty) {
-                            model.activeTags = []
+                        ForEach(model.selectedTags.sorted(), id: \.self) { tag in
+                            selectableTagToken(tag, isSelected: model.activeTags.contains(tag)) {
+                                model.selectTag(tag)
+                            }
+                        }
+                        if !model.selectedUsername.isEmpty {
+                            filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode))
+                        }
+                        if !model.selectedEmail.isEmpty {
+                            filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode))
                         }
                     }
-                    ForEach(model.selectedTags.sorted(), id: \.self) { tag in
-                        selectableTagToken(tag, isSelected: model.activeTags.contains(tag)) {
-                            model.selectTag(tag)
-                        }
-                    }
-                    if !model.selectedUsername.isEmpty {
-                        filterToken(privacyMaskedText(model.selectedUsername, enabled: appState.privacyMode))
-                    }
-                    if !model.selectedEmail.isEmpty {
-                        filterToken(privacyMaskedText(model.selectedEmail, enabled: appState.privacyMode))
-                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 5)
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 8)
             }
         }
         .background(Color(uiColor: .secondarySystemBackground))
         .overlay(alignment: .bottom) { Divider() }
     }
 
+    private var showsFilterTokens: Bool {
+        model.availability != .alive
+            || model.condition != .all
+            || !model.selectedTypes.isEmpty
+            || !model.selectedTags.isEmpty
+            || !model.selectedUsername.isEmpty
+            || !model.selectedEmail.isEmpty
+    }
+
     private func filterToken(_ title: String) -> some View {
         Text(title)
             .font(.caption.weight(.medium))
             .lineLimit(1)
-            .padding(.horizontal, 10)
-            .frame(minHeight: 28)
+            .padding(.horizontal, 8)
+            .frame(minHeight: 24)
             .foregroundStyle(HarvestTheme.blue)
             .background(HarvestTheme.blue.opacity(0.11), in: Capsule())
             .overlay { Capsule().stroke(HarvestTheme.blue.opacity(0.18), lineWidth: 0.75) }
@@ -1173,9 +1197,9 @@ private struct SiteSearchFilterBar: View {
                 }
                 Text(title).lineLimit(1)
             }
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 10)
-            .frame(minHeight: 28)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 8)
+            .frame(minHeight: 24)
             .foregroundStyle(isSelected ? Color.white : HarvestTheme.blue)
             .background(
                 isSelected ? HarvestTheme.blue : HarvestTheme.blue.opacity(0.08),
@@ -1202,7 +1226,7 @@ private struct SiteSearchTextField: UIViewRepresentable {
         let textField = UITextField(frame: .zero)
         textField.delegate = context.coordinator
         textField.placeholder = placeholder
-        textField.font = .preferredFont(forTextStyle: .body)
+        textField.font = .preferredFont(forTextStyle: .subheadline)
         textField.textColor = .label
         textField.tintColor = UIColor(HarvestTheme.blue)
         textField.backgroundColor = .clear

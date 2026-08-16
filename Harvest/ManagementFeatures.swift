@@ -106,6 +106,7 @@ struct NoticeView: View {
                     onRead: { await markRead(notice) },
                     onDelete: { await delete(notice) }
                 )
+                .presentationDetents([.large])
             }
             .confirmationDialog("确定删除全部消息？", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
                 Button("删除全部", role: .destructive) { Task { await deleteAll() } }
@@ -212,49 +213,345 @@ struct NoticeDetailSheet: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                Section {
-                    Text(notice.title).font(.title3.weight(.semibold))
-                    HStack {
-                        Text(notice.category)
-                        Spacer()
-                        Text(notice.createdAt)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    noticeHeader
+
+                    if let report = noticeSignInReport(notice.content) {
+                        NoticeSignInReportView(report: report)
+                    } else {
+                        noticeContent
                     }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-                Section("内容") {
-                    Text(markdownAttributedString(notice.content.isEmpty ? "暂无内容" : notice.content))
-                        .textSelection(.enabled)
-                }
-                if let url = URL(string: notice.url), !notice.url.isEmpty {
-                    Section {
+
+                    if let url = URL(string: notice.url), !notice.url.isEmpty {
                         NavigationLink {
                             NativeBrowserView(urlString: url.absoluteString, title: notice.title)
                                 .navigationTitle(notice.title)
                                 .navigationBarTitleDisplayMode(.inline)
                         } label: {
-                            Label("打开链接", systemImage: "safari")
+                            HStack(spacing: 10) {
+                                Image(systemName: "safari.fill")
+                                    .foregroundStyle(HarvestTheme.blue)
+                                Text("打开相关链接")
+                                    .font(.subheadline.weight(.semibold))
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .foregroundStyle(.primary)
+                            .padding(14)
+                            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                         }
+                        .buttonStyle(.plain)
                     }
                 }
-                Section {
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 28)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("消息详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                HStack(spacing: 10) {
                     if !isRead {
                         Button {
                             Task {
                                 if await onRead() { isRead = true }
                             }
-                        } label: { Label("标记已读", systemImage: "checkmark.circle") }
+                        } label: {
+                            Label("标记已读", systemImage: "checkmark.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(HarvestTheme.blue)
                     }
-                    Button(role: .destructive) { confirmDelete = true } label: { Label("删除消息", systemImage: "trash") }
+                    Button(role: .destructive) {
+                        confirmDelete = true
+                    } label: {
+                        Label("删除消息", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(HarvestTheme.coral)
                 }
+                .controlSize(.large)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial)
             }
-            .navigationTitle("消息详情").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .confirmationDialog("确定删除这条消息？", isPresented: $confirmDelete, titleVisibility: .visible) {
                 Button("删除消息", role: .destructive) { Task { if await onDelete() { dismiss() } } }
             }
         }
+    }
+
+    private var noticeHeader: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 11) {
+                Image(systemName: isRead ? "bell" : "bell.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(isRead ? Color.secondary : HarvestTheme.coral)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        (isRead ? Color.secondary : HarvestTheme.coral).opacity(0.11),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+                Text(notice.title)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Text(notice.category)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(HarvestTheme.blue)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(HarvestTheme.blue.opacity(0.09), in: Capsule())
+                Spacer(minLength: 8)
+                Label(notice.createdAt, systemImage: "clock")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var noticeContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("消息内容", systemImage: "text.alignleft")
+                .font(.headline)
+            Text(markdownAttributedString(formattedNoticeContent(notice.content)))
+                .font(.body)
+                .lineSpacing(5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct NoticeSignInReport {
+    let completedAt: String
+    let siteCount: String
+    let duration: String
+    let successCount: String
+    let failureCount: String
+    let failures: [String]
+    let successes: [String]
+}
+
+private struct NoticeSignInReportView: View {
+    let report: NoticeSignInReport
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 7), count: 4)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if !report.completedAt.isEmpty {
+                Label(report.completedAt, systemImage: "calendar.badge.checkmark")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            LazyVGrid(columns: columns, spacing: 7) {
+                metric("站点", report.siteCount, icon: "globe", color: HarvestTheme.blue)
+                metric("成功", report.successCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
+                metric("失败", report.failureCount, icon: "xmark.circle.fill", color: HarvestTheme.coral)
+                metric("耗时", report.duration, icon: "timer", color: HarvestTheme.amber)
+            }
+
+            if !report.failures.isEmpty {
+                NoticeResultGroup(
+                    title: "失败站点",
+                    entries: report.failures,
+                    icon: "xmark.circle.fill",
+                    color: HarvestTheme.coral
+                )
+            }
+
+            if !report.successes.isEmpty {
+                NoticeResultGroup(
+                    title: "成功站点",
+                    entries: report.successes,
+                    icon: "checkmark.circle.fill",
+                    color: HarvestTheme.green
+                )
+            }
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func metric(_ title: String, _ value: String, icon: String, color: Color) -> some View {
+        VStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+            Text(value.isEmpty ? "-" : value)
+                .font(.subheadline.weight(.semibold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.62)
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 66)
+        .background(color.opacity(0.075), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+private struct NoticeResultGroup: View {
+    let title: String
+    let entries: [String]
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                Text(title)
+                Spacer()
+                Text("\(entries.count)")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.bottom, 8)
+
+            ForEach(Array(entries.enumerated()), id: \.offset) { index, entry in
+                let parts = noticeResultParts(entry)
+                HStack(alignment: .top, spacing: 9) {
+                    Image(systemName: icon)
+                        .font(.caption)
+                        .foregroundStyle(color)
+                        .padding(.top, 3)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(parts.title)
+                            .font(.subheadline.weight(.semibold))
+                        if !parts.detail.isEmpty {
+                            Text(parts.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineSpacing(3)
+                        }
+                    }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .padding(.vertical, 9)
+                if index < entries.count - 1 {
+                    Divider().padding(.leading, 23)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(color.opacity(0.055), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(color.opacity(0.14), lineWidth: 0.8)
+        }
+    }
+}
+
+private func noticeSignInReport(_ rawContent: String) -> NoticeSignInReport? {
+    let content = rawContent.replacingOccurrences(of: "\r\n", with: "\n")
+    guard content.contains("签到"),
+          content.contains("失败站点") || content.contains("成功站点") else { return nil }
+
+    let failureRange = content.range(of: "失败站点")
+    let successRange = content.range(of: "成功站点")
+    let sectionStarts = [failureRange?.lowerBound, successRange?.lowerBound].compactMap { $0 }
+    let summaryEnd = sectionStarts.min() ?? content.endIndex
+    let summary = String(content[..<summaryEnd])
+
+    let failures = noticeReportEntries(
+        noticeReportSection(content, marker: failureRange, nextMarker: successRange)
+    )
+    let successes = noticeReportEntries(
+        noticeReportSection(content, marker: successRange, nextMarker: failureRange)
+    )
+
+    return NoticeSignInReport(
+        completedAt: noticeReportCapture("当前时间\\s*[:：]\\s*([^，,\\n]+)", in: summary),
+        siteCount: noticeReportCapture("站点数\\s*[:：]\\s*(\\d+)", in: summary),
+        duration: noticeReportCapture("耗时\\s*[:：]\\s*([0-9.]+\\s*秒)", in: summary),
+        successCount: noticeReportCapture("成功\\s*[:：]\\s*(\\d+)", in: summary),
+        failureCount: noticeReportCapture("失败\\s*[:：]\\s*(\\d+)", in: summary),
+        failures: failures,
+        successes: successes
+    )
+}
+
+private func noticeReportSection(
+    _ content: String,
+    marker: Range<String.Index>?,
+    nextMarker: Range<String.Index>?
+) -> String {
+    guard let marker else { return "" }
+    let end: String.Index
+    if let nextMarker, nextMarker.lowerBound > marker.upperBound {
+        end = nextMarker.lowerBound
+    } else {
+        end = content.endIndex
+    }
+    return String(content[marker.upperBound..<end])
+}
+
+private func noticeReportEntries(_ rawSection: String) -> [String] {
+    let separators = ["🥀", "🌹", "🌷", "🌸", "🌺", "💐"]
+    let trimCharacters = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+    let separated = separators.reduce(rawSection) {
+        $0.replacingOccurrences(of: $1, with: "\n")
+    }
+    return separated
+        .components(separatedBy: .newlines)
+        .map {
+            $0.trimmingCharacters(in: trimCharacters)
+        }
+        .filter { !$0.isEmpty }
+}
+
+private func noticeResultParts(_ entry: String) -> (title: String, detail: String) {
+    guard let separator = entry.firstIndex(where: { $0.isWhitespace }) else {
+        return (entry, "")
+    }
+    let title = String(entry[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+    let detail = String(entry[separator...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    return title.isEmpty ? (entry, "") : (title, detail)
+}
+
+private func noticeReportCapture(_ pattern: String, in text: String) -> String {
+    guard let expression = try? NSRegularExpression(pattern: pattern),
+          let match = expression.firstMatch(
+              in: text,
+              range: NSRange(text.startIndex..., in: text)
+          ),
+          match.numberOfRanges > 1,
+          let range = Range(match.range(at: 1), in: text) else { return "" }
+    return String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func formattedNoticeContent(_ rawContent: String) -> String {
+    let content = rawContent.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !content.isEmpty else { return "暂无内容" }
+    return ["🥀", "🌹", "🌷", "🌸", "🌺", "💐"].reduce(content) {
+        $0.replacingOccurrences(of: $1, with: "\n\n")
     }
 }
 

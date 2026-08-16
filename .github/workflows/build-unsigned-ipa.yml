@@ -50,6 +50,7 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
+            DEBUG_INFORMATION_FORMAT=dwarf \
             clean build
 
           APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Harvest.app"
@@ -70,9 +71,9 @@ jobs:
           fi
 
           shasum -a 256 output/Harvest-unsigned.ipa | tee output/Harvest-unsigned.ipa.sha256
-          DSYM_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Harvest.app.dSYM"
-          if test -d "$DSYM_PATH"; then
-            /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DSYM_PATH" output/Harvest.app.dSYM.zip
+          if unzip -Z1 output/Harvest-unsigned.ipa | grep -q '\.dSYM'; then
+            echo "The IPA unexpectedly contains a dSYM bundle."
+            exit 1
           fi
           ls -lh output/Harvest-unsigned.ipa
 
@@ -83,7 +84,6 @@ jobs:
           path: |
             output/Harvest-unsigned.ipa
             output/Harvest-unsigned.ipa.sha256
-            output/Harvest.app.dSYM.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30

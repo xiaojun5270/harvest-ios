@@ -3063,6 +3063,26 @@ private struct ResourcePushCategory: Identifiable {
     var id: String { name }
 }
 
+private func normalizedResourcePushLabel(_ rawValue: String) -> String? {
+    let trimCharacters = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+    let invisibleCharacters = [
+        "\u{034F}", "\u{061C}", "\u{180E}", "\u{200B}", "\u{200C}", "\u{200D}",
+        "\u{200E}", "\u{200F}", "\u{202A}", "\u{202B}", "\u{202C}", "\u{202D}",
+        "\u{202E}", "\u{2060}", "\u{2061}", "\u{2062}", "\u{2063}", "\u{2064}",
+        "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}", "\u{FEFF}"
+    ]
+    let cleaned = invisibleCharacters.reduce(rawValue) {
+        $0.replacingOccurrences(of: $1, with: "")
+    }
+    .trimmingCharacters(in: trimCharacters)
+    let compacted = cleaned
+        .components(separatedBy: .whitespacesAndNewlines)
+        .filter { !$0.isEmpty }
+        .joined(separator: " ")
+    guard !compacted.isEmpty else { return nil }
+    return String(compacted.prefix(128))
+}
+
 struct ResourcePushSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -3083,6 +3103,7 @@ struct ResourcePushSheet: View {
     @State private var paused = false
     @State private var skipChecking = false
     @State private var showAdvanced = false
+    @State private var showTagPicker = false
     @State private var rename = ""
     @State private var uploadLimit = ""
     @State private var downloadLimit = ""
@@ -3105,138 +3126,176 @@ struct ResourcePushSheet: View {
         self.downloader = downloader
         let initialURL = item.string("magnet_url", "magnetUrl", "detail_url", "detailUrl", "download_url", "url") ?? ""
         let initialSite = item.string("site_id", "siteId", "site") ?? ""
+        let initialSavePath = item.string("save_path", "savePath", "download_dir", "downloadDir")
+            ?? downloader.torrentPath
         _downloaderID = State(initialValue: downloader.id)
         _url = State(initialValue: initialURL)
+        _savePath = State(initialValue: initialSavePath)
         _siteIdentifier = State(initialValue: initialSite)
         _cookie = State(initialValue: item.string("cookie") ?? "")
-        _category = State(initialValue: item.string("category", "category_name") ?? "")
+        _category = State(initialValue: normalizedResourcePushLabel(item.string("category", "category_name") ?? "") ?? "")
         let lowercasedURL = initialURL.lowercased()
         _generateTorrentURL = State(initialValue: !initialSite.isEmpty && !lowercasedURL.contains("passkey") && !lowercasedURL.contains("sign"))
         let values = item.strings("tags")
-        _tags = State(initialValue: values.isEmpty ? (item.string("tags") ?? "") : values.joined(separator: ", "))
+        let initialTags = (values.isEmpty ? [item.string("tags") ?? ""] : values)
+            .compactMap(normalizedResourcePushLabel)
+        _tags = State(initialValue: initialTags.joined(separator: ", "))
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("下载器") {
-                    DownloaderIdentityRow(downloader: downloader, compact: true)
-                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14))
-                }
-
                 Section("链接") {
                     resourceSummaryCard
-                    TextField("磁力链接或种子地址", text: $url, axis: .vertical)
-                        .lineLimit(1...3)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                 }
 
                 Section("路径") {
-                    if isLoading {
-                        HStack(spacing: 9) {
-                            ProgressView()
-                            Text("正在读取常用路径").foregroundStyle(.secondary)
-                        }
-                    } else if !suggestedPaths.isEmpty {
-                        CompactFlowLayout(spacing: 8) {
-                            ForEach(suggestedPaths, id: \.self) { path in
-                                Button {
-                                    savePath = path
-                                } label: {
-                                    Text(pathLabel(path))
-                                        .font(.caption.weight(savePath == path ? .semibold : .regular))
-                                        .foregroundStyle(savePath == path ? HarvestTheme.blue : Color.primary)
-                                        .lineLimit(1)
-                                        .frame(maxWidth: 150)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(
-                                            savePath == path ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
-                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        )
-                                        .overlay {
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(savePath == path ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
-                                        }
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    TextField("保存路径（可选）", text: $savePath)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-
-                Section("分类与标签") {
-                    if !availableCategories.isEmpty {
-                        Menu {
-                            Button("不指定分类") { category = "" }
-                            Divider()
-                            ForEach(availableCategories) { item in
-                                Button {
-                                    category = item.name
-                                    if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                                       !item.savePath.isEmpty {
-                                        savePath = item.savePath
-                                    }
-                                } label: {
-                                    Label(
-                                        item.name,
-                                        systemImage: category == item.name ? "checkmark" : "folder"
-                                    )
-                                }
-                            }
-                        } label: {
-                            HStack {
-                                Label("下载器分类", systemImage: "folder")
-                                Spacer()
-                                Text(category.isEmpty ? "未选择" : category)
+                    VStack(alignment: .leading, spacing: 10) {
+                        if isLoading {
+                            HStack(spacing: 9) {
+                                ProgressView()
+                                Text("正在读取常用路径")
+                                    .font(.caption)
                                     .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                Image(systemName: "chevron.up.chevron.down")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
                             }
-                        }
-                    }
-                    TextField("分类（可选）", text: $category)
-                    if !availableTags.isEmpty {
-                        CompactFlowLayout(spacing: 7) {
-                            ForEach(availableTags, id: \.self) { tag in
-                                let selected = selectedTagValues.contains(tag)
-                                Button { toggleTag(tag) } label: {
-                                    Label(tag, systemImage: selected ? "checkmark" : "tag")
-                                        .font(.caption.weight(selected ? .semibold : .regular))
-                                        .foregroundStyle(selected ? HarvestTheme.blue : Color.primary)
-                                        .padding(.horizontal, 9)
-                                        .padding(.vertical, 6)
-                                        .background(
-                                            selected ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
-                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        )
-                                        .overlay {
-                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                .stroke(selected ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
-                                        }
+                        } else if !suggestedPaths.isEmpty {
+                            CompactFlowLayout(spacing: 8) {
+                                ForEach(suggestedPaths, id: \.self) { path in
+                                    Button {
+                                        savePath = path
+                                    } label: {
+                                        Text(pathLabel(path))
+                                            .font(.caption.weight(savePath == path ? .semibold : .regular))
+                                            .foregroundStyle(savePath == path ? HarvestTheme.blue : Color.primary)
+                                            .lineLimit(1)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 6)
+                                            .background(
+                                                savePath == path ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                                                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            )
+                                            .overlay {
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .stroke(savePath == path ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+                                            }
+                                    }
+                                    .buttonStyle(.plain)
                                 }
-                                .buttonStyle(.plain)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        TextField("保存路径（可选）", text: $savePath)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Color(uiColor: .systemBackground), in: Capsule())
+                            .overlay {
+                                Capsule()
+                                    .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+                            }
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 8, trailing: 14))
+                .listRowBackground(Color.clear)
+
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("标签")
+                                .font(.subheadline)
+                            if selectedTagValues.isEmpty {
+                                Text("点击选择标签")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            } else {
+                                CompactFlowLayout(spacing: 6) {
+                                    ForEach(Array(selectedTagValues).sorted(), id: \.self) { tag in
+                                        Button { toggleTag(tag) } label: {
+                                            Text(tag)
+                                                .font(.caption.weight(.medium))
+                                                .foregroundStyle(HarvestTheme.blue)
+                                                .lineLimit(1)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 5)
+                                                .background(
+                                                    HarvestTheme.blue.opacity(0.10),
+                                                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                )
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
                             }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        Spacer(minLength: 8)
+                        Button {
+                            showTagPicker = true
+                        } label: {
+                            Label("选择", systemImage: "plus")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(HarvestTheme.blue)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(
+                                    Color.primary.opacity(0.025),
+                                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                )
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .stroke(Color.primary.opacity(0.08))
+                                }
+                        }
+                        .buttonStyle(.plain)
                     }
-                    TextField("标签，使用逗号分隔", text: $tags)
                 }
+                .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
+                .listRowBackground(Color.clear)
 
-                Section("下载选项") {
+                Section {
                     Toggle("暂停下载", isOn: $paused)
-                    Toggle("跳过文件校验", isOn: $skipChecking)
                 }
 
                 Section {
                     DisclosureGroup(isExpanded: $showAdvanced) {
+                        TextField("磁力链接或种子地址", text: $url, axis: .vertical)
+                            .lineLimit(1...3)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Toggle("跳过哈希检查", isOn: $skipChecking)
+                        if !availableCategories.isEmpty {
+                            Menu {
+                                Button("不指定分类") { category = "" }
+                                Divider()
+                                ForEach(availableCategories) { item in
+                                    Button {
+                                        category = item.name
+                                        if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                                           !item.savePath.isEmpty {
+                                            savePath = item.savePath
+                                        }
+                                    } label: {
+                                        Label(
+                                            item.name,
+                                            systemImage: category == item.name ? "checkmark" : "folder"
+                                        )
+                                    }
+                                }
+                            } label: {
+                                HStack {
+                                    Label("下载器分类", systemImage: "folder")
+                                    Spacer()
+                                    Text(category.isEmpty ? "未选择" : category)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                    Image(systemName: "chevron.up.chevron.down")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                        TextField("分类（可选）", text: $category)
+                        TextField("手动标签（逗号分隔）", text: $tags)
                         Toggle(
                             "自动生成下载链接",
                             isOn: Binding(
@@ -3304,6 +3363,19 @@ struct ResourcePushSheet: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("添加种子")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Text(isQBittorrent ? "qBittorrent" : "Transmission")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(isQBittorrent ? HarvestTheme.blue : HarvestTheme.coral)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            (isQBittorrent ? HarvestTheme.blue : HarvestTheme.coral).opacity(0.10),
+                            in: Capsule()
+                        )
+                }
+            }
             .safeAreaInset(edge: .bottom) {
                 HStack(spacing: 12) {
                     Button("取消") { dismiss() }
@@ -3330,6 +3402,14 @@ struct ResourcePushSheet: View {
                 .background(.ultraThinMaterial)
             }
             .task { await load() }
+        }
+        .sheet(isPresented: $showTagPicker) {
+            ResourcePushTagPicker(
+                tags: availableTags,
+                selectedTags: selectedTagValues,
+                onToggle: toggleTag
+            )
+            .presentationDetents([.medium, .large])
         }
         .presentationDetents([.fraction(0.84), .large])
         .presentationDragIndicator(.visible)
@@ -3457,8 +3537,7 @@ struct ResourcePushSheet: View {
     private var selectedTagValues: Set<String> {
         Set(
             tags.split(separator: ",")
-                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+                .compactMap { normalizedResourcePushLabel(String($0)) }
         )
     }
 
@@ -3487,6 +3566,9 @@ struct ResourcePushSheet: View {
         let values = await (pathsValue, sitesValue, tagsValue, categoriesValue)
 
         suggestedPaths = values.0.map { jsonPathStrings($0) } ?? []
+        if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            savePath = suggestedPaths.first ?? ""
+        }
         sites = values.1.map { jsonRows($0).map(SiteItem.init) } ?? []
         availableTags = values.2.map { normalizedResourcePushTags($0) } ?? []
         availableCategories = values.3.map { normalizedResourcePushCategories($0) } ?? []
@@ -3519,8 +3601,12 @@ struct ResourcePushSheet: View {
         let values = strings.isEmpty
             ? jsonRows(raw).compactMap { $0.string("name", "tag", "label") }
             : strings
-        return Array(Set(values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }))
-            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        var seen = Set<String>()
+        return Array(values.compactMap(normalizedResourcePushLabel).filter {
+            seen.insert($0.lowercased()).inserted
+        }
+        .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        .prefix(100))
     }
 
     private func normalizedResourcePushCategories(_ raw: Any) -> [ResourcePushCategory] {
@@ -3528,18 +3614,24 @@ struct ResourcePushSheet: View {
         if !rows.isEmpty {
             var seen = Set<String>()
             return rows.compactMap { row in
-                guard let name = row.string("name", "category", "hash")?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                      !name.isEmpty,
+                guard let name = normalizedResourcePushLabel(row.string("name", "category", "hash") ?? ""),
                       seen.insert(name.lowercased()).inserted else { return nil }
                 return ResourcePushCategory(
                     name: name,
-                    savePath: row.string("savePath", "save_path", "path") ?? ""
+                    savePath: row.string("savePath", "save_path", "path")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 )
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .prefix(200)
+            .map { $0 }
         }
-        return Array(Set(jsonStrings(raw).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }))
+        var seen = Set<String>()
+        return jsonStrings(raw)
+            .compactMap(normalizedResourcePushLabel)
+            .filter { seen.insert($0.lowercased()).inserted }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            .prefix(200)
             .map { ResourcePushCategory(name: $0, savePath: "") }
     }
 
@@ -3557,8 +3649,8 @@ struct ResourcePushSheet: View {
         if effectiveGenerateTorrentURL && !trimmedSiteIdentifier.isEmpty { body["site_id"] = trimmedSiteIdentifier }
         if !trimmedCookie.isEmpty { body["cookie"] = trimmedCookie }
         if !savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["save_path"] = savePath.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if !category.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["category"] = category.trimmingCharacters(in: .whitespacesAndNewlines) }
-        let tagValues = tags.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        if let categoryValue = normalizedResourcePushLabel(category) { body["category"] = categoryValue }
+        let tagValues = tags.split(separator: ",").compactMap { normalizedResourcePushLabel(String($0)) }
         if !tagValues.isEmpty { body["tags"] = tagValues }
         if !rename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["rename"] = rename.trimmingCharacters(in: .whitespacesAndNewlines) }
         if let value = Int(uploadLimit), value > 0 { body["upload_limit"] = value }
@@ -3577,6 +3669,56 @@ struct ResourcePushSheet: View {
             if !shareLimitAction.isEmpty { body["share_limit_action"] = shareLimitAction }
         }
         if await appState.perform("\(APIPath.pushTorrent)/\(downloaderID)", method: .post, body: body) { dismiss() }
+    }
+}
+
+private struct ResourcePushTagPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    let tags: [String]
+    let onToggle: (String) -> Void
+    @State private var selectedTags: Set<String>
+
+    init(tags: [String], selectedTags: Set<String>, onToggle: @escaping (String) -> Void) {
+        self.tags = tags
+        self.onToggle = onToggle
+        _selectedTags = State(initialValue: selectedTags)
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if tags.isEmpty {
+                    ContentUnavailableView("暂无可选标签", systemImage: "tag")
+                } else {
+                    ForEach(tags, id: \.self) { tag in
+                        Button {
+                            if selectedTags.contains(tag) {
+                                selectedTags.remove(tag)
+                            } else {
+                                selectedTags.insert(tag)
+                            }
+                            onToggle(tag)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: selectedTags.contains(tag) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(selectedTags.contains(tag) ? HarvestTheme.blue : Color.secondary)
+                                Text(tag)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .navigationTitle("选择标签")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
     }
 }
 
