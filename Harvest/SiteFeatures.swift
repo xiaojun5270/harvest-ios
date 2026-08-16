@@ -6405,6 +6405,7 @@ private struct BrowserTorrentExtractionSheet: View {
     let items: [BrowserExtractedTorrent]
     let onPush: ([BrowserExtractedTorrent]) -> Void
     @State private var selected: Set<UUID>
+    @State private var hasCustomizedSelection = false
     @State private var query = ""
     @State private var promotion = ""
     @State private var category = ""
@@ -6525,8 +6526,13 @@ private struct BrowserTorrentExtractionSheet: View {
     private func torrentCard(_ item: BrowserExtractedTorrent) -> some View {
         let isSelected = selected.contains(item.id)
         return Button {
-            if isSelected { selected.remove(item.id) }
-            else { selected.insert(item.id) }
+            if hasCustomizedSelection {
+                if isSelected { selected.remove(item.id) }
+                else { selected.insert(item.id) }
+            } else {
+                selected = [item.id]
+                hasCustomizedSelection = true
+            }
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .top, spacing: 8) {
@@ -6623,10 +6629,22 @@ private struct BrowserTorrentExtractionSheet: View {
                 Spacer(minLength: 0)
 
                 Menu {
-                    Button("选择当前结果") { selected.formUnion(filtered.map(\.id)) }
-                    Button("选择全部可推送") { selected = Set(items.filter { !$0.pushURL.isEmpty }.map(\.id)) }
-                    Button("反选当前结果") { invertCurrentSelection() }
-                    Button("清空选择") { selected = [] }
+                    Button("选择当前结果") {
+                        selected = Set(filtered.filter { !$0.pushURL.isEmpty }.map(\.id))
+                        hasCustomizedSelection = true
+                    }
+                    Button("选择全部可推送") {
+                        selected = Set(items.filter { !$0.pushURL.isEmpty }.map(\.id))
+                        hasCustomizedSelection = false
+                    }
+                    Button("反选当前结果") {
+                        hasCustomizedSelection = true
+                        invertCurrentSelection()
+                    }
+                    Button("清空选择") {
+                        selected = []
+                        hasCustomizedSelection = true
+                    }
                 } label: {
                     Image(systemName: "checklist")
                         .font(.subheadline.weight(.semibold))
