@@ -167,13 +167,14 @@ struct BrandMark: View {
                 Image(uiImage: image)
                     .resizable()
                     .renderingMode(.original)
+                    .interpolation(.high)
             } else {
                 Image("LaunchMark")
                     .resizable()
                     .renderingMode(.original)
+                    .interpolation(.high)
             }
         }
-            .interpolation(.high)
             .scaledToFit()
             .frame(width: size, height: size)
             .background(Color.white, in: RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
