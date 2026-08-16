@@ -48,6 +48,18 @@ private enum DashboardMonthlyDefaults {
     // The API also returns older month-end snapshots; 30 daily points stay below PostgreSQL's argument limit.
     static let historyDays = 30
     static let fallbackHistoryDays = 7
+    static let cacheKey = "dashboard.data"
+    static let legacyCacheKeys = [
+        "dashboard.data.30",
+        "dashboard.data.93",
+        "dashboard.data.7",
+        "dashboard.data.1",
+        "dashboard.data.14",
+        "dashboard.data.60",
+        "dashboard.data.90",
+        "dashboard.data.180",
+        "dashboard.data.0"
+    ]
     static let chartHeight = 176.0
 }
 
@@ -138,6 +150,16 @@ struct DashboardSnapshot {
     var earliestSite = ""
     var earliestJoinedAt = ""
     var updatedAt = ""
+
+    var hasDisplayableData: Bool {
+        siteCount > 0
+            || uploaded > 0
+            || downloaded > 0
+            || seeding > 0
+            || !siteStatuses.isEmpty
+            || !siteHistory.isEmpty
+            || !trends.isEmpty
+    }
 
     init(_ raw: Any) {
         guard let root = jsonPayloadDictionary(raw) else { return }
@@ -519,6 +541,8 @@ final class DashboardViewModel: ObservableObject {
     private var downloaderSpeedMonitoring = false
     private var downloaders: [DownloaderItem] = []
 
+    var hasDisplayableData: Bool { snapshot.hasDisplayableData }
+
     func load(_ appState: AppState, days _: Int? = nil) async {
         guard !dashboardLoadInProgress else { return }
         dashboardLoadInProgress = true
@@ -528,17 +552,13 @@ final class DashboardViewModel: ObservableObject {
         }
 
         let historyDays = DashboardMonthlyDefaults.historyDays
-        let cacheKey = "dashboard.data.\(historyDays)"
+        let cacheKey = DashboardMonthlyDefaults.cacheKey
         if restoredCacheKey != cacheKey {
             restoredCacheKey = cacheKey
-            if let cached = await appState.readSessionCache(cacheKey) {
-                snapshot = DashboardSnapshot(cached.value)
-                lastUpdated = cached.cachedAt
-                cachedAt = cached.cachedAt
-                usingCachedData = true
-            }
+            await restoreCachedSnapshot(appState, cacheKey: cacheKey)
         }
-        isLoading = snapshot.siteCount == 0 && !usingCachedData
+        isLoading = !usingCachedData && !hasDisplayableData
+        if usingCachedData || hasDisplayableData { await Task.yield() }
         do {
             let raw = try await loadDashboardPayload(appState, historyDays: historyDays)
             var updatedSnapshot = DashboardSnapshot(raw)
@@ -549,20 +569,41 @@ final class DashboardViewModel: ObservableObject {
             cachedAt = nil
             usingCachedData = false
             isLoading = false
-            Task { @MainActor in
-                await Task.yield()
-                await appState.writeSessionCache(raw, name: cacheKey)
-            }
+            await Task.yield()
+            await appState.writeSessionCache(raw, name: cacheKey)
         } catch {
             guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { return }
             recordAppLog(.error, "仪表盘数据加载失败：\(error.localizedDescription)")
-            if !usingCachedData { appState.presentedError = "仪表盘数据加载失败，请稍后重试" }
+            if usingCachedData || hasDisplayableData {
+                cachedAt = cachedAt ?? lastUpdated
+                usingCachedData = true
+            } else {
+                appState.presentedError = "仪表盘数据加载失败，请稍后重试"
+            }
             isLoading = false
         }
         guard !Task.isCancelled else { return }
         async let authorizationLoad: Void = loadAuthorization(appState)
         async let downloaderLoad: Void = loadDownloaderSpeeds(appState)
         _ = await (authorizationLoad, downloaderLoad)
+    }
+
+    private func restoreCachedSnapshot(_ appState: AppState, cacheKey: String) async {
+        let candidateKeys = [cacheKey] + DashboardMonthlyDefaults.legacyCacheKeys
+        for candidateKey in candidateKeys {
+            guard let cached = await appState.readSessionCache(candidateKey) else { continue }
+            guard let cachedRoot = jsonPayloadDictionary(cached.value), !cachedRoot.isEmpty else { continue }
+            let cachedSnapshot = DashboardSnapshot(cached.value)
+            snapshot = cachedSnapshot
+            lastUpdated = cached.cachedAt
+            cachedAt = cached.cachedAt
+            usingCachedData = true
+            isLoading = false
+            if candidateKey != cacheKey {
+                await appState.writeSessionCache(cached.value, name: cacheKey)
+            }
+            return
+        }
     }
 
     private func loadDashboardPayload(_ appState: AppState, historyDays: Int) async throws -> Any {
@@ -1173,7 +1214,7 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             LazyVStack(spacing: 14) {
-                if model.isLoading {
+                if model.isLoading && !model.usingCachedData && !model.hasDisplayableData {
                     LoadingState()
                 } else {
                     if model.usingCachedData {

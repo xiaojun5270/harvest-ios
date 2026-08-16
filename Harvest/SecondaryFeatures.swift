@@ -3059,7 +3059,6 @@ private struct MediaTrailerCard: View {
 
 private struct ResourcePushCategory: Identifiable {
     let name: String
-    let savePath: String
     var id: String { name }
 }
 
@@ -3090,8 +3089,6 @@ struct ResourcePushSheet: View {
     let downloader: DownloaderItem
     @State private var downloaderID: Int
     @State private var url: String
-    @State private var savePath = ""
-    @State private var suggestedPaths: [String] = []
     @State private var sites: [SiteItem] = []
     @State private var siteIdentifier: String
     @State private var cookie: String
@@ -3126,11 +3123,8 @@ struct ResourcePushSheet: View {
         self.downloader = downloader
         let initialURL = item.string("magnet_url", "magnetUrl", "detail_url", "detailUrl", "download_url", "url") ?? ""
         let initialSite = item.string("site_id", "siteId", "site") ?? ""
-        let initialSavePath = item.string("save_path", "savePath", "download_dir", "downloadDir")
-            ?? downloader.torrentPath
         _downloaderID = State(initialValue: downloader.id)
         _url = State(initialValue: initialURL)
-        _savePath = State(initialValue: initialSavePath)
         _siteIdentifier = State(initialValue: initialSite)
         _cookie = State(initialValue: item.string("cookie") ?? "")
         _category = State(initialValue: normalizedResourcePushLabel(item.string("category", "category_name") ?? "") ?? "")
@@ -3149,34 +3143,38 @@ struct ResourcePushSheet: View {
                     resourceSummaryCard
                 }
 
-                Section("路径") {
-                    VStack(alignment: .leading, spacing: 10) {
+                Section("下载器分类") {
+                    VStack(alignment: .leading, spacing: 8) {
                         if isLoading {
                             HStack(spacing: 9) {
                                 ProgressView()
-                                Text("正在读取常用路径")
+                                Text("正在读取下载器分类")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
-                        } else if !suggestedPaths.isEmpty {
+                        } else if availableCategories.isEmpty {
+                            Text("暂无下载器分类")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
                             CompactFlowLayout(spacing: 8) {
-                                ForEach(suggestedPaths, id: \.self) { path in
+                                ForEach(availableCategories) { item in
                                     Button {
-                                        savePath = path
+                                        category = item.name
                                     } label: {
-                                        Text(pathLabel(path))
-                                            .font(.caption.weight(savePath == path ? .semibold : .regular))
-                                            .foregroundStyle(savePath == path ? HarvestTheme.blue : Color.primary)
+                                        Text(item.name)
+                                            .font(.caption.weight(category == item.name ? .semibold : .regular))
+                                            .foregroundStyle(category == item.name ? HarvestTheme.blue : Color.primary)
                                             .lineLimit(1)
                                             .padding(.horizontal, 10)
                                             .padding(.vertical, 6)
                                             .background(
-                                                savePath == path ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
+                                                category == item.name ? HarvestTheme.blue.opacity(0.11) : Color.primary.opacity(0.045),
                                                 in: RoundedRectangle(cornerRadius: 8, style: .continuous)
                                             )
                                             .overlay {
                                                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                                    .stroke(savePath == path ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
+                                                    .stroke(category == item.name ? HarvestTheme.blue.opacity(0.35) : Color.primary.opacity(0.07))
                                             }
                                     }
                                     .buttonStyle(.plain)
@@ -3184,16 +3182,6 @@ struct ResourcePushSheet: View {
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        TextField("保存路径（可选）", text: $savePath)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(Color(uiColor: .systemBackground), in: Capsule())
-                            .overlay {
-                                Capsule()
-                                    .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
-                            }
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 4, leading: 14, bottom: 8, trailing: 14))
@@ -3263,38 +3251,6 @@ struct ResourcePushSheet: View {
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
                         Toggle("跳过哈希检查", isOn: $skipChecking)
-                        if !availableCategories.isEmpty {
-                            Menu {
-                                Button("不指定分类") { category = "" }
-                                Divider()
-                                ForEach(availableCategories) { item in
-                                    Button {
-                                        category = item.name
-                                        if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                                           !item.savePath.isEmpty {
-                                            savePath = item.savePath
-                                        }
-                                    } label: {
-                                        Label(
-                                            item.name,
-                                            systemImage: category == item.name ? "checkmark" : "folder"
-                                        )
-                                    }
-                                }
-                            } label: {
-                                HStack {
-                                    Label("下载器分类", systemImage: "folder")
-                                    Spacer()
-                                    Text(category.isEmpty ? "未选择" : category)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                    Image(systemName: "chevron.up.chevron.down")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
-                        }
-                        TextField("分类（可选）", text: $category)
                         TextField("手动标签（逗号分隔）", text: $tags)
                         Toggle(
                             "自动生成下载链接",
@@ -3513,12 +3469,6 @@ struct ResourcePushSheet: View {
         return values
     }
 
-    private func pathLabel(_ path: String) -> String {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        let label = trimmed.split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? trimmed
-        return label.isEmpty ? trimmed : label
-    }
-
     private var mustGenerateTorrentURL: Bool {
         if isMTeamSiteIdentifier(siteIdentifier) { return true }
         let raw = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3556,22 +3506,17 @@ struct ResourcePushSheet: View {
 
     @MainActor private func load() async {
         defer { isLoading = false }
-        async let pathsValue = optionalValue(APIPath.downloaderPaths, label: "常用路径")
         async let sitesValue = optionalValue(APIPath.sites, label: "站点列表")
         async let tagsValue = optionalValue(APIPath.downloaderTags + "\(downloaderID)", label: "下载器标签")
         async let categoriesValue = optionalValue(
             APIPath.downloaderCategories + "\(downloaderID)",
             label: "下载器分类"
         )
-        let values = await (pathsValue, sitesValue, tagsValue, categoriesValue)
+        let values = await (sitesValue, tagsValue, categoriesValue)
 
-        suggestedPaths = values.0.map { jsonPathStrings($0) } ?? []
-        if savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            savePath = suggestedPaths.first ?? ""
-        }
-        sites = values.1.map { jsonRows($0).map(SiteItem.init) } ?? []
-        availableTags = values.2.map { normalizedResourcePushTags($0) } ?? []
-        availableCategories = values.3.map { normalizedResourcePushCategories($0) } ?? []
+        sites = values.0.map { jsonRows($0).map(SiteItem.init) } ?? []
+        availableTags = values.1.map { normalizedResourcePushTags($0) } ?? []
+        availableCategories = values.2.map { normalizedResourcePushCategories($0) } ?? []
 
         if !sites.isEmpty {
             let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3617,9 +3562,7 @@ struct ResourcePushSheet: View {
                 guard let name = normalizedResourcePushLabel(row.string("name", "category", "hash") ?? ""),
                       seen.insert(name.lowercased()).inserted else { return nil }
                 return ResourcePushCategory(
-                    name: name,
-                    savePath: row.string("savePath", "save_path", "path")?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    name: name
                 )
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
@@ -3632,7 +3575,7 @@ struct ResourcePushSheet: View {
             .filter { seen.insert($0.lowercased()).inserted }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             .prefix(200)
-            .map { ResourcePushCategory(name: $0, savePath: "") }
+            .map { ResourcePushCategory(name: $0) }
     }
 
     private func push() async {
@@ -3648,7 +3591,6 @@ struct ResourcePushSheet: View {
         let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
         if effectiveGenerateTorrentURL && !trimmedSiteIdentifier.isEmpty { body["site_id"] = trimmedSiteIdentifier }
         if !trimmedCookie.isEmpty { body["cookie"] = trimmedCookie }
-        if !savePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { body["save_path"] = savePath.trimmingCharacters(in: .whitespacesAndNewlines) }
         if let categoryValue = normalizedResourcePushLabel(category) { body["category"] = categoryValue }
         let tagValues = tags.split(separator: ",").compactMap { normalizedResourcePushLabel(String($0)) }
         if !tagValues.isEmpty { body["tags"] = tagValues }
