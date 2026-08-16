@@ -48,6 +48,7 @@ private enum DashboardMonthlyDefaults {
     // The API also returns older month-end snapshots; 30 daily points stay below PostgreSQL's argument limit.
     static let historyDays = 30
     static let cacheKey = "dashboard.data"
+    static let bootstrapCachePrefix = "dashboard.bootstrap.v1"
     static let legacyCacheKeys = [
         "dashboard.data.30",
         "dashboard.data.93",
@@ -210,6 +211,37 @@ struct DashboardSnapshot {
         return payload
     }
 
+    var bootstrapPayload: [String: Any] {
+        [
+            "totalUploaded": uploaded,
+            "totalDownloaded": downloaded,
+            "ratio": ratio,
+            "siteCount": siteCount,
+            "totalSeeding": seeding,
+            "totalSeedVol": seedVolume,
+            "totalLeeching": leeching,
+            "totalPublished": published,
+            "todayUploadIncrement": todayUploaded,
+            "todayDownloadIncrement": todayDownloaded,
+            "unread": unread,
+            "updatedAt": updatedAt,
+            "server": ["cpu": cpu, "memory": memory, "disk": disk],
+            "uploadMonthIncrementDataList": [
+                [
+                    "name": "summary",
+                    "value": monthlyHistory.map { point -> [String: Any] in
+                        [
+                            "created_at": point.key,
+                            "uploaded": point.uploaded,
+                            "downloaded": point.downloaded,
+                            "published": point.published
+                        ]
+                    }
+                ]
+            ]
+        ]
+    }
+
     init(_ raw: Any) {
         guard let root = jsonPayloadDictionary(raw) else { return }
         let overview = root.dict("overview", "summary", "statistics", "stats") ?? root
@@ -364,6 +396,42 @@ struct DashboardSnapshot {
         }
         return values.sorted { ($0.uploaded + $0.downloaded) > ($1.uploaded + $1.downloaded) }
     }
+}
+
+private func dashboardBootstrapCacheKey(_ appState: AppState) -> String? {
+    let username = appState.profile?.username.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+    guard !appState.baseURL.isEmpty, !username.isEmpty else { return nil }
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in "\(appState.baseURL)|\(username)".utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 1_099_511_628_211
+    }
+    return "\(DashboardMonthlyDefaults.bootstrapCachePrefix).\(String(hash, radix: 16))"
+}
+
+private func readDashboardBootstrapCache(_ appState: AppState) -> (snapshot: DashboardSnapshot, cachedAt: Date?)? {
+    guard let key = dashboardBootstrapCacheKey(appState),
+          let data = UserDefaults.standard.data(forKey: key),
+          let raw = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else { return nil }
+    let snapshot = DashboardSnapshot(raw)
+    guard snapshot.hasDisplayableData else { return nil }
+    let timestamp = UserDefaults.standard.double(forKey: "\(key).cachedAt")
+    return (snapshot, timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil)
+}
+
+private func writeDashboardBootstrapCache(_ snapshot: DashboardSnapshot, appState: AppState, cachedAt: Date) {
+    guard snapshot.hasDisplayableData,
+          let key = dashboardBootstrapCacheKey(appState),
+          JSONSerialization.isValidJSONObject(snapshot.bootstrapPayload),
+          let data = try? JSONSerialization.data(withJSONObject: snapshot.bootstrapPayload) else { return }
+    UserDefaults.standard.set(data, forKey: key)
+    UserDefaults.standard.set(cachedAt.timeIntervalSince1970, forKey: "\(key).cachedAt")
+}
+
+private func removeDashboardBootstrapCache(_ appState: AppState) {
+    guard let key = dashboardBootstrapCacheKey(appState) else { return }
+    UserDefaults.standard.removeObject(forKey: key)
+    UserDefaults.standard.removeObject(forKey: "\(key).cachedAt")
 }
 
 private func dashboardSiteStatuses(_ rows: [[String: Any]]) -> [DashboardSiteStatusItem] {
@@ -698,6 +766,7 @@ final class DashboardViewModel: ObservableObject {
         let cacheKey = DashboardMonthlyDefaults.cacheKey
         if restoredCacheKey != cacheKey {
             restoredCacheKey = cacheKey
+            restoreBootstrapSnapshot(appState)
             await restoreCachedSnapshot(appState, cacheKey: cacheKey)
         }
         isLoading = !usingCachedData && !hasDisplayableData
@@ -722,17 +791,28 @@ final class DashboardViewModel: ObservableObject {
         }
     }
 
+    private func restoreBootstrapSnapshot(_ appState: AppState) {
+        guard let cached = readDashboardBootstrapCache(appState) else { return }
+        snapshot = cached.snapshot
+        lastUpdated = cached.cachedAt
+        cachedAt = cached.cachedAt
+        usingCachedData = true
+        isLoading = false
+    }
+
     private func restoreCachedSnapshot(_ appState: AppState, cacheKey: String) async {
         let candidateKeys = [cacheKey] + DashboardMonthlyDefaults.legacyCacheKeys
         for candidateKey in candidateKeys {
             guard let cached = await appState.readSessionCache(candidateKey) else { continue }
             guard let cachedRoot = jsonPayloadDictionary(cached.value), !cachedRoot.isEmpty else { continue }
             let cachedSnapshot = DashboardSnapshot(cached.value)
+            guard cachedSnapshot.hasDisplayableData else { continue }
             snapshot = cachedSnapshot
             lastUpdated = cached.cachedAt
             cachedAt = cached.cachedAt
             usingCachedData = true
             isLoading = false
+            writeDashboardBootstrapCache(cachedSnapshot, appState: appState, cachedAt: cached.cachedAt)
             if candidateKey != cacheKey {
                 await appState.writeSessionCache(cached.value, name: cacheKey)
             }
@@ -749,6 +829,7 @@ final class DashboardViewModel: ObservableObject {
                 usingCachedData = true
                 isLoading = false
                 recordAppLog(.info, "仪表盘已从本地站点缓存恢复")
+                writeDashboardBootstrapCache(cachedSnapshot, appState: appState, cachedAt: cachedSites.cachedAt)
                 await appState.writeSessionCache(cachedSnapshot.persistentPayload, name: cacheKey)
             }
         }
@@ -759,9 +840,11 @@ final class DashboardViewModel: ObservableObject {
         updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
         updatedSnapshot.downloadSpeed = snapshot.downloadSpeed
         snapshot = updatedSnapshot
-        lastUpdated = Date()
+        let updatedDate = Date()
+        lastUpdated = updatedDate
         cachedAt = nil
         usingCachedData = false
+        writeDashboardBootstrapCache(updatedSnapshot, appState: appState, cachedAt: updatedDate)
         isLoading = false
         await Task.yield()
         await appState.writeSessionCache(updatedSnapshot.persistentPayload, name: cacheKey)
@@ -1319,6 +1402,7 @@ private struct DashboardCacheClearSheet: View {
         }
         URLCache.shared.removeAllCachedResponses()
         await RemoteImageDataCache.shared.removeAll()
+        removeDashboardBootstrapCache(appState)
         await appState.clearSessionCache()
         appState.setPrivacyMode(false)
         appState.setMediaTMDBEnabled(false)

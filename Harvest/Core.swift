@@ -490,7 +490,6 @@ actor AppSessionCache {
     private let directoryURL: URL
     private var memory: [String: Envelope] = [:]
     private var writesSinceTrim = 0
-    private var sanitizedLegacyFiles = false
     private let maximumDiskBytes = 48 * 1_024 * 1_024
     private let maximumEntryBytes = 12 * 1_024 * 1_024
     private let maximumAge: TimeInterval = 45 * 24 * 60 * 60
@@ -509,7 +508,6 @@ actor AppSessionCache {
     }
 
     func read(scope: String, name: String) -> AppSessionCacheRecord? {
-        sanitizeLegacyCacheIfNeeded()
         let key = memoryKey(scope: scope, name: name)
         if let envelope = memory[key] {
             return AppSessionCacheRecord(payload: envelope.payload, cachedAt: envelope.cachedAt)
@@ -540,7 +538,6 @@ actor AppSessionCache {
     }
 
     func write(scope: String, name: String, payload: Data) {
-        sanitizeLegacyCacheIfNeeded()
         guard payload.count <= maximumEntryBytes else { return }
         guard let safePayload = cacheSafePayload(payload) else { return }
         let envelope = Envelope(
@@ -592,32 +589,6 @@ actor AppSessionCache {
         values.isExcludedFromBackup = true
         var mutableURL = url
         try? mutableURL.setResourceValues(values)
-    }
-
-    private func sanitizeLegacyCacheIfNeeded() {
-        guard !sanitizedLegacyFiles else { return }
-        sanitizedLegacyFiles = true
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: directoryURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return }
-        for url in urls {
-            guard let data = try? Data(contentsOf: url),
-                  let envelope = try? JSONDecoder().decode(Envelope.self, from: data) else {
-                try? FileManager.default.removeItem(at: url)
-                continue
-            }
-            guard let safePayload = cacheSafePayload(envelope.payload) else {
-                try? FileManager.default.removeItem(at: url)
-                continue
-            }
-            guard safePayload != envelope.payload else { continue }
-            persist(
-                Envelope(scope: envelope.scope, name: envelope.name, cachedAt: envelope.cachedAt, payload: safePayload),
-                to: url
-            )
-        }
     }
 
     private func trimDiskCache() {
