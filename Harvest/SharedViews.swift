@@ -1356,6 +1356,7 @@ struct MainShellView: View {
                 SearchView { appState.selectedTab = lastNonSearchTab }
             }
         }
+        .tint(appState.accent.color)
     }
 
     private var legacyTabView: some View {
@@ -1372,6 +1373,7 @@ struct MainShellView: View {
                 .tabItem { Label("搜索", systemImage: "magnifyingglass") }
                 .tag(5)
         }
+        .tint(appState.accent.color)
     }
 
     private func presentPendingNoticeIfNeeded() {
