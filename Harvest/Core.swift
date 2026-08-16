@@ -1440,6 +1440,7 @@ final class AppState: ObservableObject {
         await RemoteImageDataCache.shared.removeAll()
         await AppLogStore.shared.clear()
         await AppSessionCache.shared.clearAll()
+        BrandMarkStore.restoreDefault()
         KeychainStore.deleteAll()
 
         let defaults = UserDefaults.standard

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -784,6 +785,8 @@ struct SettingsView: View {
     @State private var confirmingLogout = false
     @State private var confirmingRestart = false
     @State private var showingInvite = false
+    @State private var selectedBrandMarkItem: PhotosPickerItem?
+    @State private var brandMarkStatus = ""
 
     var body: some View {
         NavigationStack {
@@ -801,6 +804,36 @@ struct SettingsView: View {
                                 .lineLimit(1)
                         }
                     }.padding(.vertical, 5)
+                }
+
+                Section("品牌图标") {
+                    HStack(spacing: 14) {
+                        BrandMark(size: 58)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(BrandMarkStore.hasCustomImage ? "自定义图标" : "默认黄金图标")
+                                .font(.subheadline.weight(.semibold))
+                            Text("用于页面左上角、登录页和应用内启动页")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    PhotosPicker(selection: $selectedBrandMarkItem, matching: .images) {
+                        Label("选择自定义图标", systemImage: "photo.badge.plus")
+                    }
+                    if BrandMarkStore.hasCustomImage {
+                        Button(role: .destructive) {
+                            BrandMarkStore.restoreDefault()
+                            brandMarkStatus = "已恢复默认黄金图标"
+                        } label: {
+                            Label("恢复默认图标", systemImage: "arrow.counterclockwise")
+                        }
+                    }
+                    if !brandMarkStatus.isEmpty {
+                        Text(brandMarkStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Section("外观与隐私") {
@@ -903,8 +936,26 @@ struct SettingsView: View {
                 InviteSheet(notify: true) { }
                     .environmentObject(appState)
             }
+            .onChange(of: selectedBrandMarkItem) { _, item in
+                guard let item else { return }
+                Task { await importBrandMark(item) }
+            }
             .confirmationDialog("确定退出当前账号？", isPresented: $confirmingLogout, titleVisibility: .visible) { Button("退出登录", role: .destructive) { dismiss(); appState.logout() } }
             .confirmationDialog("确定重启 Harvest 服务？", isPresented: $confirmingRestart, titleVisibility: .visible) { Button("重启服务", role: .destructive) { Task { _ = await appState.perform(APIPath.serverRestart, method: .get) } } }
+        }
+    }
+
+    @MainActor
+    private func importBrandMark(_ item: PhotosPickerItem) async {
+        defer { selectedBrandMarkItem = nil }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self), BrandMarkStore.save(data) else {
+                brandMarkStatus = "图片无效或文件过大，请重新选择"
+                return
+            }
+            brandMarkStatus = "自定义图标已应用"
+        } catch {
+            brandMarkStatus = "读取图片失败：\(error.localizedDescription)"
         }
     }
 

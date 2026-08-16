@@ -159,16 +159,100 @@ struct LaunchView: View {
 
 struct BrandMark: View {
     var size: CGFloat = 72
+    @State private var revision = 0
 
     var body: some View {
-        Image("LaunchMark")
-            .resizable()
-            .renderingMode(.original)
+        Group {
+            if let image = BrandMarkStore.customImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .renderingMode(.original)
+            } else {
+                Image("LaunchMark")
+                    .resizable()
+                    .renderingMode(.original)
+            }
+        }
             .interpolation(.high)
             .scaledToFit()
             .frame(width: size, height: size)
             .background(Color.white, in: RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
             .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
             .accessibilityLabel("Harvest")
+            .id(revision)
+            .onReceive(NotificationCenter.default.publisher(for: .harvestBrandMarkChanged)) { _ in
+                revision &+= 1
+            }
+    }
+}
+
+extension Notification.Name {
+    static let harvestBrandMarkChanged = Notification.Name("harvest.brandMark.changed")
+}
+
+@MainActor
+enum BrandMarkStore {
+    private static let maximumSourceBytes = 24 * 1_024 * 1_024
+    private static let maximumPixelSize: CGFloat = 1_024
+    private static var cachedImage: UIImage?
+    private static var didLoadImage = false
+
+    private static var fileURL: URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let directory = base.appendingPathComponent("Harvest", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("custom-brand-mark.png")
+    }
+
+    static var customImage: UIImage? {
+        if didLoadImage { return cachedImage }
+        defer { didLoadImage = true }
+        guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
+        cachedImage = UIImage(data: data)
+        return cachedImage
+    }
+
+    static var hasCustomImage: Bool {
+        if didLoadImage { return cachedImage != nil }
+        guard let fileURL else { return false }
+        return FileManager.default.fileExists(atPath: fileURL.path)
+    }
+
+    static func save(_ sourceData: Data) -> Bool {
+        guard !sourceData.isEmpty, sourceData.count <= maximumSourceBytes,
+              let sourceImage = UIImage(data: sourceData) else { return false }
+        let sourceSize = sourceImage.size
+        guard sourceSize.width > 0, sourceSize.height > 0 else { return false }
+        let scale = min(1, maximumPixelSize / max(sourceSize.width, sourceSize.height))
+        let targetSize = CGSize(
+            width: max(1, floor(sourceSize.width * scale)),
+            height: max(1, floor(sourceSize.height * scale))
+        )
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let normalized = UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            sourceImage.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        guard let data = normalized.pngData(), data.count <= 8 * 1_024 * 1_024 else { return false }
+        guard let fileURL else { return false }
+        do {
+            try data.write(to: fileURL, options: .atomic)
+        } catch {
+            return false
+        }
+        cachedImage = normalized
+        didLoadImage = true
+        NotificationCenter.default.post(name: .harvestBrandMarkChanged, object: nil)
+        return true
+    }
+
+    static func restoreDefault() {
+        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+        cachedImage = nil
+        didLoadImage = true
+        NotificationCenter.default.post(name: .harvestBrandMarkChanged, object: nil)
     }
 }

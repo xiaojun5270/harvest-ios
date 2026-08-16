@@ -1406,6 +1406,7 @@ private struct DashboardCacheClearSheet: View {
         }
         URLCache.shared.removeAllCachedResponses()
         await RemoteImageDataCache.shared.removeAll()
+        BrandMarkStore.restoreDefault()
         removeDashboardBootstrapCache(appState)
         await appState.clearSessionCache()
         appState.setPrivacyMode(false)
