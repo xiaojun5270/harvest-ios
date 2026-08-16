@@ -5625,6 +5625,8 @@ struct SiteBrowserScreen: View {
     @State private var isCapturingScreenshot = false
     @State private var createdSiteID: Int?
     @State private var persistedSiteBody: [String: Any]?
+    @State private var torrentActionPosition: CGPoint?
+    @State private var torrentActionDragOrigin: CGPoint?
 
     init(
         site: SiteItem,
@@ -5687,30 +5689,33 @@ struct SiteBrowserScreen: View {
                 .accessibilityLabel("网页加载进度")
                 .accessibilityValue(session.loadProgress.formatted(.percent.precision(.fractionLength(0))))
         }
-        .overlay(alignment: .bottomTrailing) {
-            if hasTorrentListRules {
-                Button {
-                    Task { await extractTorrentList() }
-                } label: {
-                    Group {
-                        if isWorking {
-                            ProgressView().tint(.white)
-                        } else {
-                            Image(systemName: "checklist")
-                                .font(.system(size: 23, weight: .semibold))
+        .overlay {
+            GeometryReader { proxy in
+                if hasTorrentListRules {
+                    Button {
+                        Task { await extractTorrentList() }
+                    } label: {
+                        Group {
+                            if isWorking {
+                                ProgressView().tint(.white)
+                            } else {
+                                Image(systemName: "checklist")
+                                    .font(.system(size: 23, weight: .semibold))
+                            }
                         }
+                        .foregroundStyle(.white)
+                        .frame(width: 56, height: 56)
+                        .background(HarvestTheme.blue, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .shadow(color: HarvestTheme.blue.opacity(0.28), radius: 10, y: 5)
                     }
-                    .foregroundStyle(.white)
-                    .frame(width: 56, height: 56)
-                    .background(HarvestTheme.blue, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .shadow(color: HarvestTheme.blue.opacity(0.28), radius: 10, y: 5)
+                    .buttonStyle(.plain)
+                    .disabled(isWorking || session.isLoading)
+                    .opacity(session.isLoading ? 0.55 : 1)
+                    .accessibilityLabel("提取种子列表")
+                    .accessibilityHint("可拖动调整位置")
+                    .position(resolvedTorrentActionPosition(in: proxy.size))
+                    .highPriorityGesture(torrentActionDragGesture(in: proxy.size))
                 }
-                .buttonStyle(.plain)
-                .disabled(isWorking || session.isLoading)
-                .opacity(session.isLoading ? 0.55 : 1)
-                .accessibilityLabel("提取种子列表")
-                .padding(.trailing, 18)
-                .padding(.bottom, 18)
             }
         }
         .navigationTitle(title)
@@ -5877,6 +5882,52 @@ struct SiteBrowserScreen: View {
         .sheet(isPresented: $showScreenshotShare) {
             if let screenshotImage { ActivityShareSheet(items: [screenshotImage]) }
         }
+    }
+
+    private func resolvedTorrentActionPosition(in size: CGSize) -> CGPoint {
+        let defaultPosition = CGPoint(
+            x: max(36, size.width - 46),
+            y: max(36, size.height - 46)
+        )
+        return clampedTorrentActionPosition(torrentActionPosition ?? defaultPosition, in: size)
+    }
+
+    private func clampedTorrentActionPosition(_ position: CGPoint, in size: CGSize) -> CGPoint {
+        let minimum: CGFloat = 36
+        let maximumX = max(minimum, size.width - minimum)
+        let maximumY = max(minimum, size.height - minimum)
+        return CGPoint(
+            x: min(maximumX, max(minimum, position.x)),
+            y: min(maximumY, max(minimum, position.y))
+        )
+    }
+
+    private func torrentActionDragGesture(in size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 6)
+            .onChanged { value in
+                if torrentActionDragOrigin == nil {
+                    torrentActionDragOrigin = resolvedTorrentActionPosition(in: size)
+                }
+                guard let origin = torrentActionDragOrigin else { return }
+                torrentActionPosition = clampedTorrentActionPosition(
+                    CGPoint(
+                        x: origin.x + value.translation.width,
+                        y: origin.y + value.translation.height
+                    ),
+                    in: size
+                )
+            }
+            .onEnded { value in
+                guard let origin = torrentActionDragOrigin else { return }
+                torrentActionPosition = clampedTorrentActionPosition(
+                    CGPoint(
+                        x: origin.x + value.translation.width,
+                        y: origin.y + value.translation.height
+                    ),
+                    in: size
+                )
+                torrentActionDragOrigin = nil
+            }
     }
 
     @MainActor private func copyCurrentLink() {
