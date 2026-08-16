@@ -514,11 +514,19 @@ final class DashboardViewModel: ObservableObject {
     private var serverInterval = DashboardServerRefreshDefaults.interval
     private var serverDuration = DashboardServerRefreshDefaults.duration
     private var restoredCacheKey: String?
+    private var dashboardLoadInProgress = false
     private var downloaderSpeedTask: Task<Void, Never>?
     private var downloaderSpeedMonitoring = false
     private var downloaders: [DownloaderItem] = []
 
     func load(_ appState: AppState, days _: Int? = nil) async {
+        guard !dashboardLoadInProgress else { return }
+        dashboardLoadInProgress = true
+        defer {
+            dashboardLoadInProgress = false
+            isLoading = false
+        }
+
         let historyDays = DashboardMonthlyDefaults.historyDays
         let cacheKey = "dashboard.data.\(historyDays)"
         if restoredCacheKey != cacheKey {
@@ -531,7 +539,6 @@ final class DashboardViewModel: ObservableObject {
             }
         }
         isLoading = snapshot.siteCount == 0 && !usingCachedData
-        defer { isLoading = false }
         do {
             let raw = try await loadDashboardPayload(appState, historyDays: historyDays)
             var updatedSnapshot = DashboardSnapshot(raw)
@@ -541,11 +548,16 @@ final class DashboardViewModel: ObservableObject {
             lastUpdated = Date()
             cachedAt = nil
             usingCachedData = false
-            await appState.writeSessionCache(raw, name: cacheKey)
+            isLoading = false
+            Task { @MainActor in
+                await Task.yield()
+                await appState.writeSessionCache(raw, name: cacheKey)
+            }
         } catch {
             guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { return }
             recordAppLog(.error, "仪表盘数据加载失败：\(error.localizedDescription)")
             if !usingCachedData { appState.presentedError = "仪表盘数据加载失败，请稍后重试" }
+            isLoading = false
         }
         guard !Task.isCancelled else { return }
         async let authorizationLoad: Void = loadAuthorization(appState)
@@ -1210,15 +1222,17 @@ struct DashboardView: View {
         .refreshable { await model.load(appState, days: trendDays) }
         .onAppear { migrateDesignationOrderIfNeeded() }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
-            model.startDownloaderSpeedMonitoring(appState)
             await model.load(appState, days: trendDays)
+            guard !Task.isCancelled else { return }
+            model.startDownloaderSpeedMonitoring(appState)
             guard autoRefresh else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(max(30, refreshInterval)))
                 if !Task.isCancelled { await model.load(appState, days: trendDays) }
             }
         }
-        .task(id: "\(showServerResources)-\(serverResourceAutoStart)-\(serverResourceInterval)-\(serverResourceDuration)") {
+        .task(id: "\(model.isLoading)-\(showServerResources)-\(serverResourceAutoStart)-\(serverResourceInterval)-\(serverResourceDuration)") {
+            guard !model.isLoading else { return }
             model.configureServerMonitoring(
                 appState,
                 visible: showServerResources,

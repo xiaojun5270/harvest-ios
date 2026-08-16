@@ -806,7 +806,14 @@ struct SitesView: View {
                     .padding(.top, 8)
                     .padding(.bottom, 4)
             }
-            SiteSearchFilterBar(model: model) { showFilters = true }
+            SiteSearchFilterBar(
+                model: model,
+                openFilters: { showFilters = true },
+                openAdd: { showAdd = true },
+                openImport: { showImport = true },
+                openGenerator: { showGenerator = true },
+                openTimeline: { showTimeline = true }
+            )
             Group {
                 if model.isLoading { LoadingState() }
                 else if model.filtered.isEmpty {
@@ -885,24 +892,6 @@ struct SitesView: View {
                 }
                 .disabled(isRunningGlobalAction)
                 .accessibilityLabel("批量站点操作")
-
-                Menu {
-                    Button { showAdd = true } label: {
-                        Label("添加站点", systemImage: "plus")
-                    }
-                    Button { showImport = true } label: {
-                        Label("上传配置", systemImage: "square.and.arrow.up")
-                    }
-                    Button { showGenerator = true } label: {
-                        Label("生成配置", systemImage: "doc.badge.gearshape")
-                    }
-                    Button { showTimeline = true } label: {
-                        Label("站点时间轴", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
-                    }
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .accessibilityLabel("新增与配置")
             }
         }
         .task { if model.isLoading { await model.load(appState) } }
@@ -1023,6 +1012,10 @@ private struct SiteSearchFilterBar: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var model: SitesViewModel
     let openFilters: () -> Void
+    let openAdd: () -> Void
+    let openImport: () -> Void
+    let openGenerator: () -> Void
+    let openTimeline: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1058,6 +1051,29 @@ private struct SiteSearchFilterBar: View {
                 .buttonStyle(.bordered)
                 .tint(model.hasFilters ? HarvestTheme.blue : .secondary)
                 .accessibilityLabel("筛选，已启用 \(model.activeFilterCount) 项")
+
+                Menu {
+                    Button(action: openAdd) {
+                        Label("添加站点", systemImage: "plus")
+                    }
+                    Button(action: openImport) {
+                        Label("上传配置", systemImage: "square.and.arrow.up")
+                    }
+                    Button(action: openGenerator) {
+                        Label("生成配置", systemImage: "doc.badge.gearshape")
+                    }
+                    Button(action: openTimeline) {
+                        Label("站点时间轴", systemImage: "point.topleft.down.to.point.bottomright.curvepath")
+                    }
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.circle)
+                .controlSize(.small)
+                .accessibilityLabel("新增与配置")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)

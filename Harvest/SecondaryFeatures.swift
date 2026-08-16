@@ -1116,6 +1116,19 @@ enum ResourceSearchSortField: String, CaseIterable, Identifiable {
 fileprivate struct ResourceSearchListItem: Identifiable {
     let id: String
     let value: [String: Any]
+    let titleSortValue: String
+    let subtitleSortValue: String
+    let sizeSortValue: Double
+    let seedersSortValue: Double
+    let publishedSortValue: TimeInterval?
+    let siteValue: String
+    let saleValue: String
+    let categoryValue: String
+    let resolutionValues: Set<String>
+    let tagValues: Set<String>
+    let seasonValues: Set<String>
+    let episodeValues: Set<String>
+    let hasHR: Bool
 }
 
 private func resourceHasHRValue(_ item: [String: Any]) -> Bool {
@@ -1144,7 +1157,6 @@ final class SearchViewModel: ObservableObject {
     @Published var query = ""
     @Published var mode = "影视"
     @Published var media: [MediaItem] = []
-    @Published var resources: [[String: Any]] = []
     @Published var isLoading = false
     @Published var statusMessage = ""
     @Published var sites: [SiteItem] = []
@@ -1152,22 +1164,56 @@ final class SearchViewModel: ObservableObject {
     @Published var maxCount: Int
     @Published var sitesEnabled: Bool
     @Published var selectedSiteIDs: Set<Int>
-    @Published var resourceSortField: ResourceSearchSortField = .seeders
-    @Published var resourceSortAscending = false
-    @Published var resourceFilterSites: Set<String> = []
-    @Published var resourceFilterSales: Set<String> = []
-    @Published var resourceFilterCategories: Set<String> = []
-    @Published var resourceFilterResolutions: Set<String> = []
-    @Published var resourceFilterTags: Set<String> = []
-    @Published var resourceFilterSeasons: Set<String> = []
-    @Published var resourceFilterEpisodes: Set<String> = []
-    @Published var resourceFilterExcludeHR = false
-    @Published var resourceFilterSizeEnabled = false
-    @Published var resourceFilterMinSizeGB = 0.0
-    @Published var resourceFilterMaxSizeGB = 100.0
+    @Published var resourceSortField: ResourceSearchSortField = .seeders {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceSortAscending = false {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterSites: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterSales: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterCategories: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterResolutions: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterTags: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterSeasons: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterEpisodes: Set<String> = [] {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterExcludeHR = false {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterSizeEnabled = false {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterMinSizeGB = 0.0 {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published var resourceFilterMaxSizeGB = 100.0 {
+        didSet { scheduleResourceProjectionRebuild() }
+    }
+    @Published fileprivate var displayedResourceItems: [ResourceSearchListItem] = []
     private var searchGeneration = 0
     private var mediaSearchCache: [String: MediaSearchCacheEntry] = [:]
     private let mediaSearchCacheLifetime: TimeInterval = 5 * 60
+    private var resourceItems: [ResourceSearchListItem] = []
+    private var resourceIdentifiers: Set<String> = []
+    private var pendingResourceItems: [ResourceSearchListItem] = []
+    private var resourceFlushTask: Task<Void, Never>?
+    private var resourceProjectionTask: Task<Void, Never>?
+    private var resourceResultLimitReached = false
+    private let resourceResultLimit = 2_000
 
     init() {
         let defaults = UserDefaults.standard
@@ -1198,41 +1244,43 @@ final class SearchViewModel: ObservableObject {
         }
     }
 
-    var displayedResources: [[String: Any]] {
-        resources.filter(matchesResourceFilters).sorted(by: resourceComesBefore)
+    deinit {
+        resourceFlushTask?.cancel()
+        resourceProjectionTask?.cancel()
     }
 
-    fileprivate var displayedResourceItems: [ResourceSearchListItem] {
-        displayedResources.map { ResourceSearchListItem(id: resourceIdentifier($0), value: $0) }
-    }
+    var resourceCount: Int { resourceItems.count }
+    var displayedResourceCount: Int { displayedResourceItems.count }
+    var hasResourceResults: Bool { !resourceItems.isEmpty }
+    var hasDisplayedResourceResults: Bool { !displayedResourceItems.isEmpty }
 
     var resourceSites: [String] {
-        uniqueResourceValues { resourceSiteValue($0) }
+        uniqueResourceValues(\.siteValue)
     }
 
     var resourceSales: [String] {
-        uniqueResourceValues { resourceSaleValue($0) }
+        uniqueResourceValues(\.saleValue)
     }
 
     var resourceCategories: [String] {
-        uniqueResourceValues { resourceCategory($0) }
+        uniqueResourceValues(\.categoryValue)
     }
 
     var resourceResolutions: [String] {
-        let available = Set(resources.flatMap(resourceResolutionValues))
+        let available = Set(resourceItems.flatMap(\.resolutionValues))
         return ["720P", "1080P", "2160P", "4K", "8K"].filter(available.contains)
     }
 
     var resourceTags: [String] {
-        Array(Set(resources.flatMap(resourceTagValues))).sorted()
+        Array(Set(resourceItems.flatMap(\.tagValues))).sorted()
     }
 
     var resourceSeasons: [String] {
-        Array(Set(resources.flatMap(resourceSeasonValues))).sorted(by: numberedLabelComesBefore)
+        Array(Set(resourceItems.flatMap(\.seasonValues))).sorted(by: numberedLabelComesBefore)
     }
 
     var resourceEpisodes: [String] {
-        Array(Set(resources.flatMap(resourceEpisodeValues))).sorted(by: numberedLabelComesBefore)
+        Array(Set(resourceItems.flatMap(\.episodeValues))).sorted(by: numberedLabelComesBefore)
     }
 
     var resourceFilterCount: Int {
@@ -1259,7 +1307,7 @@ final class SearchViewModel: ObservableObject {
         if searchMode == "影视" {
             media = []
         } else {
-            resources = []
+            resetResourceResults()
         }
         defer {
             if searchGeneration == generation { isLoading = false }
@@ -1347,7 +1395,7 @@ final class SearchViewModel: ObservableObject {
                 ) {
                     guard searchGeneration == generation else { return }
                     if let message = jsonMessage(event), !message.isEmpty {
-                        statusMessage = message
+                        if statusMessage != message { statusMessage = message }
                     }
                     let explicitlyFailed = event.bool("succeed", "success") == false
                         || event.int("code").map { $0 != 0 } == true
@@ -1363,15 +1411,21 @@ final class SearchViewModel: ObservableObject {
                         let rows = jsonRows(data)
                         if rows.isEmpty, let row = jsonDictionary(data) { appendResourceRows([row]) }
                         else { appendResourceRows(rows) }
+                        if resourceResultLimitReached { break }
                     }
                 }
                 guard searchGeneration == generation, !Task.isCancelled else { return }
-                if resources.isEmpty {
+                flushPendingResourceItems()
+                if resourceItems.isEmpty {
                     statusMessage = resourceWarnings.last ?? "未找到相关资源"
                 } else {
-                    statusMessage = resourceWarnings.isEmpty
-                        ? "已找到 \(resources.count) 条资源"
-                        : "已找到 \(resources.count) 条资源，部分站点搜索失败"
+                    if resourceResultLimitReached {
+                        statusMessage = "结果较多，已显示前 \(resourceItems.count) 条资源"
+                    } else {
+                        statusMessage = resourceWarnings.isEmpty
+                            ? "已找到 \(resourceItems.count) 条资源"
+                            : "已找到 \(resourceItems.count) 条资源，部分站点搜索失败"
+                    }
                 }
             }
         } catch is CancellationError {
@@ -1379,8 +1433,11 @@ final class SearchViewModel: ObservableObject {
         } catch {
             guard searchGeneration == generation else { return }
             recordAppLog(.warning, "搜索请求未完整结束：\(error.localizedDescription)")
-            if searchMode == "资源", !resources.isEmpty {
-                statusMessage = "已找到 \(resources.count) 条资源，部分站点搜索未完成"
+            if searchMode == "资源" {
+                flushPendingResourceItems()
+            }
+            if searchMode == "资源", !resourceItems.isEmpty {
+                statusMessage = "已找到 \(resourceItems.count) 条资源，部分站点搜索未完成"
             } else {
                 statusMessage = "搜索失败：\(error.localizedDescription)"
             }
@@ -1393,9 +1450,10 @@ final class SearchViewModel: ObservableObject {
         isLoading = false
         if clearResults {
             media = []
-            resources = []
+            resetResourceResults()
             statusMessage = ""
         } else if wasLoading {
+            flushPendingResourceItems()
             statusMessage = "搜索已停止"
         }
     }
@@ -1649,17 +1707,17 @@ final class SearchViewModel: ObservableObject {
         return values.sorted(by: numberedLabelComesBefore)
     }
 
-    private func matchesResourceFilters(_ item: [String: Any]) -> Bool {
-        if !resourceFilterSites.isEmpty && !resourceFilterSites.contains(resourceSiteValue(item)) { return false }
-        if !resourceFilterSales.isEmpty && !resourceFilterSales.contains(resourceSaleValue(item)) { return false }
-        if !resourceFilterCategories.isEmpty && !resourceFilterCategories.contains(resourceCategory(item)) { return false }
-        if !resourceFilterResolutions.isEmpty && Set(resourceResolutionValues(item)).isDisjoint(with: resourceFilterResolutions) { return false }
-        if !resourceFilterTags.isEmpty && Set(resourceTagValues(item)).isDisjoint(with: resourceFilterTags) { return false }
-        if !resourceFilterSeasons.isEmpty && Set(resourceSeasonValues(item)).isDisjoint(with: resourceFilterSeasons) { return false }
-        if !resourceFilterEpisodes.isEmpty && Set(resourceEpisodeValues(item)).isDisjoint(with: resourceFilterEpisodes) { return false }
-        if resourceFilterExcludeHR && resourceHasHR(item) { return false }
+    private func matchesResourceFilters(_ item: ResourceSearchListItem) -> Bool {
+        if !resourceFilterSites.isEmpty && !resourceFilterSites.contains(item.siteValue) { return false }
+        if !resourceFilterSales.isEmpty && !resourceFilterSales.contains(item.saleValue) { return false }
+        if !resourceFilterCategories.isEmpty && !resourceFilterCategories.contains(item.categoryValue) { return false }
+        if !resourceFilterResolutions.isEmpty && item.resolutionValues.isDisjoint(with: resourceFilterResolutions) { return false }
+        if !resourceFilterTags.isEmpty && item.tagValues.isDisjoint(with: resourceFilterTags) { return false }
+        if !resourceFilterSeasons.isEmpty && item.seasonValues.isDisjoint(with: resourceFilterSeasons) { return false }
+        if !resourceFilterEpisodes.isEmpty && item.episodeValues.isDisjoint(with: resourceFilterEpisodes) { return false }
+        if resourceFilterExcludeHR && item.hasHR { return false }
         if resourceFilterSizeEnabled {
-            let bytes = resourceSize(item)
+            let bytes = item.sizeSortValue
             guard bytes > 0 else { return false }
             let gigabytes = bytes / 1_073_741_824
             if gigabytes < resourceFilterMinSizeGB || gigabytes > resourceFilterMaxSizeGB { return false }
@@ -1667,26 +1725,24 @@ final class SearchViewModel: ObservableObject {
         return true
     }
 
-    private func resourceComesBefore(_ left: [String: Any], _ right: [String: Any]) -> Bool {
+    private func resourceComesBefore(_ left: ResourceSearchListItem, _ right: ResourceSearchListItem) -> Bool {
         let primary: Int
         switch resourceSortField {
-        case .title: primary = compareText(resourceTitle(left), resourceTitle(right))
-        case .subtitle: primary = compareText(resourceSubtitle(left), resourceSubtitle(right))
-        case .size: primary = compareNumber(resourceSize(left), resourceSize(right))
-        case .seeders: primary = compareNumber(Double(resourceSeeders(left)), Double(resourceSeeders(right)))
-        case .published: primary = comparePublished(resourcePublished(left), resourcePublished(right))
+        case .title: primary = compareNormalizedText(left.titleSortValue, right.titleSortValue)
+        case .subtitle: primary = compareNormalizedText(left.subtitleSortValue, right.subtitleSortValue)
+        case .size: primary = compareNumber(left.sizeSortValue, right.sizeSortValue)
+        case .seeders: primary = compareNumber(left.seedersSortValue, right.seedersSortValue)
+        case .published: primary = comparePublished(left.publishedSortValue, right.publishedSortValue)
         }
         if primary != 0 { return primary < 0 }
-        let published = comparePublished(resourcePublished(left), resourcePublished(right))
+        let published = comparePublished(left.publishedSortValue, right.publishedSortValue)
         if published != 0 { return published < 0 }
-        return compareText(resourceTitle(left), resourceTitle(right)) < 0
+        return compareNormalizedText(left.titleSortValue, right.titleSortValue) < 0
     }
 
-    private func compareText(_ left: String, _ right: String) -> Int {
-        let lhs = left.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let rhs = right.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if lhs.isEmpty != rhs.isEmpty { return lhs.isEmpty ? 1 : -1 }
-        let comparison = lhs.localizedCompare(rhs)
+    private func compareNormalizedText(_ left: String, _ right: String) -> Int {
+        if left.isEmpty != right.isEmpty { return left.isEmpty ? 1 : -1 }
+        let comparison = left.localizedCompare(right)
         let result = comparison == .orderedAscending ? -1 : (comparison == .orderedDescending ? 1 : 0)
         return resourceSortAscending ? result : -result
     }
@@ -1697,12 +1753,10 @@ final class SearchViewModel: ObservableObject {
         return resourceSortAscending ? result : -result
     }
 
-    private func comparePublished(_ left: String, _ right: String) -> Int {
-        let lhs = resourceDateValue(left)
-        let rhs = resourceDateValue(right)
-        if (lhs == nil) != (rhs == nil) { return lhs == nil ? 1 : -1 }
-        guard let lhs, let rhs else { return 0 }
-        let result = lhs == rhs ? 0 : (lhs < rhs ? -1 : 1)
+    private func comparePublished(_ left: TimeInterval?, _ right: TimeInterval?) -> Int {
+        if (left == nil) != (right == nil) { return left == nil ? 1 : -1 }
+        guard let left, let right else { return 0 }
+        let result = left == right ? 0 : (left < right ? -1 : 1)
         return resourceSortAscending ? result : -result
     }
 
@@ -1714,8 +1768,8 @@ final class SearchViewModel: ObservableObject {
         return parseDate(text)?.timeIntervalSince1970
     }
 
-    private func uniqueResourceValues(_ pick: ([String: Any]) -> String) -> [String] {
-        Array(Set(resources.map(pick).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
+    private func uniqueResourceValues(_ pick: KeyPath<ResourceSearchListItem, String>) -> [String] {
+        Array(Set(resourceItems.map { $0[keyPath: pick].trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
     }
 
     private func uniqueMediaItems(_ items: [MediaItem]) -> [MediaItem] {
@@ -1724,12 +1778,91 @@ final class SearchViewModel: ObservableObject {
     }
 
     private func appendResourceRows(_ rows: [[String: Any]]) {
-        var identifiers = Set(resources.map(resourceIdentifier))
         for row in rows {
-            if identifiers.insert(resourceIdentifier(row)).inserted {
-                resources.append(row)
+            guard resourceItems.count + pendingResourceItems.count < resourceResultLimit else {
+                resourceResultLimitReached = true
+                break
             }
+            let identifier = resourceIdentifier(row)
+            guard resourceIdentifiers.insert(identifier).inserted else { continue }
+            pendingResourceItems.append(makeResourceListItem(row, identifier: identifier))
         }
+        scheduleResourceFlush()
+    }
+
+    private func scheduleResourceFlush() {
+        guard !pendingResourceItems.isEmpty, resourceFlushTask == nil else { return }
+        resourceFlushTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(120)) }
+            catch { return }
+            guard let self else { return }
+            self.resourceFlushTask = nil
+            self.flushPendingResourceItems()
+        }
+    }
+
+    private func flushPendingResourceItems() {
+        resourceFlushTask?.cancel()
+        resourceFlushTask = nil
+        guard !pendingResourceItems.isEmpty else { return }
+        let batch = pendingResourceItems
+        pendingResourceItems.removeAll(keepingCapacity: true)
+        resourceItems.append(contentsOf: batch)
+        rebuildResourceProjection()
+    }
+
+    private func resetResourceResults() {
+        resourceFlushTask?.cancel()
+        resourceFlushTask = nil
+        resourceProjectionTask?.cancel()
+        resourceProjectionTask = nil
+        pendingResourceItems.removeAll(keepingCapacity: false)
+        resourceItems.removeAll(keepingCapacity: false)
+        resourceIdentifiers.removeAll(keepingCapacity: false)
+        resourceResultLimitReached = false
+        displayedResourceItems = []
+    }
+
+    private func scheduleResourceProjectionRebuild() {
+        resourceProjectionTask?.cancel()
+        resourceProjectionTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(80)) }
+            catch { return }
+            guard let self else { return }
+            self.resourceProjectionTask = nil
+            self.rebuildResourceProjection()
+        }
+    }
+
+    private func rebuildResourceProjection() {
+        resourceProjectionTask?.cancel()
+        resourceProjectionTask = nil
+        let visible = resourceFilterCount == 0
+            ? resourceItems
+            : resourceItems.filter(matchesResourceFilters)
+        displayedResourceItems = visible.sorted(by: resourceComesBefore)
+    }
+
+    private func makeResourceListItem(_ item: [String: Any], identifier: String) -> ResourceSearchListItem {
+        let title = resourceTitle(item).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let subtitle = resourceSubtitle(item).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ResourceSearchListItem(
+            id: identifier,
+            value: item,
+            titleSortValue: title,
+            subtitleSortValue: subtitle,
+            sizeSortValue: resourceSize(item),
+            seedersSortValue: Double(resourceSeeders(item)),
+            publishedSortValue: resourceDateValue(resourcePublished(item)),
+            siteValue: resourceSiteValue(item),
+            saleValue: resourceSaleValue(item),
+            categoryValue: resourceCategory(item),
+            resolutionValues: Set(resourceResolutionValues(item)),
+            tagValues: Set(resourceTagValues(item)),
+            seasonValues: Set(resourceSeasonValues(item)),
+            episodeValues: Set(resourceEpisodeValues(item)),
+            hasHR: resourceHasHR(item)
+        )
     }
 
     func resourceIdentifier(_ item: [String: Any]) -> String {
@@ -1950,7 +2083,7 @@ struct SearchView: View {
                             Button { selectedResource = ResourceSelection(value: item.value) } label: {
                                 ResourceRowItem(
                                     item: item.value,
-                                    siteLabel: model.siteLabel(model.resourceSiteValue(item.value))
+                                    siteLabel: model.siteLabel(item.siteValue)
                                 )
                             }
                                 .buttonStyle(.plain)
@@ -2036,8 +2169,8 @@ struct SearchView: View {
             .accessibilityLabel(model.resourceSortAscending ? "升序" : "降序")
 
             Spacer(minLength: 0)
-            if !model.resources.isEmpty {
-                Text("\(model.displayedResources.count)/\(model.resources.count)")
+            if model.hasResourceResults {
+                Text("\(model.displayedResourceCount)/\(model.resourceCount)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -2094,7 +2227,7 @@ struct SearchView: View {
     }
 
     private var currentResultsAreEmpty: Bool {
-        model.mode == "影视" ? model.media.isEmpty : model.displayedResources.isEmpty
+        model.mode == "影视" ? model.media.isEmpty : !model.hasDisplayedResourceResults
     }
 
     private var searchStatusIsWarning: Bool {
@@ -2106,7 +2239,7 @@ struct SearchView: View {
     private var emptyMessage: String {
         if !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            !model.statusMessage.isEmpty {
-            if model.mode == "资源", !model.resources.isEmpty, model.displayedResources.isEmpty {
+            if model.mode == "资源", model.hasResourceResults, !model.hasDisplayedResourceResults {
                 return "当前筛选条件没有匹配资源"
             }
             return model.statusMessage
