@@ -3059,6 +3059,7 @@ private struct MediaTrailerCard: View {
 
 private struct ResourcePushCategory: Identifiable {
     let name: String
+    let savePath: String
     var id: String { name }
 }
 
@@ -3096,6 +3097,7 @@ struct ResourcePushSheet: View {
     @State private var category: String
     @State private var tags: String
     @State private var availableCategories: [ResourcePushCategory] = []
+    @State private var defaultSavePath = ""
     @State private var availableTags: [String] = []
     @State private var paused = false
     @State private var skipChecking = false
@@ -3160,7 +3162,9 @@ struct ResourcePushSheet: View {
                             CompactFlowLayout(spacing: 8) {
                                 ForEach(availableCategories) { item in
                                     Button {
-                                        category = item.name
+                                        withAnimation(.easeInOut(duration: 0.18)) {
+                                            category = item.name
+                                        }
                                     } label: {
                                         Text(item.name)
                                             .font(.caption.weight(category == item.name ? .semibold : .regular))
@@ -3181,6 +3185,30 @@ struct ResourcePushSheet: View {
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if !category.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Label("保存路径", systemImage: "folder")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                Text(selectedCategoryPath.isEmpty ? "使用下载器默认保存路径" : selectedCategoryPath)
+                                    .font(.subheadline.monospaced())
+                                    .foregroundStyle(selectedCategoryPath.isEmpty ? Color.secondary : Color.primary)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.72)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 10)
+                                    .background(
+                                        Color(uiColor: .systemBackground),
+                                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    )
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+                                    }
+                            }
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                         }
                     }
                 }
@@ -3484,6 +3512,14 @@ struct ResourcePushSheet: View {
         generateTorrentURL || mustGenerateTorrentURL
     }
 
+    private var selectedCategoryPath: String {
+        guard !category.isEmpty else { return "" }
+        let categoryPath = availableCategories.first {
+            $0.name.caseInsensitiveCompare(category) == .orderedSame
+        }?.savePath.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return categoryPath.isEmpty ? defaultSavePath : categoryPath
+    }
+
     private var selectedTagValues: Set<String> {
         Set(
             tags.split(separator: ",")
@@ -3512,11 +3548,19 @@ struct ResourcePushSheet: View {
             APIPath.downloaderCategories + "\(downloaderID)",
             label: "下载器分类"
         )
+        async let preferencesValue = optionalValue(
+            APIPath.downloaderPreferences + "\(downloaderID)",
+            label: "下载器默认路径",
+            timeoutInterval: 8
+        )
         let values = await (sitesValue, tagsValue, categoriesValue)
 
         sites = values.0.map { jsonRows($0).map(SiteItem.init) } ?? []
         availableTags = values.1.map { normalizedResourcePushTags($0) } ?? []
         availableCategories = values.2.map { normalizedResourcePushCategories($0) } ?? []
+        isLoading = false
+        let preferences = await preferencesValue
+        defaultSavePath = preferences.map(resourcePushDefaultSavePath) ?? ""
 
         if !sites.isEmpty {
             let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3533,8 +3577,12 @@ struct ResourcePushSheet: View {
         }
     }
 
-    @MainActor private func optionalValue(_ path: String, label: String) async -> Any? {
-        do { return try await appState.api(path) }
+    @MainActor private func optionalValue(
+        _ path: String,
+        label: String,
+        timeoutInterval: TimeInterval? = nil
+    ) async -> Any? {
+        do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
         catch {
             recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
             return nil
@@ -3555,27 +3603,67 @@ struct ResourcePushSheet: View {
     }
 
     private func normalizedResourcePushCategories(_ raw: Any) -> [ResourcePushCategory] {
-        let rows = jsonRows(raw)
+        let payload: Any = jsonPayloadDictionary(raw) ?? raw
+        let rows = jsonRows(payload)
         if !rows.isEmpty {
             var seen = Set<String>()
             return rows.compactMap { row in
                 guard let name = normalizedResourcePushLabel(row.string("name", "category", "hash") ?? ""),
                       seen.insert(name.lowercased()).inserted else { return nil }
                 return ResourcePushCategory(
-                    name: name
+                    name: name,
+                    savePath: row.string("savePath", "save_path", "path", "downloadDir", "download_dir") ?? ""
                 )
             }
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             .prefix(200)
             .map { $0 }
         }
+
+        if let dictionary = payload as? [String: Any] {
+            var seen = Set<String>()
+            let mapped = dictionary.compactMap { key, value -> ResourcePushCategory? in
+                let nested = value as? [String: Any]
+                let rawName = nested?.string("name", "category") ?? key
+                guard let name = normalizedResourcePushLabel(rawName),
+                      seen.insert(name.lowercased()).inserted else { return nil }
+                let savePath = nested?.string("savePath", "save_path", "path", "downloadDir", "download_dir")
+                    ?? (value as? String)
+                    ?? ""
+                return ResourcePushCategory(name: name, savePath: savePath)
+            }
+            if !mapped.isEmpty {
+                return mapped
+                    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                    .prefix(200)
+                    .map { $0 }
+            }
+        }
+
         var seen = Set<String>()
-        return jsonStrings(raw)
+        return jsonStrings(payload)
             .compactMap(normalizedResourcePushLabel)
             .filter { seen.insert($0.lowercased()).inserted }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             .prefix(200)
-            .map { ResourcePushCategory(name: $0) }
+            .map { ResourcePushCategory(name: $0, savePath: "") }
+    }
+
+    private func resourcePushDefaultSavePath(_ raw: Any) -> String {
+        guard let dictionary = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return "" }
+        for key in ["save_path", "savePath", "download-dir", "download_dir", "downloadDir"] {
+            if let value = dictionary[key] as? String {
+                let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !path.isEmpty { return path }
+            }
+        }
+        for key in ["preferences", "prefs", "data"] {
+            if let nested = dictionary[key] {
+                let path = resourcePushDefaultSavePath(nested)
+                if !path.isEmpty { return path }
+            }
+        }
+        return ""
     }
 
     private func push() async {

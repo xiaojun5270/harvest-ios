@@ -47,7 +47,6 @@ private enum DashboardMonthlyDefaults {
     static let visibleMonthCount = 3
     // The API also returns older month-end snapshots; 30 daily points stay below PostgreSQL's argument limit.
     static let historyDays = 30
-    static let fallbackHistoryDays = 7
     static let cacheKey = "dashboard.data"
     static let legacyCacheKeys = [
         "dashboard.data.30",
@@ -161,6 +160,56 @@ struct DashboardSnapshot {
             || !trends.isEmpty
     }
 
+    var persistentPayload: [String: Any] {
+        var payload: [String: Any] = [
+            "totalUploaded": uploaded,
+            "totalDownloaded": downloaded,
+            "ratio": ratio,
+            "siteCount": siteCount,
+            "totalSeeding": seeding,
+            "totalSeedVol": seedVolume,
+            "totalLeeching": leeching,
+            "totalPublished": published,
+            "todayUploadIncrement": todayUploaded,
+            "todayDownloadIncrement": todayDownloaded,
+            "unread": unread,
+            "updatedAt": updatedAt,
+            "server": ["cpu": cpu, "memory": memory, "disk": disk],
+            "statusList": siteStatuses.map { item -> [String: Any] in
+                [
+                    "name": item.name,
+                    "value": [
+                        "uploaded": item.uploaded,
+                        "downloaded": item.downloaded,
+                        "published": item.published
+                    ] as [String: Any]
+                ]
+            },
+            "uploadMonthIncrementDataList": siteHistory.map { series -> [String: Any] in
+                [
+                    "name": series.name,
+                    "value": series.points.map { point -> [String: Any] in
+                        [
+                            "created_at": point.key,
+                            "uploaded": point.uploaded,
+                            "downloaded": point.downloaded,
+                            "published": point.published
+                        ]
+                    }
+                ]
+            },
+            "seedDataList": seedDistribution.map { ["name": $0.name, "value": $0.value] as [String: Any] },
+            "uploadIncrementDataList": todayUploadDistribution.map { ["name": $0.name, "value": $0.value] as [String: Any] },
+            "downloadIncrementDataList": todayDownloadDistribution.map { ["name": $0.name, "value": $0.value] as [String: Any] },
+            "usernameCount": usernameDistribution.map { ["name": $0.name, "value": $0.value] as [String: Any] },
+            "emailCount": emailDistribution.map { ["name": $0.name, "value": $0.value] as [String: Any] }
+        ]
+        if !earliestSite.isEmpty || !earliestJoinedAt.isEmpty {
+            payload["earliestSite"] = ["site": earliestSite, "time_join": earliestJoinedAt]
+        }
+        return payload
+    }
+
     init(_ raw: Any) {
         guard let root = jsonPayloadDictionary(raw) else { return }
         let overview = root.dict("overview", "summary", "statistics", "stats") ?? root
@@ -197,6 +246,100 @@ struct DashboardSnapshot {
         earliestSite = earliest.string("site", "name", "nickname") ?? ""
         earliestJoinedAt = earliest.string("time_join", "timeJoin", "joined_at") ?? ""
         updatedAt = root.string("updatedAt", "updated_at") ?? ""
+    }
+
+    init(sites: [SiteItem]) {
+        let visibleSites = sites.filter(\.showInDashboard)
+        siteCount = visibleSites.count
+        uploaded = visibleSites.reduce(0) { $0 + max(0, $1.uploaded) }
+        downloaded = visibleSites.reduce(0) { $0 + max(0, $1.downloaded) }
+        ratio = downloaded > 0 ? uploaded / downloaded : 0
+        seeding = visibleSites.reduce(0) { $0 + max(0, $1.seeding) }
+        seedVolume = visibleSites.reduce(0) { $0 + max(0, $1.seedVolume) }
+        leeching = visibleSites.reduce(0) { $0 + max(0, $1.leeching) }
+        published = visibleSites.reduce(0) { $0 + max(0, $1.published) }
+        todayUploaded = visibleSites.reduce(0) { $0 + max(0, $1.uploadDelta) }
+        todayDownloaded = visibleSites.reduce(0) { $0 + max(0, $1.downloadDelta) }
+        unread = visibleSites.reduce(0) { $0 + max(0, $1.unread) }
+
+        siteStatuses = visibleSites.compactMap { site in
+            guard site.uploaded > 0 || site.downloaded > 0 || site.published > 0 else { return nil }
+            return DashboardSiteStatusItem(
+                name: site.name,
+                uploaded: site.uploaded,
+                downloaded: site.downloaded,
+                published: Double(site.published)
+            )
+        }
+        .sorted { $0.uploaded > $1.uploaded }
+        siteUploadDistribution = siteStatuses.map { DashboardDistributionItem(name: $0.name, value: $0.uploaded) }
+            .filter { $0.value > 0 }
+        siteDownloadDistribution = siteStatuses.map { DashboardDistributionItem(name: $0.name, value: $0.downloaded) }
+            .filter { $0.value > 0 }
+        seedDistribution = visibleSites.compactMap { site in
+            guard site.seedVolume > 0 else { return nil }
+            return DashboardDistributionItem(name: site.name, value: site.seedVolume)
+        }
+        .sorted { $0.value > $1.value }
+        todayUploadDistribution = visibleSites.compactMap { site in
+            guard site.uploadDelta > 0 else { return nil }
+            return DashboardDistributionItem(name: site.name, value: site.uploadDelta)
+        }
+        .sorted { $0.value > $1.value }
+        todayDownloadDistribution = visibleSites.compactMap { site in
+            guard site.downloadDelta > 0 else { return nil }
+            return DashboardDistributionItem(name: site.name, value: site.downloadDelta)
+        }
+        .sorted { $0.value > $1.value }
+
+        siteHistory = visibleSites.compactMap { site in
+            let points = site.statusHistory.compactMap { row -> DashboardSiteHistoryPoint? in
+                guard let key = row.string("date", "created_at", "createdAt", "updated_at")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !key.isEmpty else { return nil }
+                return DashboardSiteHistoryPoint(
+                    key: key,
+                    uploaded: row.double("uploaded", "upload") ?? 0,
+                    downloaded: row.double("downloaded", "download") ?? 0,
+                    published: row.double("published", "publish") ?? 0
+                )
+            }
+            guard !points.isEmpty else { return nil }
+            return DashboardSiteHistorySeries(name: site.name, points: points)
+        }
+        monthlyHistory = dashboardMonthlyHistory(siteHistory)
+
+        var trendTotals: [String: (upload: Double, download: Double)] = [:]
+        for series in siteHistory {
+            for point in series.points {
+                let current = trendTotals[point.key] ?? (0, 0)
+                trendTotals[point.key] = (current.upload + point.uploaded, current.download + point.downloaded)
+            }
+        }
+        trends = trendTotals.keys.sorted().compactMap { key in
+            guard let date = parseDate(key), let value = trendTotals[key] else { return nil }
+            return TrendPoint(date: date, upload: value.upload, download: value.download)
+        }
+
+        func groupedDistribution(_ values: [String]) -> [DashboardDistributionItem] {
+            var counts: [String: Double] = [:]
+            for value in values {
+                let key = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !key.isEmpty { counts[key, default: 0] += 1 }
+            }
+            return counts.map { DashboardDistributionItem(name: $0.key, value: $0.value) }
+                .sorted { $0.value > $1.value }
+        }
+        usernameDistribution = groupedDistribution(visibleSites.map(\.username))
+        emailDistribution = groupedDistribution(visibleSites.map(\.email))
+
+        if let earliest = visibleSites.compactMap({ site -> (site: SiteItem, date: Date)? in
+            guard let date = parseDate(site.joinedAt) else { return nil }
+            return (site, date)
+        }).min(by: { $0.date < $1.date }) {
+            earliestSite = earliest.site.name
+            earliestJoinedAt = earliest.site.joinedAt
+        }
+        updatedAt = visibleSites.map(\.updatedAt).filter { !$0.isEmpty }.max() ?? ""
     }
 
     func siteIncrements(days: Int) -> [DashboardSiteIncrementItem] {
@@ -559,33 +702,24 @@ final class DashboardViewModel: ObservableObject {
         }
         isLoading = !usingCachedData && !hasDisplayableData
         if usingCachedData || hasDisplayableData { await Task.yield() }
+
         do {
-            let raw = try await loadDashboardPayload(appState, historyDays: historyDays)
-            var updatedSnapshot = DashboardSnapshot(raw)
-            updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
-            updatedSnapshot.downloadSpeed = snapshot.downloadSpeed
-            snapshot = updatedSnapshot
-            lastUpdated = Date()
-            cachedAt = nil
-            usingCachedData = false
-            isLoading = false
-            await Task.yield()
-            await appState.writeSessionCache(raw, name: cacheKey)
+            let raw = try await appState.api(
+                APIPath.dashboard,
+                query: ["days": historyDays],
+                timeoutInterval: 15
+            )
+            await applyDashboardPayload(raw, appState: appState, cacheKey: cacheKey)
         } catch {
-            guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { return }
-            recordAppLog(.error, "仪表盘数据加载失败：\(error.localizedDescription)")
-            if usingCachedData || hasDisplayableData {
-                cachedAt = cachedAt ?? lastUpdated
-                usingCachedData = true
-            } else {
-                appState.presentedError = "仪表盘数据加载失败，请稍后重试"
-            }
-            isLoading = false
+            handleDashboardLoadFailure(error, appState: appState)
         }
         guard !Task.isCancelled else { return }
-        async let authorizationLoad: Void = loadAuthorization(appState)
-        async let downloaderLoad: Void = loadDownloaderSpeeds(appState)
-        _ = await (authorizationLoad, downloaderLoad)
+        Task { [weak self] in
+            guard let self else { return }
+            async let authorizationLoad: Void = self.loadAuthorization(appState)
+            async let downloaderLoad: Void = self.loadDownloaderSpeeds(appState)
+            _ = await (authorizationLoad, downloaderLoad)
+        }
     }
 
     private func restoreCachedSnapshot(_ appState: AppState, cacheKey: String) async {
@@ -604,20 +738,45 @@ final class DashboardViewModel: ObservableObject {
             }
             return
         }
+
+        if let cachedSites = await appState.readSessionCache("site.info.list") {
+            let sites = jsonRows(cachedSites.value).map(SiteItem.init)
+            let cachedSnapshot = DashboardSnapshot(sites: sites)
+            if cachedSnapshot.hasDisplayableData {
+                snapshot = cachedSnapshot
+                lastUpdated = cachedSites.cachedAt
+                cachedAt = cachedSites.cachedAt
+                usingCachedData = true
+                isLoading = false
+                recordAppLog(.info, "仪表盘已从本地站点缓存恢复")
+                await appState.writeSessionCache(cachedSnapshot.persistentPayload, name: cacheKey)
+            }
+        }
     }
 
-    private func loadDashboardPayload(_ appState: AppState, historyDays: Int) async throws -> Any {
-        do {
-            return try await appState.api(APIPath.dashboard, query: ["days": historyDays])
-        } catch {
-            guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { throw error }
-            let fallbackDays = DashboardMonthlyDefaults.fallbackHistoryDays
-            recordAppLog(
-                .warning,
-                "仪表盘 \(historyDays) 天数据加载失败，降级为 \(fallbackDays) 天：\(error.localizedDescription)"
-            )
-            return try await appState.api(APIPath.dashboard, query: ["days": fallbackDays])
+    private func applyDashboardPayload(_ raw: Any, appState: AppState, cacheKey: String) async {
+        var updatedSnapshot = DashboardSnapshot(raw)
+        updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
+        updatedSnapshot.downloadSpeed = snapshot.downloadSpeed
+        snapshot = updatedSnapshot
+        lastUpdated = Date()
+        cachedAt = nil
+        usingCachedData = false
+        isLoading = false
+        await Task.yield()
+        await appState.writeSessionCache(updatedSnapshot.persistentPayload, name: cacheKey)
+    }
+
+    private func handleDashboardLoadFailure(_ error: Error, appState: AppState) {
+        guard !Task.isCancelled, !isDashboardRequestCancellation(error) else { return }
+        recordAppLog(.error, "仪表盘数据加载失败：\(error.localizedDescription)")
+        if usingCachedData || hasDisplayableData {
+            cachedAt = cachedAt ?? lastUpdated
+            usingCachedData = true
+        } else {
+            appState.presentedError = "仪表盘数据加载失败，请稍后重试"
         }
+        isLoading = false
     }
 
     func startDownloaderSpeedMonitoring(_ appState: AppState) {
