@@ -7256,12 +7256,14 @@ struct SiteEditorSheet: View {
     }
 
     private func applyConfigDefaults(_ key: String) {
-        guard site == nil, let config = availableConfigs[key] else {
-            if site == nil, name.isEmpty { name = key }
+        guard site == nil else { return }
+        guard let config = availableConfigs[key] else {
+            name = key
+            url = ""
             return
         }
         name = config.string("nickname", "name") ?? key
-        if url.isEmpty { url = config.strings("url").first ?? config.string("url") ?? "" }
+        url = config.strings("url").first ?? config.string("url") ?? ""
         signin = config.bool("sign_in", "signIn") ?? signin
         getInfo = config.bool("get_info", "getInfo") ?? getInfo
         repeatTorrents = config.bool("repeat_torrents", "repeatTorrents") ?? repeatTorrents
