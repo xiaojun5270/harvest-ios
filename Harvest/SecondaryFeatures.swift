@@ -1300,6 +1300,10 @@ final class SearchViewModel: ObservableObject {
         searchGeneration &+= 1
         let generation = searchGeneration
         let searchMode = mode
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            searchMode == "资源" ? .resourceSearch : .mediaSearch
+        )
+        defer { performanceInterval.end() }
         addHistory(term)
         statusMessage = searchMode == "资源" ? "开始搜索「\(term)」" : "正在搜索影视信息"
         if searchMode == "资源" { resourceSearchMessages = [statusMessage] }
@@ -1471,6 +1475,10 @@ final class SearchViewModel: ObservableObject {
         source: String,
         query: [String: Any] = [:]
     ) async -> MediaSearchResult {
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            isDoubanSource(source) ? .doubanLoad : .tmdbLoad
+        )
+        defer { performanceInterval.end() }
         do {
             let raw = try await appState.api(path, query: query, timeoutInterval: 12)
             let rows = mediaRows(raw)
@@ -3832,6 +3840,12 @@ private struct MediaCatalogNetworkResult: @unchecked Sendable {
     let errorMessage: String?
 }
 
+private struct MediaCatalogCacheResult: @unchecked Sendable {
+    let cacheKey: String
+    let collection: MediaCollection
+    let cachedAt: Date
+}
+
 struct NewsView: View {
     @EnvironmentObject private var appState: AppState
     @State private var collections: [MediaCollection] = []
@@ -3845,6 +3859,7 @@ struct NewsView: View {
     @State private var cachedCatalogSignatures: Set<String> = []
     @State private var catalogCacheDates: [String: Date] = [:]
     @State private var loadGeneration = 0
+    @State private var loadingSignature: String?
     @State private var selectedMedia: MediaItem?
     @State private var selectedCollection: MediaCollection?
     @State private var showNotices = false
@@ -3960,16 +3975,27 @@ struct NewsView: View {
 
     private func load(forceRefresh: Bool = false) async {
         guard let source = activeSource else {
+            loadGeneration &+= 1
+            loadingSignature = nil
             collections = []
             isLoading = false
             usingCachedData = false
             cachedAt = nil
             return
         }
-        loadGeneration &+= 1
-        let generation = loadGeneration
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            source == .douban ? .doubanLoad : .tmdbLoad
+        )
+        defer { performanceInterval.end() }
         let definitions = catalogDefinitions(for: source)
         let signature = definitions.map(\.cacheKey).joined(separator: "\n")
+        if !forceRefresh, loadingSignature == signature { return }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        loadingSignature = signature
+        defer {
+            if loadGeneration == generation { loadingSignature = nil }
+        }
         usingCachedData = cachedCatalogSignatures.contains(signature)
         cachedAt = catalogCacheDates[signature]
         let definitionKeys = Set(definitions.map(\.cacheKey))
@@ -3985,24 +4011,36 @@ struct NewsView: View {
             var restored: [String: MediaCollection] = [:]
             var newestCacheDate: Date?
             var oldestCacheDate: Date?
-            for definition in definitions {
-                guard loadGeneration == generation, !Task.isCancelled else { return }
-                guard let cached = await cachedCollection(definition) else { continue }
-                if !cached.collection.items.isEmpty {
-                    restored[definition.cacheKey] = cached.collection
-                    previous[definition.cacheKey] = cached.collection
-                    replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
-                    isLoading = false
+            await withTaskGroup(of: MediaCatalogCacheResult?.self) { group in
+                for definition in definitions {
+                    group.addTask {
+                        await Self.cachedCollection(definition, appState: appState)
+                    }
                 }
-                if cached.cachedAt > (newestCacheDate ?? .distantPast) {
-                    newestCacheDate = cached.cachedAt
-                }
-                if cached.cachedAt < (oldestCacheDate ?? .distantFuture) {
-                    oldestCacheDate = cached.cachedAt
+                while let cached = await group.next() {
+                    guard loadGeneration == generation, !Task.isCancelled else {
+                        group.cancelAll()
+                        return
+                    }
+                    guard let cached else { continue }
+                    if !cached.collection.items.isEmpty {
+                        restored[cached.cacheKey] = cached.collection
+                        previous[cached.cacheKey] = cached.collection
+                    }
+                    if cached.cachedAt > (newestCacheDate ?? .distantPast) {
+                        newestCacheDate = cached.cachedAt
+                    }
+                    if cached.cachedAt < (oldestCacheDate ?? .distantFuture) {
+                        oldestCacheDate = cached.cachedAt
+                    }
                 }
             }
             guard loadGeneration == generation, !Task.isCancelled else { return }
             previous.merge(restored) { _, restoredValue in restoredValue }
+            if !restored.isEmpty {
+                replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
+                isLoading = false
+            }
             restoredCatalogSignatures.insert(signature)
             replaceCollections(for: source, with: definitions.compactMap { previous[$0.cacheKey] })
             cachedAt = newestCacheDate
@@ -4128,16 +4166,22 @@ struct NewsView: View {
         }
     }
 
-    private func cachedCollection(
-        _ definition: MediaCatalogDefinition
-    ) async -> (collection: MediaCollection, cachedAt: Date)? {
-        guard let cached = await appState.readSessionCacheData(definition.cacheKey) else { return nil }
+    private static func cachedCollection(
+        _ definition: MediaCatalogDefinition,
+        appState: AppState
+    ) async -> MediaCatalogCacheResult? {
+        guard !Task.isCancelled,
+              let cached = await appState.readSessionCacheData(definition.cacheKey) else { return nil }
         let payload = cached.payload
         let collection = await Task.detached(priority: .utility) {
             Self.decodeCollection(payload, definition: definition)
         }.value
-        guard let collection else { return nil }
-        return (collection, cached.cachedAt)
+        guard !Task.isCancelled, let collection else { return nil }
+        return MediaCatalogCacheResult(
+            cacheKey: definition.cacheKey,
+            collection: collection,
+            cachedAt: cached.cachedAt
+        )
     }
 
     private static func fetchCatalog(

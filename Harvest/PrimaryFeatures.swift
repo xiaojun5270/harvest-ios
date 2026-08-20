@@ -65,10 +65,10 @@ private enum DashboardMonthlyDefaults {
 
 private enum DashboardListLayout {
     static let visibleRows = 10
-    static let siteRowHeight: CGFloat = 58
-    static let distributionRowHeight: CGFloat = 48
-    static let incrementRowHeight: CGFloat = 50
-    static let accountRowHeight: CGFloat = 36
+    static let siteRowHeight: CGFloat = 54
+    static let distributionRowHeight: CGFloat = 46
+    static let incrementRowHeight: CGFloat = 46
+    static let accountRowHeight: CGFloat = 34
 }
 
 private func isDashboardRequestCancellation(_ error: Error) -> Bool {
@@ -119,7 +119,11 @@ struct DashboardMonthlyPoint: Identifiable {
     var id: String { key }
 }
 
-struct DashboardSnapshot {
+private struct DashboardRawPayload: @unchecked Sendable {
+    let value: Any
+}
+
+struct DashboardSnapshot: @unchecked Sendable {
     var uploaded: Double = 0
     var downloaded: Double = 0
     var uploadSpeed: Double = 0
@@ -751,6 +755,7 @@ final class DashboardViewModel: ObservableObject {
     private var serverInterval = DashboardServerRefreshDefaults.interval
     private var serverDuration = DashboardServerRefreshDefaults.duration
     private var restoredCacheKey: String?
+    private var cacheRestoreTask: Task<Void, Never>?
     private var dashboardLoadInProgress = false
     private var downloaderSpeedTask: Task<Void, Never>?
     private var downloaderSpeedMonitoring = false
@@ -760,6 +765,8 @@ final class DashboardViewModel: ObservableObject {
 
     func load(_ appState: AppState, days _: Int? = nil) async {
         guard !dashboardLoadInProgress else { return }
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.dashboardLoad)
+        defer { performanceInterval.end() }
         dashboardLoadInProgress = true
         defer {
             dashboardLoadInProgress = false
@@ -771,7 +778,10 @@ final class DashboardViewModel: ObservableObject {
         if restoredCacheKey != cacheKey {
             restoredCacheKey = cacheKey
             restoreBootstrapSnapshot(appState)
-            await restoreCachedSnapshot(appState, cacheKey: cacheKey)
+            cacheRestoreTask?.cancel()
+            cacheRestoreTask = Task { [weak self] in
+                await self?.restoreCachedSnapshot(appState, cacheKey: cacheKey)
+            }
         }
         isLoading = !usingCachedData && !hasDisplayableData
         if usingCachedData || hasDisplayableData { await Task.yield() }
@@ -805,12 +815,22 @@ final class DashboardViewModel: ObservableObject {
     }
 
     private func restoreCachedSnapshot(_ appState: AppState, cacheKey: String) async {
+        guard usingCachedData || !hasDisplayableData else { return }
         let candidateKeys = [cacheKey] + DashboardMonthlyDefaults.legacyCacheKeys
         for candidateKey in candidateKeys {
-            guard let cached = await appState.readSessionCache(candidateKey) else { continue }
-            guard let cachedRoot = jsonPayloadDictionary(cached.value), !cachedRoot.isEmpty else { continue }
-            let cachedSnapshot = DashboardSnapshot(cached.value)
-            guard cachedSnapshot.hasDisplayableData else { continue }
+            guard let cached = await appState.readSessionCacheData(candidateKey) else { continue }
+            let cachedSnapshot = await Task.detached(priority: .utility) { () -> DashboardSnapshot? in
+                guard let raw = try? JSONSerialization.jsonObject(
+                    with: cached.payload,
+                    options: [.fragmentsAllowed]
+                ),
+                    let root = jsonPayloadDictionary(raw),
+                    !root.isEmpty else { return nil }
+                let snapshot = DashboardSnapshot(raw)
+                return snapshot.hasDisplayableData ? snapshot : nil
+            }.value
+            guard let cachedSnapshot else { continue }
+            guard usingCachedData || !hasDisplayableData else { return }
             snapshot = cachedSnapshot
             lastUpdated = cached.cachedAt
             cachedAt = cached.cachedAt
@@ -818,15 +838,21 @@ final class DashboardViewModel: ObservableObject {
             isLoading = false
             writeDashboardBootstrapCache(cachedSnapshot, appState: appState, cachedAt: cached.cachedAt)
             if candidateKey != cacheKey {
-                await appState.writeSessionCache(cached.value, name: cacheKey)
+                await appState.writeSessionCacheData(cached.payload, name: cacheKey)
             }
             return
         }
 
-        if let cachedSites = await appState.readSessionCache("site.info.list") {
-            let sites = jsonRows(cachedSites.value).map(SiteItem.init)
-            let cachedSnapshot = DashboardSnapshot(sites: sites)
-            if cachedSnapshot.hasDisplayableData {
+        if let cachedSites = await appState.readSessionCacheData("site.info.list") {
+            let cachedSnapshot = await Task.detached(priority: .utility) {
+                guard let raw = try? JSONSerialization.jsonObject(
+                    with: cachedSites.payload,
+                    options: [.fragmentsAllowed]
+                ) else { return DashboardSnapshot([String: Any]()) }
+                let sites = jsonRows(raw).map(SiteItem.init)
+                return DashboardSnapshot(sites: sites)
+            }.value
+            if cachedSnapshot.hasDisplayableData, usingCachedData || !hasDisplayableData {
                 snapshot = cachedSnapshot
                 lastUpdated = cachedSites.cachedAt
                 cachedAt = cachedSites.cachedAt
@@ -840,7 +866,11 @@ final class DashboardViewModel: ObservableObject {
     }
 
     private func applyDashboardPayload(_ raw: Any, appState: AppState, cacheKey: String) async {
-        var updatedSnapshot = DashboardSnapshot(raw)
+        let payload = DashboardRawPayload(value: raw)
+        let parsedSnapshot = await Task.detached(priority: .userInitiated) {
+            DashboardSnapshot(payload.value)
+        }.value
+        var updatedSnapshot = parsedSnapshot
         updatedSnapshot.uploadSpeed = snapshot.uploadSpeed
         updatedSnapshot.downloadSpeed = snapshot.downloadSpeed
         snapshot = updatedSnapshot
@@ -2542,7 +2572,7 @@ private struct DashboardSiteStatusView: View {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             dashboardRank(index + 1, color: HarvestTheme.blue, compact: true)
                             Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.caption.weight(.semibold))
@@ -2558,20 +2588,23 @@ private struct DashboardSiteStatusView: View {
                                     .fixedSize(horizontal: true, vertical: false)
                             }
                         }
-                        HStack(spacing: 10) {
+                        HStack(spacing: 8) {
                             dashboardCapacityMetric(
                                 item.uploaded,
                                 maximum: maximumUpload,
                                 icon: "arrow.up",
-                                color: HarvestTheme.green
+                                color: HarvestTheme.green,
+                                emphasizesLeadingEdge: index < 3
                             )
                             dashboardCapacityMetric(
                                 item.downloaded,
                                 maximum: maximumDownload,
                                 icon: "arrow.down",
-                                color: HarvestTheme.blue
+                                color: HarvestTheme.blue,
+                                emphasizesLeadingEdge: index < 3
                             )
                         }
+                        .padding(.leading, 20)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.siteRowHeight)
@@ -2587,7 +2620,8 @@ private struct DashboardSiteStatusView: View {
         _ value: Double,
         maximum: Double,
         icon: String,
-        color: Color
+        color: Color,
+        emphasizesLeadingEdge: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Label(dashboardCompactBytes(value), systemImage: icon)
@@ -2595,7 +2629,13 @@ private struct DashboardSiteStatusView: View {
                 .foregroundStyle(color)
                 .lineLimit(1)
                 .minimumScaleFactor(0.68)
-            DashboardMetricBar(value: value, maximum: maximum, color: color, height: 5)
+            DashboardMetricBar(
+                value: value,
+                maximum: maximum,
+                color: color,
+                height: 5,
+                emphasizesLeadingEdge: emphasizesLeadingEdge
+            )
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -2630,7 +2670,7 @@ private struct DashboardIncrementRankingView: View {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             dashboardRank(index + 1, color: HarvestTheme.green)
                             Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.caption.weight(.semibold))
@@ -2644,16 +2684,18 @@ private struct DashboardIncrementRankingView: View {
                                 value: item.uploaded,
                                 maximum: maximumUpload,
                                 color: HarvestTheme.green,
-                                height: 5
+                                height: 5,
+                                emphasizesLeadingEdge: index < 3
                             )
                             DashboardMetricBar(
                                 value: item.downloaded,
                                 maximum: maximumDownload,
                                 color: HarvestTheme.blue,
-                                height: 5
+                                height: 5,
+                                emphasizesLeadingEdge: index < 3
                             )
                         }
-                        .padding(.leading, 46)
+                        .padding(.leading, 20)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.incrementRowHeight)
@@ -2842,7 +2884,7 @@ private struct DistributionView: View {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                     VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             dashboardRank(index + 1, color: metric.color)
                             Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.caption.weight(.semibold))
@@ -2869,7 +2911,7 @@ private struct DistributionView: View {
                             height: 7,
                             emphasizesLeadingEdge: index < 3
                         )
-                        .padding(.leading, 46)
+                        .padding(.leading, 20)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.distributionRowHeight)
@@ -2883,11 +2925,14 @@ private struct DistributionView: View {
 }
 
 private struct DashboardMetricBar: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     let value: Double
     let maximum: Double
     let color: Color
     var height: CGFloat = 6
     var emphasizesLeadingEdge = false
+    @State private var shimmerPhase = 0.0
 
     private var progress: Double {
         guard value.isFinite, maximum.isFinite, maximum > 0 else { return 0 }
@@ -2897,18 +2942,49 @@ private struct DashboardMetricBar: View {
     var body: some View {
         GeometryReader { proxy in
             let filledWidth = proxy.size.width * progress
+            let shimmerWidth = min(max(filledWidth * 0.24, 10), 30)
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Color.primary.opacity(0.065))
-                Capsule()
-                    .fill(
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: [color.opacity(0.48), color],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                    Capsule()
+                        .stroke(color.opacity(0.34), lineWidth: 0.6)
+                    if reduceMotion {
                         LinearGradient(
-                            colors: [color.opacity(0.48), color],
+                            colors: [.clear, Color.white.opacity(0.72)],
                             startPoint: .leading,
                             endPoint: .trailing
                         )
-                    )
+                        .frame(width: min(shimmerWidth, filledWidth))
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    } else if emphasizesLeadingEdge, filledWidth > 2 {
+                        let shimmerOffset = -shimmerWidth + (filledWidth + shimmerWidth) * shimmerPhase
+                        LinearGradient(
+                            colors: [
+                                .clear,
+                                Color.white.opacity(0.18),
+                                Color.white.opacity(0.92),
+                                color.opacity(0.30),
+                                .clear
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                        .frame(width: shimmerWidth, height: height + 4)
+                        .offset(x: shimmerOffset)
+                        .blur(radius: 0.35)
+                    }
+                }
                     .frame(width: filledWidth)
+                    .clipShape(Capsule())
                     .shadow(
                         color: emphasizesLeadingEdge ? color.opacity(0.24) : .clear,
                         radius: 4,
@@ -2918,6 +2994,18 @@ private struct DashboardMetricBar: View {
             }
         }
         .frame(height: height)
+        .animation(.linear(duration: 2.2).repeatForever(autoreverses: false), value: shimmerPhase)
+        .onAppear {
+            guard !reduceMotion, emphasizesLeadingEdge, progress > 0 else { return }
+            shimmerPhase = 1
+        }
+        .onChange(of: reduceMotion) { _, isReduced in
+            if isReduced {
+                shimmerPhase = 0
+            } else if emphasizesLeadingEdge, progress > 0 {
+                shimmerPhase = 1
+            }
+        }
         .accessibilityHidden(true)
     }
 }
@@ -2960,7 +3048,7 @@ private struct DashboardAccountDistributionView: View {
                 .frame(height: 38)
 
                 ForEach(Array(selectedItems.enumerated()), id: \.element.id) { index, item in
-                    HStack(spacing: 7) {
+                    HStack(spacing: 6) {
                         dashboardRank(index + 1, color: HarvestTheme.coral)
                         Text(privacyMaskedText(item.name, enabled: privacy))
                             .font(.caption.weight(.medium))
@@ -3007,16 +3095,16 @@ private enum AccountDistributionKind: String, CaseIterable, Identifiable {
 }
 
 private func dashboardRank(_ rank: Int, color: Color, compact: Bool = false) -> some View {
-    Text("#\(rank)")
-        .font(.system(size: compact ? 9 : 10, weight: .bold, design: .monospaced))
-        .foregroundStyle(rank <= 3 ? color : Color.secondary)
-        .lineLimit(1)
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(width: compact ? 30 : 38, height: 22)
-        .background(
-            rank <= 3 ? color.opacity(0.12) : Color.primary.opacity(0.045),
-            in: Capsule()
-        )
+    Circle()
+        .fill(rank <= 3 ? color : Color.secondary.opacity(0.35))
+        .frame(width: compact ? 7 : 8, height: compact ? 7 : 8)
+        .overlay {
+            if rank <= 3 {
+                Circle().stroke(color.opacity(0.24), lineWidth: 2)
+            }
+        }
+        .frame(width: compact ? 8 : 9, height: compact ? 22 : 22)
+        .accessibilityLabel("第\(rank)名")
 }
 
 private struct DashboardScrollableModule<Content: View>: View {
@@ -3055,12 +3143,12 @@ private struct DashboardScrollableModule<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 11) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 9) {
                 Image(systemName: icon)
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.white)
-                    .frame(width: 34, height: 34)
+                    .frame(width: 30, height: 30)
                     .background(
                         LinearGradient(
                             colors: [color.opacity(0.72), color],
@@ -3069,7 +3157,7 @@ private struct DashboardScrollableModule<Content: View>: View {
                         ),
                         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                     )
-                    .shadow(color: color.opacity(0.20), radius: 6, x: 0, y: 3)
+                    .shadow(color: color.opacity(0.18), radius: 5, x: 0, y: 2)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title).font(.headline.weight(.bold))
                     Text(subtitle)
@@ -3103,7 +3191,7 @@ private struct DashboardScrollableModule<Content: View>: View {
                 .frame(height: 1)
             }
         }
-        .padding(12)
+        .padding(10)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground),
             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)

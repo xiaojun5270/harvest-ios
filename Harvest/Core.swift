@@ -389,6 +389,10 @@ struct AppSessionCacheRecord: Sendable {
     let cachedAt: Date
 }
 
+private struct AppSessionCacheValue: @unchecked Sendable {
+    let value: Any
+}
+
 private func normalizedCacheKey(_ key: String) -> String {
     String(key.lowercased().filter { $0.isLetter || $0.isNumber })
 }
@@ -762,9 +766,9 @@ final class APIClient {
 
     private init() {
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 25
-        configuration.timeoutIntervalForResource = 60
-        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        configuration.waitsForConnectivity = false
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
         configuration.httpMaximumConnectionsPerHost = 8
@@ -789,6 +793,8 @@ final class APIClient {
         body: Any? = nil,
         timeoutInterval: TimeInterval? = nil
     ) async throws -> Any {
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
         guard var components = URLComponents(string: normalized + path) else {
@@ -843,6 +849,8 @@ final class APIClient {
         parts: [MultipartPart],
         query: [String: Any] = [:]
     ) async throws -> Any {
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
         guard var components = URLComponents(string: normalized + path) else {
@@ -902,6 +910,8 @@ final class APIClient {
         method: HTTPMethod = .get,
         body: [String: Any]? = nil
     ) async throws -> (data: Data, fileName: String?) {
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
         guard var components = URLComponents(string: normalized + path) else {
@@ -1695,16 +1705,26 @@ final class AppState: ObservableObject {
     }
 
     func readSessionCache(_ name: String) async -> (value: Any, cachedAt: Date)? {
-        guard let record = await readSessionCacheData(name),
-              let value = try? JSONSerialization.jsonObject(with: record.payload, options: [.fragmentsAllowed]) else {
-            return nil
-        }
-        return (value, record.cachedAt)
+        guard let record = await readSessionCacheData(name) else { return nil }
+        let payload = record.payload
+        let decoded = await Task.detached(priority: .utility) { () -> AppSessionCacheValue? in
+            guard let value = try? JSONSerialization.jsonObject(
+                with: payload,
+                options: [.fragmentsAllowed]
+            ) else { return nil }
+            return AppSessionCacheValue(value: value)
+        }.value
+        guard let decoded else { return nil }
+        return (decoded.value, record.cachedAt)
     }
 
     func writeSessionCache(_ value: Any, name: String) async {
-        guard JSONSerialization.isValidJSONObject(value),
-              let payload = try? JSONSerialization.data(withJSONObject: value) else { return }
+        let boxedValue = AppSessionCacheValue(value: value)
+        let payload = await Task.detached(priority: .utility) { () -> Data? in
+            guard JSONSerialization.isValidJSONObject(boxedValue.value) else { return nil }
+            return try? JSONSerialization.data(withJSONObject: boxedValue.value)
+        }.value
+        guard let payload else { return }
         await writeSessionCacheData(payload, name: name)
     }
 

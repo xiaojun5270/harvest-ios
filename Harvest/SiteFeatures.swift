@@ -284,9 +284,9 @@ private struct SiteBrowserTarget: Identifiable {
 
 @MainActor
 final class SitesViewModel: ObservableObject {
-    private(set) var sites: [SiteItem] = [] { didSet { rebuildFilteredSites() } }
+    private(set) var sites: [SiteItem] = [] { didSet { scheduleFilteredSitesRebuild() } }
     @Published private(set) var filtered: [SiteItem] = []
-    private var siteConfigs: [String: [String: Any]] = [:] { didSet { rebuildFilteredSites() } }
+    private var siteConfigs: [String: [String: Any]] = [:] { didSet { scheduleFilteredSitesRebuild() } }
     @Published var isLoading = true
     @Published private(set) var usingCachedData = false
     @Published private(set) var cachedAt: Date?
@@ -355,6 +355,9 @@ final class SitesViewModel: ObservableObject {
         }
     }
     private var didRestoreCache = false
+    private var loadInProgress = false
+    private var suppressFilteredSitesRebuild = false
+    private var lastConfigsLoadedAt: Date?
 
     init() {
         let defaults = UserDefaults.standard
@@ -387,6 +390,11 @@ final class SitesViewModel: ObservableObject {
 
     private func rebuildFilteredSites() {
         filtered = computeFilteredSites()
+    }
+
+    private func scheduleFilteredSitesRebuild() {
+        guard !suppressFilteredSitesRebuild else { return }
+        rebuildFilteredSites()
     }
 
     private func computeFilteredSites() -> [SiteItem] {
@@ -599,37 +607,78 @@ final class SitesViewModel: ObservableObject {
     }
 
     func load(_ appState: AppState, cached: Bool = true) async {
+        guard !loadInProgress else { return }
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
+        defer { performanceInterval.end() }
+        loadInProgress = true
+        defer {
+            loadInProgress = false
+            isLoading = false
+        }
+
         let cacheKey = "site.info.list"
+        let configCacheKey = "site.config.list"
         if !didRestoreCache {
             didRestoreCache = true
-            if let cached = await appState.readSessionCache(cacheKey) {
-                sites = jsonRows(cached.value).map(SiteItem.init)
-                cachedAt = cached.cachedAt
+            async let siteCache = appState.readSessionCache(cacheKey)
+            async let configCache = appState.readSessionCache(configCacheKey)
+            let (cachedSites, cachedConfigs) = await (siteCache, configCache)
+            suppressFilteredSitesRebuild = true
+            if let cachedSites {
+                sites = jsonRows(cachedSites.value).map(SiteItem.init)
+                cachedAt = cachedSites.cachedAt
                 usingCachedData = true
             }
+            if let cachedConfigs {
+                siteConfigs = Self.indexedConfigs(jsonRows(cachedConfigs.value))
+                lastConfigsLoadedAt = cachedConfigs.cachedAt
+            }
+            suppressFilteredSitesRebuild = false
+            rebuildFilteredSites()
         }
         isLoading = sites.isEmpty && !usingCachedData
-        defer { isLoading = false }
+
+        let shouldRefreshConfigs = siteConfigs.isEmpty
+            || (lastConfigsLoadedAt.map { Date().timeIntervalSince($0) > 15 * 60 } ?? true)
+        let configTask: Task<Result<Any, Error>, Never>? = shouldRefreshConfigs
+            ? Task {
+                do { return .success(try await appState.api(APIPath.websiteList)) }
+                catch { return .failure(error) }
+            }
+            : nil
+
+        var loadedSites: [SiteItem]?
         do {
             let raw = try await appState.api(APIPath.sites, query: ["cached": cached])
-            sites = jsonRows(raw).map(SiteItem.init)
+            loadedSites = jsonRows(raw).map(SiteItem.init)
             cachedAt = nil
             usingCachedData = false
-            await appState.writeSessionCache(sites.map(sitePersistentCacheRow), name: cacheKey)
         } catch {
             if !usingCachedData { appState.presentedError = error.localizedDescription }
         }
-        do {
-            let configs = jsonRows(try await appState.api(APIPath.websiteList))
-            var indexed: [String: [String: Any]] = [:]
-            for config in configs {
-                guard let key = config.string("name", "site")?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                      !key.isEmpty else { continue }
-                indexed[key] = config
+
+        var loadedConfigs: [[String: Any]]?
+        if let configTask {
+            switch await configTask.value {
+            case let .success(raw):
+                loadedConfigs = jsonRows(raw)
+                lastConfigsLoadedAt = Date()
+            case let .failure(error):
+                recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
             }
-            siteConfigs = indexed
-        } catch {
-            recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
+        }
+
+        suppressFilteredSitesRebuild = true
+        if let loadedSites { sites = loadedSites }
+        if let loadedConfigs { siteConfigs = Self.indexedConfigs(loadedConfigs) }
+        suppressFilteredSitesRebuild = false
+        rebuildFilteredSites()
+
+        if let loadedSites {
+            await appState.writeSessionCache(loadedSites.map(sitePersistentCacheRow), name: cacheKey)
+        }
+        if let loadedConfigs {
+            await appState.writeSessionCache(loadedConfigs, name: configCacheKey)
         }
     }
 
@@ -695,6 +744,19 @@ final class SitesViewModel: ObservableObject {
 
     func config(for site: SiteItem) -> [String: Any]? {
         siteConfigs[site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+    }
+
+    private static func indexedConfigs(_ configs: [[String: Any]]) -> [String: [String: Any]] {
+        var indexed: [String: [String: Any]] = [:]
+        indexed.reserveCapacity(configs.count)
+        for config in configs {
+            guard let key = config.string("name", "site")?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased(),
+                !key.isEmpty else { continue }
+            indexed[key] = config
+        }
+        return indexed
     }
 
     private func resolvedSiteType(for site: SiteItem) -> String {

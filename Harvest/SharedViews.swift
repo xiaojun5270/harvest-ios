@@ -1412,52 +1412,54 @@ struct ManualTaskFeedbackOverlay: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.16)
-                .ignoresSafeArea()
-
-            VStack(spacing: 14) {
+        VStack {
+            HStack(spacing: 10) {
                 ZStack {
                     Circle()
                         .fill(color.opacity(0.13))
-                        .frame(width: 58, height: 58)
+                        .frame(width: 30, height: 30)
                     if feedback.phase == .running {
                         ProgressView()
-                            .controlSize(.large)
+                            .controlSize(.small)
                             .tint(color)
-                    }
-                    if feedback.phase != .running {
+                    } else {
                         Image(systemName: icon)
-                            .font(.system(size: 20, weight: .bold))
+                            .font(.system(size: 13, weight: .bold))
                             .foregroundStyle(color)
                     }
                 }
 
-                VStack(spacing: 5) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(feedback.title)
-                        .font(.headline)
-                        .multilineTextAlignment(.center)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
                     if let message = feedback.message, !message.isEmpty {
                         Text(message)
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minWidth: 172, maxWidth: 260)
-            .padding(.horizontal, 24)
-            .padding(.vertical, 22)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .frame(maxWidth: 360)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(Color.primary.opacity(0.08))
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(color.opacity(0.18), lineWidth: 0.8)
             }
-            .shadow(color: .black.opacity(0.16), radius: 24, y: 10)
+            .shadow(color: .black.opacity(0.14), radius: 12, y: 5)
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(feedback.phase == .running ? .updatesFrequently : [])
+            Spacer(minLength: 0)
         }
-        .allowsHitTesting(feedback.phase == .running)
+        .safeAreaPadding(.top, 8)
+        .padding(.horizontal, 16)
+        .allowsHitTesting(false)
     }
 }
 

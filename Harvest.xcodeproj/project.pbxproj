@@ -17,6 +17,7 @@
 		100000000000000000000008 /* SiteFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000B /* SiteFeatures.swift */; };
 		100000000000000000000009 /* DownloadFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000C /* DownloadFeatures.swift */; };
 		10000000000000000000000A /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000D /* PrivacyInfo.xcprivacy */; };
+		10000000000000000000000B /* PerformanceMonitoring.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20000000000000000000000E /* PerformanceMonitoring.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +34,7 @@
 		20000000000000000000000B /* SiteFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SiteFeatures.swift; sourceTree = "<group>"; };
 		20000000000000000000000C /* DownloadFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownloadFeatures.swift; sourceTree = "<group>"; };
 		20000000000000000000000D /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		20000000000000000000000E /* PerformanceMonitoring.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceMonitoring.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -60,6 +62,7 @@
 			children = (
 				200000000000000000000001 /* HarvestApp.swift */,
 				200000000000000000000002 /* Core.swift */,
+				20000000000000000000000E /* PerformanceMonitoring.swift */,
 				200000000000000000000003 /* SharedViews.swift */,
 				200000000000000000000004 /* PrimaryFeatures.swift */,
 				20000000000000000000000B /* SiteFeatures.swift */,
@@ -154,6 +157,7 @@
 			files = (
 				100000000000000000000001 /* HarvestApp.swift in Sources */,
 				100000000000000000000002 /* Core.swift in Sources */,
+				10000000000000000000000B /* PerformanceMonitoring.swift in Sources */,
 				100000000000000000000003 /* SharedViews.swift in Sources */,
 				100000000000000000000004 /* PrimaryFeatures.swift in Sources */,
 				100000000000000000000008 /* SiteFeatures.swift in Sources */,

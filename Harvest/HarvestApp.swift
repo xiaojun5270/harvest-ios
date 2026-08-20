@@ -8,6 +8,7 @@ final class HarvestAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        HarvestPerformanceMonitor.shared.start()
         return true
     }
 
@@ -80,6 +81,7 @@ struct RootView: View {
         }
         .animation(.easeInOut(duration: 0.2), value: appState.isAuthenticated)
         .onAppear {
+            HarvestPerformanceMonitor.shared.finishLaunch()
             if UserDefaults.standard.bool(forKey: "notifications.openPending") {
                 UserDefaults.standard.removeObject(forKey: "notifications.openPending")
                 appState.noticePresentationGeneration &+= 1
@@ -137,7 +139,7 @@ private final class ManualTaskFeedbackWindow {
         }
         hostingController = controller
         window?.rootViewController = controller
-        window?.isUserInteractionEnabled = feedback.phase == .running
+        window?.isUserInteractionEnabled = false
         window?.isHidden = false
     }
 }
