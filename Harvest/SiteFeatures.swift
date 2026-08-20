@@ -7125,36 +7125,44 @@ struct SiteEditorSheet: View {
                     } else {
                         LabeledContent("站点配置", value: siteKey)
                     }
-                    TextField("显示名称", text: $name)
-                    TextField("排序", text: $sortID).keyboardType(.numberPad)
-                    TextField("镜像地址（可选）", text: $url).textInputAutocapitalization(.never).keyboardType(.URL)
+                    editorField("显示名称", text: $name)
+                    HStack(alignment: .top, spacing: 12) {
+                        editorField("排序", text: $sortID, keyboardType: .numberPad)
+                            .frame(maxWidth: 120)
+                        Spacer(minLength: 0)
+                    }
+                    editorField("镜像地址（可选）", text: $url, keyboardType: .URL, isURL: true)
                 }
-                Section("凭据") {
-                    TextField("用户 ID（可选）", text: $userID).textInputAutocapitalization(.never)
-                    TextField("用户名（可选）", text: $username).textInputAutocapitalization(.never)
-                    TextField("Cookie", text: $cookie, axis: .vertical).lineLimit(3...6)
-                    TextField("User-Agent（可选）", text: $userAgent)
-                    TextField("邮箱（可选）", text: $email).keyboardType(.emailAddress).textInputAutocapitalization(.never)
-                    TextField("Passkey（可选）", text: $passkey)
-                    TextField("Authkey（可选）", text: $authkey)
-                    TextField("LocalStorage JSON（可选）", text: $localStorage, axis: .vertical).lineLimit(3...8).font(.system(.caption, design: .monospaced))
+                Section("登录凭据") {
+                    editorField("用户 ID（可选）", text: $userID, isURL: true)
+                    editorField("用户名（可选）", text: $username, isURL: true)
+                    editorTextEditor("Cookie", text: $cookie, minHeight: 96)
+                    editorField("User-Agent（可选）", text: $userAgent, isURL: true)
+                    editorField("邮箱（可选）", text: $email, keyboardType: .emailAddress, isURL: true)
+                    editorField("Passkey（可选）", text: $passkey, isURL: true)
+                    editorField("Authkey（可选）", text: $authkey, isURL: true)
+                    editorTextEditor("LocalStorage JSON（可选）", text: $localStorage, minHeight: 128, monospaced: true)
                 }
                 Section("地址与标签") {
-                    TextField("RSS 地址（可选）", text: $rss).textInputAutocapitalization(.never).keyboardType(.URL)
-                    TextField("种子页地址（可选）", text: $torrentsURL).textInputAutocapitalization(.never).keyboardType(.URL)
-                    TextField("代理地址（可选）", text: $proxy).textInputAutocapitalization(.never).keyboardType(.URL)
-                    TextField("标签，使用逗号分隔", text: $tags)
+                    editorField("RSS 地址（可选）", text: $rss, keyboardType: .URL, isURL: true)
+                    editorField("种子页地址（可选）", text: $torrentsURL, keyboardType: .URL, isURL: true)
+                    editorField("代理地址（可选）", text: $proxy, keyboardType: .URL, isURL: true)
+                    editorField("标签（使用逗号分隔）", text: $tags)
                 }
-                Section("能力") {
+                Section("同步能力") {
                     Toggle("站点可用", isOn: $enabled)
                     Toggle("获取数据", isOn: $getInfo)
                     Toggle("参与签到", isOn: $signin)
                     Toggle("参与辅种", isOn: $repeatTorrents)
                     Toggle("允许搜索", isOn: $searchTorrents)
+                }
+                Section("自动任务") {
                     Toggle("抓取免费种", isOn: $brushFree)
                     Toggle("抓取 RSS", isOn: $brushRSS)
                     Toggle("识别 HR", isOn: $hrDiscern)
                     Toggle("打包种子文件", isOn: $packageFile)
+                }
+                Section("显示") {
                     Toggle("显示在仪表盘", isOn: $showInDashboard)
                 }
             }
@@ -7272,6 +7280,52 @@ struct SiteEditorSheet: View {
         brushRSS = config.bool("brush_rss", "brushRss") ?? brushRSS
         packageFile = config.bool("package_file", "packageFile") ?? packageFile
         hrDiscern = config.bool("hr_discern", "hrDiscern") ?? hrDiscern
+    }
+
+    private func editorField(
+        _ title: String,
+        text: Binding<String>,
+        keyboardType: UIKeyboardType = .default,
+        isURL: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            TextField(title, text: text)
+                .textInputAutocapitalization(isURL ? .never : .sentences)
+                .autocorrectionDisabled(isURL)
+                .keyboardType(keyboardType)
+                .textFieldStyle(.plain)
+        }
+        .padding(.vertical, 5)
+    }
+
+    private func editorTextEditor(
+        _ title: String,
+        text: Binding<String>,
+        minHeight: CGFloat,
+        monospaced: Bool = false
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            TextEditor(text: text)
+                .font(monospaced ? .system(.caption, design: .monospaced) : .body)
+                .frame(minHeight: minHeight)
+                .scrollContentBackground(.hidden)
+                .padding(8)
+                .background(
+                    Color(uiColor: .tertiarySystemGroupedBackground),
+                    in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                }
+        }
+        .padding(.vertical, 5)
     }
 
     private var filteredAvailableSites: [String] {

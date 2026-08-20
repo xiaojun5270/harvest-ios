@@ -1159,6 +1159,7 @@ final class SearchViewModel: ObservableObject {
     @Published var media: [MediaItem] = []
     @Published var isLoading = false
     @Published var statusMessage = ""
+    @Published var resourceSearchMessages: [String] = []
     @Published var sites: [SiteItem] = []
     @Published var history: [String]
     @Published var maxCount: Int
@@ -1212,8 +1213,6 @@ final class SearchViewModel: ObservableObject {
     private var pendingResourceItems: [ResourceSearchListItem] = []
     private var resourceFlushTask: Task<Void, Never>?
     private var resourceProjectionTask: Task<Void, Never>?
-    private var resourceResultLimitReached = false
-    private let resourceResultLimit = 2_000
 
     init() {
         let defaults = UserDefaults.standard
@@ -1303,6 +1302,7 @@ final class SearchViewModel: ObservableObject {
         let searchMode = mode
         addHistory(term)
         statusMessage = searchMode == "资源" ? "开始搜索「\(term)」" : "正在搜索影视信息"
+        if searchMode == "资源" { resourceSearchMessages = [statusMessage] }
         isLoading = true
         if searchMode == "影视" {
             media = []
@@ -1395,6 +1395,9 @@ final class SearchViewModel: ObservableObject {
                 ) {
                     guard searchGeneration == generation else { return }
                     if let message = jsonMessage(event), !message.isEmpty {
+                        if resourceSearchMessages.last != message {
+                            resourceSearchMessages.append(message)
+                        }
                         if statusMessage != message { statusMessage = message }
                     }
                     let explicitlyFailed = event.bool("succeed", "success") == false
@@ -1411,7 +1414,6 @@ final class SearchViewModel: ObservableObject {
                         let rows = jsonRows(data)
                         if rows.isEmpty, let row = jsonDictionary(data) { appendResourceRows([row]) }
                         else { appendResourceRows(rows) }
-                        if resourceResultLimitReached { break }
                     }
                 }
                 guard searchGeneration == generation, !Task.isCancelled else { return }
@@ -1419,14 +1421,11 @@ final class SearchViewModel: ObservableObject {
                 if resourceItems.isEmpty {
                     statusMessage = resourceWarnings.last ?? "未找到相关资源"
                 } else {
-                    if resourceResultLimitReached {
-                        statusMessage = "结果较多，已显示前 \(resourceItems.count) 条资源"
-                    } else {
-                        statusMessage = resourceWarnings.isEmpty
-                            ? "已找到 \(resourceItems.count) 条资源"
-                            : "已找到 \(resourceItems.count) 条资源，部分站点搜索失败"
-                    }
+                    statusMessage = resourceWarnings.isEmpty
+                        ? "已找到 \(resourceItems.count) 条资源"
+                        : "已找到 \(resourceItems.count) 条资源，部分站点搜索失败"
                 }
+                if resourceSearchMessages.last != statusMessage { resourceSearchMessages.append(statusMessage) }
             }
         } catch is CancellationError {
             return
@@ -1438,8 +1437,12 @@ final class SearchViewModel: ObservableObject {
             }
             if searchMode == "资源", !resourceItems.isEmpty {
                 statusMessage = "已找到 \(resourceItems.count) 条资源，部分站点搜索未完成"
+                if resourceSearchMessages.last != statusMessage { resourceSearchMessages.append(statusMessage) }
             } else {
                 statusMessage = "搜索失败：\(error.localizedDescription)"
+                if searchMode == "资源", resourceSearchMessages.last != statusMessage {
+                    resourceSearchMessages.append(statusMessage)
+                }
             }
         }
     }
@@ -1451,10 +1454,14 @@ final class SearchViewModel: ObservableObject {
         if clearResults {
             media = []
             resetResourceResults()
+            resourceSearchMessages = []
             statusMessage = ""
         } else if wasLoading {
             flushPendingResourceItems()
             statusMessage = "搜索已停止"
+            if mode == "资源", resourceSearchMessages.last != statusMessage {
+                resourceSearchMessages.append(statusMessage)
+            }
         }
     }
 
@@ -1779,10 +1786,6 @@ final class SearchViewModel: ObservableObject {
 
     private func appendResourceRows(_ rows: [[String: Any]]) {
         for row in rows {
-            guard resourceItems.count + pendingResourceItems.count < resourceResultLimit else {
-                resourceResultLimitReached = true
-                break
-            }
             let identifier = resourceIdentifier(row)
             guard resourceIdentifiers.insert(identifier).inserted else { continue }
             pendingResourceItems.append(makeResourceListItem(row, identifier: identifier))
@@ -1819,7 +1822,6 @@ final class SearchViewModel: ObservableObject {
         pendingResourceItems.removeAll(keepingCapacity: false)
         resourceItems.removeAll(keepingCapacity: false)
         resourceIdentifiers.removeAll(keepingCapacity: false)
-        resourceResultLimitReached = false
         displayedResourceItems = []
     }
 
@@ -1931,6 +1933,7 @@ struct SearchView: View {
     @State private var showSettings = false
     @State private var showResourceFilters = false
     @State private var activeSearchTask: Task<Void, Never>?
+    @State private var isResourceLogExpanded = true
     @FocusState private var searchFieldFocused: Bool
     let onClose: () -> Void
     let onVisibilityChanged: (Bool) -> Void
@@ -2046,6 +2049,10 @@ struct SearchView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .background(Color(uiColor: .secondarySystemBackground))
+            }
+
+            if model.mode == "资源", !model.resourceSearchMessages.isEmpty {
+                resourceSearchLogView
             }
 
             if model.isLoading && currentResultsAreEmpty {
@@ -2178,6 +2185,42 @@ struct SearchView: View {
         .font(.subheadline.weight(.medium))
         .padding(.horizontal, 16)
         .padding(.bottom, 12)
+    }
+
+    private var resourceSearchLogView: some View {
+        DisclosureGroup(isExpanded: $isResourceLogExpanded) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(model.resourceSearchMessages.enumerated()), id: \.offset) { _, message in
+                        HStack(alignment: .top, spacing: 7) {
+                            Image(systemName: message.lowercased().contains("失败") ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(message.lowercased().contains("失败") ? HarvestTheme.coral : HarvestTheme.green)
+                            Text(message)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .frame(maxHeight: 150)
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: model.isLoading ? "waveform.path.ecg" : "checkmark.circle.fill")
+                    .foregroundStyle(model.isLoading ? HarvestTheme.blue : HarvestTheme.green)
+                Text("搜索日志")
+                    .font(.caption.weight(.semibold))
+                Text("\(model.resourceSearchMessages.count) 条")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 7)
+        .background(Color(uiColor: .secondarySystemBackground))
     }
 
     private var searchHistoryView: some View {

@@ -65,9 +65,9 @@ private enum DashboardMonthlyDefaults {
 
 private enum DashboardListLayout {
     static let visibleRows = 10
-    static let siteRowHeight: CGFloat = 52
-    static let distributionRowHeight: CGFloat = 40
-    static let incrementRowHeight: CGFloat = 42
+    static let siteRowHeight: CGFloat = 58
+    static let distributionRowHeight: CGFloat = 48
+    static let incrementRowHeight: CGFloat = 50
     static let accountRowHeight: CGFloat = 36
 }
 
@@ -2522,10 +2522,18 @@ private struct DashboardSiteStatusView: View {
     let items: [DashboardSiteStatusItem]
     let privacy: Bool
 
+    private var maximumUpload: Double {
+        max(items.map(\.uploaded).filter { $0.isFinite }.max() ?? 1, 1)
+    }
+
+    private var maximumDownload: Double {
+        max(items.map(\.downloaded).filter { $0.isFinite }.max() ?? 1, 1)
+    }
+
     var body: some View {
         DashboardScrollableModule(
             title: "站点状态",
-            subtitle: "按累计上传排序",
+            subtitle: "累计上传 / 下载对比",
             icon: "globe.asia.australia.fill",
             color: HarvestTheme.blue,
             itemCount: items.count,
@@ -2533,25 +2541,39 @@ private struct DashboardSiteStatusView: View {
         ) {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            dashboardRank(index + 1, color: HarvestTheme.blue, compact: true)
                             Text(privacyMaskedText(item.name, enabled: privacy))
-                                .font(.subheadline.weight(.semibold))
+                                .font(.caption.weight(.semibold))
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             if item.published > 0 {
                                 Label(formatCompactNumber(item.published), systemImage: "paperplane")
-                                    .font(.caption2.monospacedDigit())
+                                    .font(.caption2.weight(.semibold).monospacedDigit())
                                     .foregroundStyle(HarvestTheme.coral)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(HarvestTheme.coral.opacity(0.10), in: Capsule())
                                     .fixedSize(horizontal: true, vertical: false)
                             }
                         }
-                        HStack(spacing: 12) {
-                            dashboardCapacityLabel(item.uploaded, icon: "arrow.up", color: HarvestTheme.green)
-                            dashboardCapacityLabel(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue)
+                        HStack(spacing: 10) {
+                            dashboardCapacityMetric(
+                                item.uploaded,
+                                maximum: maximumUpload,
+                                icon: "arrow.up",
+                                color: HarvestTheme.green
+                            )
+                            dashboardCapacityMetric(
+                                item.downloaded,
+                                maximum: maximumDownload,
+                                icon: "arrow.down",
+                                color: HarvestTheme.blue
+                            )
                         }
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.siteRowHeight)
                     .overlay(alignment: .bottom) {
                         if index < items.count - 1 { Divider().padding(.leading, 10) }
@@ -2561,13 +2583,21 @@ private struct DashboardSiteStatusView: View {
         }
     }
 
-    private func dashboardCapacityLabel(_ value: Double, icon: String, color: Color) -> some View {
-        Label(dashboardCompactBytes(value), systemImage: icon)
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(color)
-            .lineLimit(1)
-            .minimumScaleFactor(0.72)
-            .frame(maxWidth: .infinity, alignment: icon == "arrow.up" ? .leading : .trailing)
+    private func dashboardCapacityMetric(
+        _ value: Double,
+        maximum: Double,
+        icon: String,
+        color: Color
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(dashboardCompactBytes(value), systemImage: icon)
+                .font(.caption2.weight(.medium).monospacedDigit())
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.68)
+            DashboardMetricBar(value: value, maximum: maximum, color: color, height: 5)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -2575,6 +2605,14 @@ private struct DashboardIncrementRankingView: View {
     let items: [DashboardSiteIncrementItem]
     let days: Int
     let privacy: Bool
+
+    private var maximumUpload: Double {
+        max(items.map(\.uploaded).filter { $0.isFinite }.max() ?? 1, 1)
+    }
+
+    private var maximumDownload: Double {
+        max(items.map(\.downloaded).filter { $0.isFinite }.max() ?? 1, 1)
+    }
 
     private var rangeLabel: String {
         days == 1 ? "当日增量排行" : "近 \(days) 天增量排行"
@@ -2591,14 +2629,31 @@ private struct DashboardIncrementRankingView: View {
         ) {
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                    HStack(spacing: 8) {
-                        dashboardRank(index + 1, color: HarvestTheme.green)
-                        Text(privacyMaskedText(item.name, enabled: privacy))
-                            .font(.caption.weight(.semibold))
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        incrementMetric(item.uploaded, icon: "arrow.up", color: HarvestTheme.green)
-                        incrementMetric(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue)
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            dashboardRank(index + 1, color: HarvestTheme.green)
+                            Text(privacyMaskedText(item.name, enabled: privacy))
+                                .font(.caption.weight(.semibold))
+                                .lineLimit(1)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            incrementMetric(item.uploaded, icon: "arrow.up", color: HarvestTheme.green)
+                            incrementMetric(item.downloaded, icon: "arrow.down", color: HarvestTheme.blue)
+                        }
+                        HStack(spacing: 6) {
+                            DashboardMetricBar(
+                                value: item.uploaded,
+                                maximum: maximumUpload,
+                                color: HarvestTheme.green,
+                                height: 5
+                            )
+                            DashboardMetricBar(
+                                value: item.downloaded,
+                                maximum: maximumDownload,
+                                color: HarvestTheme.blue,
+                                height: 5
+                            )
+                        }
+                        .padding(.leading, 46)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.incrementRowHeight)
@@ -2777,11 +2832,17 @@ private struct DistributionView: View {
             itemCount: items.count,
             rowHeight: DashboardListLayout.distributionRowHeight
         ) {
-            let maximum = max(items.map(\.value).max() ?? 1, 1)
+            let maximum = max(items.map(\.value).filter { $0.isFinite }.max() ?? 1, 1)
+            let total = max(
+                items.reduce(0) { result, item in
+                    result + (item.value.isFinite ? max(item.value, 0) : 0)
+                },
+                1
+            )
             LazyVStack(spacing: 0) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
                             dashboardRank(index + 1, color: metric.color)
                             Text(privacyMaskedText(item.name, enabled: privacy))
                                 .font(.caption.weight(.semibold))
@@ -2795,12 +2856,20 @@ private struct DistributionView: View {
                             .foregroundStyle(metric.color)
                             .lineLimit(1)
                             .minimumScaleFactor(0.68)
-                            .frame(width: 94, alignment: .trailing)
+                            .frame(width: 86, alignment: .trailing)
+                            Text(dashboardPercentage(item.value, total: total))
+                                .font(.system(size: 9, weight: .bold, design: .rounded).monospacedDigit())
+                                .foregroundStyle(metric.color)
+                                .frame(width: 34, alignment: .trailing)
                         }
-                        ProgressView(value: item.value, total: maximum)
-                            .tint(metric.color)
-                            .scaleEffect(x: 1, y: 0.58, anchor: .center)
-                            .padding(.leading, 30)
+                        DashboardMetricBar(
+                            value: item.value,
+                            maximum: maximum,
+                            color: metric.color,
+                            height: 7,
+                            emphasizesLeadingEdge: index < 3
+                        )
+                        .padding(.leading, 46)
                     }
                     .padding(.horizontal, 8)
                     .frame(height: DashboardListLayout.distributionRowHeight)
@@ -2811,6 +2880,53 @@ private struct DistributionView: View {
             }
         }
     }
+}
+
+private struct DashboardMetricBar: View {
+    let value: Double
+    let maximum: Double
+    let color: Color
+    var height: CGFloat = 6
+    var emphasizesLeadingEdge = false
+
+    private var progress: Double {
+        guard value.isFinite, maximum.isFinite, maximum > 0 else { return 0 }
+        return min(max(value / maximum, 0), 1)
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let filledWidth = proxy.size.width * progress
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.primary.opacity(0.065))
+                Capsule()
+                    .fill(
+                        LinearGradient(
+                            colors: [color.opacity(0.48), color],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .frame(width: filledWidth)
+                    .shadow(
+                        color: emphasizesLeadingEdge ? color.opacity(0.24) : .clear,
+                        radius: 4,
+                        x: 0,
+                        y: 1
+                    )
+            }
+        }
+        .frame(height: height)
+        .accessibilityHidden(true)
+    }
+}
+
+private func dashboardPercentage(_ value: Double, total: Double) -> String {
+    guard value.isFinite, total.isFinite, value > 0, total > 0 else { return "0%" }
+    let percentage = value / total * 100
+    if percentage >= 10 { return String(format: "%.0f%%", percentage) }
+    return String(format: "%.1f%%", percentage)
 }
 
 private struct DashboardAccountDistributionView: View {
@@ -2939,15 +3055,23 @@ private struct DashboardScrollableModule<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 11) {
                 Image(systemName: icon)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(color)
-                    .frame(width: 30, height: 30)
-                    .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(
+                        LinearGradient(
+                            colors: [color.opacity(0.72), color],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+                    .shadow(color: color.opacity(0.20), radius: 6, x: 0, y: 3)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(title).font(.headline)
+                    Text(title).font(.headline.weight(.bold))
                     Text(subtitle)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -2958,6 +3082,9 @@ private struct DashboardScrollableModule<Content: View>: View {
                 Text("\(itemCount) 项")
                     .font(.caption2.weight(.semibold).monospacedDigit())
                     .foregroundStyle(color)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(color.opacity(0.10), in: Capsule())
             }
 
             ScrollView(.vertical) {
@@ -2967,7 +3094,14 @@ private struct DashboardScrollableModule<Content: View>: View {
             .scrollDisabled(itemCount <= DashboardListLayout.visibleRows)
             .scrollIndicators(itemCount > DashboardListLayout.visibleRows ? .visible : .hidden)
             .scrollBounceBehavior(.basedOnSize)
-            .overlay(alignment: .top) { Divider() }
+            .overlay(alignment: .top) {
+                LinearGradient(
+                    colors: [.clear, color.opacity(0.28), .clear],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(height: 1)
+            }
         }
         .padding(12)
         .background(
@@ -2976,8 +3110,16 @@ private struct DashboardScrollableModule<Content: View>: View {
         )
         .overlay {
             RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
-                .stroke(Color.primary.opacity(0.06))
+                .stroke(
+                    LinearGradient(
+                        colors: [color.opacity(0.16), Color.primary.opacity(0.045), color.opacity(0.08)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 0.8
+                )
         }
+        .shadow(color: color.opacity(0.045), radius: 12, x: 0, y: 6)
     }
 }
 
