@@ -162,6 +162,22 @@ struct APIError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+func isRequestCancellation(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    let nsError = error as NSError
+    if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled { return true }
+
+    let message = error.localizedDescription
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return message == "已取消"
+        || message == "已取消。"
+        || message == "cancelled"
+        || message == "canceled"
+        || message.contains("request cancelled")
+        || message.contains("request canceled")
+}
+
 enum AppLogLevel: String, Codable, CaseIterable, Sendable {
     case verbose = "VERBOSE"
     case debug = "DEBUG"
@@ -766,7 +782,8 @@ final class APIClient {
 
     private init() {
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 20
+        // 与 Flutter 客户端的接收超时保持一致，避免较慢站点在 20 秒时被提前终止。
+        configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 45
         configuration.waitsForConnectivity = false
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -793,7 +810,10 @@ final class APIClient {
         body: Any? = nil,
         timeoutInterval: TimeInterval? = nil
     ) async throws -> Any {
-        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            .apiRequest,
+            context: Self.performanceContext(method: method, path: path)
+        )
         defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
@@ -801,7 +821,10 @@ final class APIClient {
             throw APIError(statusCode: 0, message: "服务器地址无效")
         }
         if !query.isEmpty {
-            components.queryItems = query.map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            let queryItems = query
+                .sorted { $0.key < $1.key }
+                .map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            components.queryItems = (components.queryItems ?? []) + queryItems
         }
         guard let url = components.url else {
             throw APIError(statusCode: 0, message: "请求地址无效")
@@ -849,7 +872,10 @@ final class APIClient {
         parts: [MultipartPart],
         query: [String: Any] = [:]
     ) async throws -> Any {
-        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            .apiRequest,
+            context: Self.performanceContext(method: .post, path: path)
+        )
         defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
@@ -857,7 +883,10 @@ final class APIClient {
             throw APIError(statusCode: 0, message: "上传地址无效")
         }
         if !query.isEmpty {
-            components.queryItems = query.map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            let queryItems = query
+                .sorted { $0.key < $1.key }
+                .map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            components.queryItems = (components.queryItems ?? []) + queryItems
         }
         guard let url = components.url else { throw APIError(statusCode: 0, message: "上传地址无效") }
 
@@ -910,7 +939,10 @@ final class APIClient {
         method: HTTPMethod = .get,
         body: [String: Any]? = nil
     ) async throws -> (data: Data, fileName: String?) {
-        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.apiRequest)
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(
+            .apiRequest,
+            context: Self.performanceContext(method: method, path: path)
+        )
         defer { performanceInterval.end() }
         var normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while normalized.hasSuffix("/") { normalized.removeLast() }
@@ -918,7 +950,10 @@ final class APIClient {
             throw APIError(statusCode: 0, message: "下载地址无效")
         }
         if !query.isEmpty {
-            components.queryItems = query.map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            let queryItems = query
+                .sorted { $0.key < $1.key }
+                .map { URLQueryItem(name: $0.key, value: String(describing: $0.value)) }
+            components.queryItems = (components.queryItems ?? []) + queryItems
         }
         guard let url = components.url else { throw APIError(statusCode: 0, message: "下载地址无效") }
 
@@ -956,6 +991,17 @@ final class APIClient {
             .first
             .map(String.init)?
             .trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+    }
+
+    private static func performanceContext(method: HTTPMethod, path: String) -> String {
+        let pathWithoutFragment = path
+            .split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? path
+        let pathWithoutQuery = pathWithoutFragment
+            .split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? pathWithoutFragment
+        let sanitizedPath = sanitizedCachedURL(pathWithoutQuery)
+        return "\(method.rawValue) \(String(sanitizedPath.prefix(180)))"
     }
 
     func streamSSE(
@@ -1799,6 +1845,7 @@ final class AppState: ObservableObject {
                 retry: false
             )
         } catch {
+            if isRequestCancellation(error) { throw error }
             await AppLogStore.shared.append(.error, "\(method.rawValue) \(path) 失败：\(error.localizedDescription)")
             throw error
         }
@@ -1828,6 +1875,7 @@ final class AppState: ObservableObject {
             try await refreshAccessToken()
             return try await upload(path, fields: fields, parts: parts, retry: false)
         } catch {
+            if isRequestCancellation(error) { throw error }
             await AppLogStore.shared.append(.error, "POST \(path) 上传失败：\(error.localizedDescription)")
             throw error
         }
@@ -1859,6 +1907,7 @@ final class AppState: ObservableObject {
             try await refreshAccessToken()
             return try await download(path, query: query, method: method, body: body, retry: false)
         } catch {
+            if isRequestCancellation(error) { throw error }
             await AppLogStore.shared.append(.error, "\(method.rawValue) \(path) 下载失败：\(error.localizedDescription)")
             throw error
         }
@@ -1947,7 +1996,7 @@ final class AppState: ObservableObject {
             }
             return true
         } catch {
-            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+            if isRequestCancellation(error) {
                 if let feedbackID { cancelManualTask(feedbackID) }
                 return false
             }

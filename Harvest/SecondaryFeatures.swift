@@ -1489,7 +1489,7 @@ final class SearchViewModel: ObservableObject {
             }
             return MediaSearchResult(source: source, items: rows.map { MediaItem($0, source: source) }, errorMessage: nil)
         } catch {
-            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+            if Task.isCancelled || isRequestCancellation(error) {
                 return MediaSearchResult(source: source, items: [], errorMessage: nil)
             }
             await AppLogStore.shared.append(.error, "\(source) 影视接口失败：\(error.localizedDescription)")
@@ -1522,6 +1522,7 @@ final class SearchViewModel: ObservableObject {
                     return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 }
         } catch {
+            guard !isRequestCancellation(error) else { return }
             recordAppLog(.warning, "加载资源搜索站点失败：\(error.localizedDescription)")
             if mode == "资源", sites.isEmpty {
                 statusMessage = "站点列表加载失败：\(error.localizedDescription)"
@@ -4227,7 +4228,7 @@ struct NewsView: View {
                 errorMessage: nil
             )
         } catch {
-            if Task.isCancelled || (error as? URLError)?.code == .cancelled {
+            if Task.isCancelled || isRequestCancellation(error) {
                 return MediaCatalogNetworkResult(
                     cacheKey: definition.cacheKey,
                     collection: nil,
@@ -4304,7 +4305,7 @@ struct NewsView: View {
                 await appState.writeSessionCacheData(payload, name: cacheKey)
             }
         } catch {
-            if !Task.isCancelled {
+            if !Task.isCancelled, !isRequestCancellation(error) {
                 await AppLogStore.shared.append(.warning, "豆瓣标签接口不可用：\(error.localizedDescription)")
             }
         }

@@ -1125,20 +1125,25 @@ final class DownloadsViewModel: ObservableObject {
                     let siteRaw = try await appState.api(APIPath.sites)
                     sites = jsonRows(siteRaw).map(SiteItem.init)
                 } catch {
-                    recordAppLog(.warning, "下载页站点索引刷新失败：\(error.localizedDescription)")
+                    if !isRequestCancellation(error) {
+                        recordAppLog(.warning, "下载页站点索引刷新失败：\(error.localizedDescription)")
+                    }
                 }
             }
             if websiteConfigs.isEmpty || usingCachedData {
                 do {
                     websiteConfigs = jsonRows(try await appState.api(APIPath.websiteList))
                 } catch {
-                    recordAppLog(.warning, "下载页站点配置刷新失败：\(error.localizedDescription)")
+                    if !isRequestCancellation(error) {
+                        recordAppLog(.warning, "下载页站点配置刷新失败：\(error.localizedDescription)")
+                    }
                 }
             }
             usingCachedData = successfulDownloaderLoads < enabledDownloaders.count
             if !usingCachedData { cachedAt = nil }
             if !usingCachedData { await persistCache(appState) }
         } catch {
+            guard !isRequestCancellation(error) else { return }
             usingCachedData = !downloaders.isEmpty || !torrents.isEmpty
             if usingCachedData {
                 recordAppLog(.warning, "下载页刷新失败，继续显示缓存：\(error.localizedDescription)")
@@ -1238,7 +1243,9 @@ final class DownloadsViewModel: ObservableObject {
                         }
                         return (id, downloaderTorrentSummary(decoded, category: category))
                     } catch {
-                        recordAppLog(.warning, "下载器 \(id) 种子统计读取失败：\(error.localizedDescription)")
+                        if !isRequestCancellation(error) {
+                            recordAppLog(.warning, "下载器 \(id) 种子统计读取失败：\(error.localizedDescription)")
+                        }
                         return (id, nil)
                     }
                 }

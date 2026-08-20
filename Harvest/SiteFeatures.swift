@@ -358,6 +358,7 @@ final class SitesViewModel: ObservableObject {
     private var loadInProgress = false
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
+    private var activeSiteOperations: Set<String> = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -664,7 +665,9 @@ final class SitesViewModel: ObservableObject {
                 loadedConfigs = jsonRows(raw)
                 lastConfigsLoadedAt = Date()
             case let .failure(error):
-                recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
+                if !isRequestCancellation(error) {
+                    recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
+                }
             }
         }
 
@@ -683,6 +686,10 @@ final class SitesViewModel: ObservableObject {
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
+        let operationKey = "\(path)#\(site.id)"
+        guard activeSiteOperations.insert(operationKey).inserted else { return }
+        defer { activeSiteOperations.remove(operationKey) }
+
         let displayName = privacyMaskedText(site.name, enabled: appState.privacyMode)
         let title: String
         let successMessage: String
@@ -4700,7 +4707,9 @@ private struct SiteSignInDetailView: View {
             let payload = try await appState.api("\(APIPath.sites)/\(site.id)")
             if let row = jsonPayloadDictionary(payload) { latestSite = SiteItem(row) }
         } catch {
-            await AppLogStore.shared.append(.warning, "签到详情加载失败：\(error.localizedDescription)")
+            if !isRequestCancellation(error) {
+                await AppLogStore.shared.append(.warning, "签到详情加载失败：\(error.localizedDescription)")
+            }
         }
     }
 
@@ -5012,6 +5021,7 @@ struct SiteDetailView: View {
     }
 
     @MainActor private func loadDetail() async {
+        guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
         async let detail = loadDetailPayload("\(APIPath.sites)/\(site.id)")
@@ -5024,7 +5034,9 @@ struct SiteDetailView: View {
     @MainActor private func loadDetailPayload(_ path: String) async -> [String: Any]? {
         do { return jsonPayloadDictionary(try await appState.api(path)) }
         catch {
-            await AppLogStore.shared.append(.warning, "站点详情子请求失败 \(path)：\(error.localizedDescription)")
+            if !isRequestCancellation(error) {
+                await AppLogStore.shared.append(.warning, "站点详情子请求失败 \(path)：\(error.localizedDescription)")
+            }
             return nil
         }
     }

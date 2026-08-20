@@ -24,15 +24,18 @@ enum HarvestPerformanceOperation: String, Sendable {
 
 final class HarvestPerformanceInterval: @unchecked Sendable {
     private let operation: HarvestPerformanceOperation
+    private let context: String?
     private let startedAt: TimeInterval
     private let lock = NSLock()
     private var completion: (() -> Void)?
 
     fileprivate init(
         operation: HarvestPerformanceOperation,
+        context: String?,
         completion: @escaping () -> Void
     ) {
         self.operation = operation
+        self.context = context
         startedAt = ProcessInfo.processInfo.systemUptime
         self.completion = completion
     }
@@ -48,7 +51,11 @@ final class HarvestPerformanceInterval: @unchecked Sendable {
         finish()
         let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
         if elapsed >= operation.slowThreshold {
-            recordAppLog(.warning, "性能监控：\(operation.rawValue)耗时 \(Self.durationText(elapsed))")
+            let label = [operation.rawValue, context]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            recordAppLog(.warning, "性能监控：\(label) 耗时 \(Self.durationText(elapsed))")
         }
     }
 
@@ -98,47 +105,50 @@ final class HarvestPerformanceMonitor: NSObject, MXMetricManagerSubscriber {
         interval?.end()
     }
 
-    func begin(_ operation: HarvestPerformanceOperation) -> HarvestPerformanceInterval {
+    func begin(
+        _ operation: HarvestPerformanceOperation,
+        context: String? = nil
+    ) -> HarvestPerformanceInterval {
         let signposter = self.signposter
         switch operation {
         case .appLaunch:
             let state = signposter.beginInterval("App Launch", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("App Launch", state)
             }
         case .apiRequest:
             let state = signposter.beginInterval("API Request", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("API Request", state)
             }
         case .dashboardLoad:
             let state = signposter.beginInterval("Dashboard Load", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("Dashboard Load", state)
             }
         case .sitesLoad:
             let state = signposter.beginInterval("Sites Load", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("Sites Load", state)
             }
         case .mediaSearch:
             let state = signposter.beginInterval("Media Search", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("Media Search", state)
             }
         case .resourceSearch:
             let state = signposter.beginInterval("Resource Search", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("Resource Search", state)
             }
         case .tmdbLoad:
             let state = signposter.beginInterval("TMDB Load", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("TMDB Load", state)
             }
         case .doubanLoad:
             let state = signposter.beginInterval("Douban Load", id: signposter.makeSignpostID())
-            return HarvestPerformanceInterval(operation: operation) { [signposter] in
+            return HarvestPerformanceInterval(operation: operation, context: context) { [signposter] in
                 signposter.endInterval("Douban Load", state)
             }
         }

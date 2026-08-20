@@ -139,6 +139,7 @@ struct NoticeView: View {
             await syncUnreadCount()
         }
         catch {
+            guard !isRequestCancellation(error) else { return }
             if notices.isEmpty { appState.presentedError = error.localizedDescription }
             else { recordAppLog(.warning, "消息刷新失败，继续显示缓存：\(error.localizedDescription)") }
         }
@@ -917,7 +918,15 @@ struct SettingsView: View {
                 Section("维护") {
                     NavigationLink { DataMaintenanceView().environmentObject(appState) } label: { Label("备份与迁移", systemImage: "externaldrive.badge.timemachine") }
                     NavigationLink { UpdateMaintenanceView().environmentObject(appState) } label: { Label("更新与网络", systemImage: "arrow.triangle.2.circlepath") }
-                    Button { Task { _ = await appState.perform(APIPath.cacheClear, method: .get); } } label: { Label("清理站点缓存", systemImage: "trash.slash") }
+                    Button {
+                        Task {
+                            _ = await appState.perform(
+                                APIPath.cacheClear,
+                                method: .get,
+                                query: ["key": "my_site_list"]
+                            )
+                        }
+                    } label: { Label("清理站点缓存", systemImage: "trash.slash") }
                     Button { Task { _ = await appState.perform(APIPath.notifyTest, method: .get, query: ["title": "Harvest", "content": "原生客户端通知测试", "push_type": ""]); } } label: { Label("发送测试通知", systemImage: "bell.badge") }
                     if appState.profile?.isSuperuser == true { Button(role: .destructive) { confirmingRestart = true } label: { Label("重启服务", systemImage: "arrow.clockwise.circle") } }
                 }
