@@ -910,7 +910,11 @@ final class DashboardViewModel: ObservableObject {
 
     private func loadDownloaderSpeeds(_ appState: AppState) async {
         do {
-            let raw = try await appState.api(APIPath.downloaders, query: ["with_status": true])
+            let raw = try await appState.api(
+                APIPath.downloaders,
+                query: ["with_status": true],
+                timeoutInterval: 10
+            )
             guard !Task.isCancelled else { return }
             downloaders = jsonRows(raw).map(DownloaderItem.init)
             applyDownloaderSpeeds()
@@ -922,6 +926,7 @@ final class DashboardViewModel: ObservableObject {
 
     private func watchDownloaderSpeeds(_ appState: AppState) async {
         var lastErrorMessage = ""
+        var reconnectAttempt = 0
         while downloaderSpeedMonitoring, !Task.isCancelled {
             do {
                 let stream = APIClient.shared.streamWebSocket(
@@ -933,6 +938,7 @@ final class DashboardViewModel: ObservableObject {
                 for try await event in stream {
                     guard downloaderSpeedMonitoring, !Task.isCancelled else { return }
                     lastErrorMessage = ""
+                    reconnectAttempt = 0
                     let data = (event["data"] as? [String: Any]) ?? jsonPayloadDictionary(event) ?? [:]
                     guard !data.isEmpty else { continue }
                     var liveByKey: [String: [String: Any]] = [:]
@@ -958,13 +964,17 @@ final class DashboardViewModel: ObservableObject {
                 }
             } catch {
                 guard downloaderSpeedMonitoring, !Task.isCancelled else { return }
+                guard !isRequestCancellation(error) else { return }
                 let message = error.localizedDescription
                 if message != lastErrorMessage {
                     recordAppLog(.warning, "仪表盘下载器速度连接中断：\(message)")
                     lastErrorMessage = message
                 }
+                if isTerminalWebSocketError(error) { return }
             }
-            do { try await Task.sleep(for: .seconds(3)) }
+            reconnectAttempt = min(reconnectAttempt + 1, 6)
+            let delay = min(60, 1 << reconnectAttempt)
+            do { try await Task.sleep(for: .seconds(delay)) }
             catch { return }
         }
     }
@@ -981,7 +991,7 @@ final class DashboardViewModel: ObservableObject {
         authorizationLoading = authorizationInfo == nil
         defer { authorizationLoading = false }
         do {
-            let raw = try await appState.api(APIPath.authInfo)
+            let raw = try await appState.api(APIPath.authInfo, timeoutInterval: 10)
             guard let value = jsonPayloadDictionary(raw) else {
                 throw APIError(statusCode: 0, message: "授权信息响应无效")
             }
@@ -2975,7 +2985,6 @@ private struct DashboardMetricBar: View {
     let color: Color
     var height: CGFloat = 6
     var emphasizesLeadingEdge = false
-    @State private var shimmerPhase = 0.0
 
     private var progress: Double {
         guard value.isFinite, maximum.isFinite, maximum > 0 else { return 0 }
@@ -2985,7 +2994,6 @@ private struct DashboardMetricBar: View {
     var body: some View {
         GeometryReader { proxy in
             let filledWidth = proxy.size.width * progress
-            let shimmerWidth = min(max(filledWidth * 0.24, 10), 30)
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Color.primary.opacity(0.065))
@@ -3006,49 +3014,17 @@ private struct DashboardMetricBar: View {
                             startPoint: .leading,
                             endPoint: .trailing
                         )
-                        .frame(width: min(shimmerWidth, filledWidth))
+                        .frame(width: min(max(filledWidth * 0.24, 10), 30))
                         .frame(maxWidth: .infinity, alignment: .trailing)
                     } else if emphasizesLeadingEdge, filledWidth > 2 {
-                        let shimmerOffset = -shimmerWidth + (filledWidth + shimmerWidth) * shimmerPhase
-                        LinearGradient(
-                            colors: [
-                                .clear,
-                                Color.white.opacity(0.18),
-                                Color.white.opacity(0.92),
-                                color.opacity(0.30),
-                                .clear
-                            ],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                        .frame(width: shimmerWidth, height: height + 4)
-                        .offset(x: shimmerOffset)
-                        .blur(radius: 0.35)
+                        HardwareProgressShimmer(color: color)
                     }
                 }
                     .frame(width: filledWidth)
                     .clipShape(Capsule())
-                    .shadow(
-                        color: emphasizesLeadingEdge ? color.opacity(0.24) : .clear,
-                        radius: 4,
-                        x: 0,
-                        y: 1
-                    )
             }
         }
         .frame(height: height)
-        .animation(.linear(duration: 2.2).repeatForever(autoreverses: false), value: shimmerPhase)
-        .onAppear {
-            guard !reduceMotion, emphasizesLeadingEdge, progress > 0 else { return }
-            shimmerPhase = 1
-        }
-        .onChange(of: reduceMotion) { _, isReduced in
-            if isReduced {
-                shimmerPhase = 0
-            } else if emphasizesLeadingEdge, progress > 0 {
-                shimmerPhase = 1
-            }
-        }
         .accessibilityHidden(true)
     }
 }

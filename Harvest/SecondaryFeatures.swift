@@ -698,13 +698,18 @@ struct TaskEditorSheet: View {
         loadingDownloaders = true
         defer { loadingDownloaders = false }
         do {
-            downloaders = jsonRows(try await appState.api(APIPath.downloaders))
+            downloaders = jsonRows(
+                try await appState.api(APIPath.downloaders, timeoutInterval: 10)
+            )
                 .map { DownloaderItem($0) }
                 .filter { $0.enabled }
             if sourceDownloaderID == 0 { sourceDownloaderID = downloaders.first?.id ?? 0 }
             if targetDownloaderID == 0 { targetDownloaderID = targetOptions.first?.id ?? 0 }
             await fillFolderMap(updateSource: true, updateTarget: true, onlyWhenEmpty: true)
-        } catch { appState.presentedError = error.localizedDescription }
+        } catch {
+            guard !isRequestCancellation(error) else { return }
+            appState.presentedError = error.localizedDescription
+        }
     }
 
     @MainActor private func fillFolderMap(
@@ -1395,7 +1400,8 @@ final class SearchViewModel: ObservableObject {
                         "key": term,
                         "max_count": maxCount,
                         "sites": sitesEnabled ? selectedSiteIDs.sorted().map { String($0) } : []
-                    ]
+                    ],
+                    timeoutInterval: 30
                 ) {
                     guard searchGeneration == generation else { return }
                     if let message = jsonMessage(event), !message.isEmpty {
@@ -1434,6 +1440,7 @@ final class SearchViewModel: ObservableObject {
         } catch is CancellationError {
             return
         } catch {
+            guard !isRequestCancellation(error) else { return }
             guard searchGeneration == generation else { return }
             recordAppLog(.warning, "搜索请求未完整结束：\(error.localizedDescription)")
             if searchMode == "资源" {
@@ -1514,7 +1521,8 @@ final class SearchViewModel: ObservableObject {
 
     func loadSites(_ appState: AppState) async {
         do {
-            sites = jsonRows(try await appState.api(APIPath.sites))
+            let raw = try await appState.api(APIPath.sites, timeoutInterval: 12)
+            sites = jsonRows(raw)
                 .map(SiteItem.init)
                 .filter { $0.enabled && $0.searchTorrents }
                 .sorted {
@@ -3594,11 +3602,20 @@ struct ResourcePushSheet: View {
 
     @MainActor private func load() async {
         defer { isLoading = false }
-        async let sitesValue = optionalValue(APIPath.sites, label: "站点列表")
-        async let tagsValue = optionalValue(APIPath.downloaderTags + "\(downloaderID)", label: "下载器标签")
+        async let sitesValue = optionalValue(
+            APIPath.sites,
+            label: "站点列表",
+            timeoutInterval: 10
+        )
+        async let tagsValue = optionalValue(
+            APIPath.downloaderTags + "\(downloaderID)",
+            label: "下载器标签",
+            timeoutInterval: 8
+        )
         async let categoriesValue = optionalValue(
             APIPath.downloaderCategories + "\(downloaderID)",
-            label: "下载器分类"
+            label: "下载器分类",
+            timeoutInterval: 8
         )
         async let preferencesValue = optionalValue(
             APIPath.downloaderPreferences + "\(downloaderID)",
@@ -3636,6 +3653,7 @@ struct ResourcePushSheet: View {
     ) async -> Any? {
         do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
         catch {
+            guard !Task.isCancelled, !isRequestCancellation(error) else { return nil }
             recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
             return nil
         }

@@ -329,7 +329,9 @@ private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let frameCount = CGImageSourceGetCount(source)
         guard frameCount > 0 else { return nil }
-        let maximumFrameCount = 180
+        // Site logos are rendered at a small size. Capping decoded frames prevents
+        // several GIF logos from retaining hundreds of full RGBA frames while scrolling.
+        let maximumFrameCount = 90
         let frameStep = max(1, Int(ceil(Double(frameCount) / Double(maximumFrameCount))))
 
         let thumbnailOptions: [CFString: Any] = [
@@ -407,17 +409,45 @@ private final class RemoteAnimatedImageCache: @unchecked Sendable {
 
 private final class AnimatedRemoteUIImageView: UIImageView {
     private var displayedCacheKey = ""
+    private var displayedAnimatedImage: RemoteAnimatedImage?
 
     override var intrinsicContentSize: CGSize {
         CGSize(width: UIView.noIntrinsicMetric, height: UIView.noIntrinsicMetric)
     }
 
     func display(_ animatedImage: RemoteAnimatedImage) {
-        guard displayedCacheKey != animatedImage.cacheKey else { return }
+        if displayedCacheKey == animatedImage.cacheKey {
+            displayedAnimatedImage = animatedImage
+            startRemoteAnimationIfNeeded()
+            return
+        }
         displayedCacheKey = animatedImage.cacheKey
-        layer.removeAnimation(forKey: "harvest.site-logo.animation")
+        displayedAnimatedImage = animatedImage
+        stopRemoteAnimation()
         image = animatedImage.frames.first
-        guard animatedImage.frames.count > 1 else { return }
+        startRemoteAnimationIfNeeded()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopRemoteAnimation()
+        } else {
+            startRemoteAnimationIfNeeded()
+        }
+    }
+
+    func stopRemoteAnimation() {
+        layer.removeAnimation(forKey: "harvest.site-logo.animation")
+    }
+
+    private func startRemoteAnimationIfNeeded() {
+        guard window != nil,
+              layer.animation(forKey: "harvest.site-logo.animation") == nil,
+              let animatedImage = displayedAnimatedImage,
+              animatedImage.frames.count > 1 else {
+            return
+        }
 
         let animation = CAKeyframeAnimation(keyPath: "contents")
         animation.values = animatedImage.frames.compactMap(\.cgImage)
@@ -461,6 +491,10 @@ private struct AnimatedRemoteImageView: UIViewRepresentable {
     ) -> CGSize? {
         guard let width = proposal.width, let height = proposal.height else { return nil }
         return CGSize(width: width, height: height)
+    }
+
+    static func dismantleUIView(_ imageView: AnimatedRemoteUIImageView, coordinator: Void) {
+        imageView.stopRemoteAnimation()
     }
 }
 
@@ -1680,20 +1714,12 @@ struct FlowingSymbolBadge: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
-            badge(rotation: reduceMotion ? 42 : rotation(at: context.date))
-        }
+        badge
         .frame(width: size, height: size)
         .accessibilityHidden(true)
     }
 
-    private func rotation(at date: Date) -> Double {
-        let duration = 3.6
-        let elapsed = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: duration)
-        return elapsed / duration * 360
-    }
-
-    private func badge(rotation: Double) -> some View {
+    private var badge: some View {
         ZStack {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(color)
@@ -1713,25 +1739,14 @@ struct FlowingSymbolBadge: View {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .strokeBorder(color.opacity(0.24), lineWidth: 0.7)
 
-            AngularGradient(
-                gradient: Gradient(stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .clear, location: 0.54),
-                    .init(color: color.opacity(0.06), location: 0.62),
-                    .init(color: color.opacity(0.24), location: 0.74),
-                    .init(color: color.opacity(0.56), location: 0.86),
-                    .init(color: Color.white.opacity(0.9), location: 0.93),
-                    .init(color: color.opacity(0.22), location: 0.975),
-                    .init(color: .clear, location: 1)
-                ]),
-                center: .center
+            HardwareFlowingBorder(
+                color: color,
+                lineWidth: glowLineWidth,
+                cornerRadius: cornerRadius,
+                circular: false,
+                phaseOffset: phaseOffset,
+                paused: reduceMotion
             )
-            .rotationEffect(.degrees(rotation + phaseOffset))
-            .mask {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(lineWidth: glowLineWidth)
-            }
-            .shadow(color: color.opacity(0.3), radius: max(1.2, size * 0.055))
         }
     }
 }
@@ -1743,35 +1758,348 @@ struct FlowingCircleBorder: View {
     var lineWidth: CGFloat = 1.8
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
-            border(rotation: reduceMotion ? 42 : rotation(at: context.date))
-        }
+        HardwareFlowingBorder(
+            color: color,
+            lineWidth: lineWidth,
+            cornerRadius: 0,
+            circular: true,
+            phaseOffset: 0,
+            paused: reduceMotion
+        )
         .allowsHitTesting(false)
     }
+}
 
-    private func rotation(at date: Date) -> Double {
-        let duration = 3.6
-        let elapsed = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: duration)
-        return elapsed / duration * 360
+private struct HardwareFlowingBorder: UIViewRepresentable {
+    let color: Color
+    let lineWidth: CGFloat
+    let cornerRadius: CGFloat
+    let circular: Bool
+    let phaseOffset: Double
+    let paused: Bool
+
+    func makeUIView(context: Context) -> HardwareFlowingBorderView {
+        let view = HardwareFlowingBorderView()
+        view.isUserInteractionEnabled = false
+        return view
     }
 
-    private func border(rotation: Double) -> some View {
-        AngularGradient(
-            gradient: Gradient(stops: [
-                .init(color: .clear, location: 0),
-                .init(color: .clear, location: 0.54),
-                .init(color: color.opacity(0.08), location: 0.62),
-                .init(color: color.opacity(0.28), location: 0.74),
-                .init(color: color.opacity(0.62), location: 0.86),
-                .init(color: Color.white.opacity(0.92), location: 0.93),
-                .init(color: color.opacity(0.24), location: 0.975),
-                .init(color: .clear, location: 1)
-            ]),
-            center: .center
+    func updateUIView(_ view: HardwareFlowingBorderView, context: Context) {
+        view.configure(
+            color: UIColor(color),
+            lineWidth: lineWidth,
+            cornerRadius: cornerRadius,
+            circular: circular,
+            phaseOffset: phaseOffset,
+            paused: paused
         )
-        .rotationEffect(.degrees(rotation))
-        .mask { Circle().strokeBorder(lineWidth: lineWidth) }
-        .shadow(color: color.opacity(0.28), radius: 2)
+    }
+
+    static func dismantleUIView(_ view: HardwareFlowingBorderView, coordinator: Void) {
+        view.stopAnimating()
+    }
+}
+
+private final class HardwareFlowingBorderView: UIView {
+    private let gradientLayer = CAGradientLayer()
+    private let borderMaskLayer = CAShapeLayer()
+    private var borderLineWidth: CGFloat = 1.8
+    private var borderCornerRadius: CGFloat = 0
+    private var isCircular = false
+    private var phaseOffset = 0.0
+    private var animationPaused = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        clipsToBounds = false
+
+        gradientLayer.type = .conic
+        gradientLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
+        gradientLayer.endPoint = CGPoint(x: 0.5, y: 0)
+        gradientLayer.mask = borderMaskLayer
+        gradientLayer.shouldRasterize = true
+        gradientLayer.rasterizationScale = UIScreen.main.scale
+        layer.addSublayer(gradientLayer)
+
+        borderMaskLayer.fillColor = UIColor.clear.cgColor
+        borderMaskLayer.strokeColor = UIColor.white.cgColor
+        borderMaskLayer.lineCap = .round
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        gradientLayer.frame = bounds
+        borderMaskLayer.frame = bounds
+        let inset = borderLineWidth / 2 + 0.5
+        let pathRect = bounds.insetBy(dx: inset, dy: inset)
+        borderMaskLayer.path = isCircular
+            ? UIBezierPath(ovalIn: pathRect).cgPath
+            : UIBezierPath(
+                roundedRect: pathRect,
+                cornerRadius: max(0, borderCornerRadius - inset)
+            ).cgPath
+        borderMaskLayer.lineWidth = borderLineWidth
+        restartAnimationIfNeeded()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopAnimating()
+        } else {
+            restartAnimationIfNeeded()
+        }
+    }
+
+    func configure(
+        color: UIColor,
+        lineWidth: CGFloat,
+        cornerRadius: CGFloat,
+        circular: Bool,
+        phaseOffset: Double,
+        paused: Bool
+    ) {
+        let needsAnimationRestart = self.phaseOffset != phaseOffset || animationPaused != paused
+        borderLineWidth = max(0.75, lineWidth)
+        borderCornerRadius = cornerRadius
+        isCircular = circular
+        self.phaseOffset = phaseOffset
+        animationPaused = paused
+        gradientLayer.colors = [
+            color.withAlphaComponent(0).cgColor,
+            color.withAlphaComponent(0).cgColor,
+            color.withAlphaComponent(0.08).cgColor,
+            color.withAlphaComponent(0.28).cgColor,
+            color.withAlphaComponent(0.62).cgColor,
+            UIColor.white.withAlphaComponent(0.92).cgColor,
+            color.withAlphaComponent(0.24).cgColor,
+            color.withAlphaComponent(0).cgColor
+        ]
+        gradientLayer.locations = [0, 0.54, 0.62, 0.74, 0.86, 0.93, 0.975, 1]
+        setNeedsLayout()
+        if needsAnimationRestart { restartAnimationIfNeeded(force: true) }
+    }
+
+    func stopAnimating() {
+        gradientLayer.removeAnimation(forKey: "harvest.flowing-border")
+    }
+
+    private func restartAnimationIfNeeded(force: Bool = false) {
+        guard window != nil, !bounds.isEmpty else { return }
+        if animationPaused {
+            stopAnimating()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            gradientLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 4))
+            CATransaction.commit()
+            return
+        }
+        if !force, gradientLayer.animation(forKey: "harvest.flowing-border") != nil { return }
+        stopAnimating()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradientLayer.setAffineTransform(.identity)
+        CATransaction.commit()
+        let animation = CABasicAnimation(keyPath: "transform.rotation.z")
+        animation.fromValue = phaseOffset * .pi / 180
+        animation.byValue = Double.pi * 2
+        animation.duration = 3.6
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        gradientLayer.add(animation, forKey: "harvest.flowing-border")
+    }
+}
+
+struct HardwareProgressShimmer: UIViewRepresentable {
+    let color: Color
+    var paused = false
+
+    func makeUIView(context: Context) -> HardwareProgressShimmerView {
+        let view = HardwareProgressShimmerView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: HardwareProgressShimmerView, context: Context) {
+        view.configure(color: UIColor(color), paused: paused)
+    }
+
+    static func dismantleUIView(_ view: HardwareProgressShimmerView, coordinator: Void) {
+        view.stopAnimating()
+    }
+}
+
+struct HardwareBreathingSymbolBadge: UIViewRepresentable {
+    let icon: String
+    let color: Color
+    var paused = false
+
+    func makeUIView(context: Context) -> HardwareBreathingSymbolBadgeView {
+        let view = HardwareBreathingSymbolBadgeView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ view: HardwareBreathingSymbolBadgeView, context: Context) {
+        view.configure(icon: icon, color: UIColor(color), paused: paused)
+    }
+
+    static func dismantleUIView(_ view: HardwareBreathingSymbolBadgeView, coordinator: Void) {
+        view.stopAnimating()
+    }
+}
+
+final class HardwareBreathingSymbolBadgeView: UIView {
+    private let imageView = UIImageView()
+    private var animationPaused = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isOpaque = false
+        imageView.contentMode = .center
+        imageView.tintColor = .white
+        addSubview(imageView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        imageView.frame = bounds
+        layer.cornerRadius = min(3.5, min(bounds.width, bounds.height) * 0.25)
+        restartAnimationIfNeeded()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopAnimating()
+        } else {
+            restartAnimationIfNeeded()
+        }
+    }
+
+    func configure(icon: String, color: UIColor, paused: Bool) {
+        let needsRestart = animationPaused != paused
+        animationPaused = paused
+        backgroundColor = color
+        let configuration = UIImage.SymbolConfiguration(pointSize: 6.5, weight: .bold)
+        imageView.image = UIImage(systemName: icon, withConfiguration: configuration)
+        if needsRestart { restartAnimationIfNeeded(force: true) }
+    }
+
+    func stopAnimating() {
+        layer.removeAnimation(forKey: "harvest.breathing-symbol")
+    }
+
+    private func restartAnimationIfNeeded(force: Bool = false) {
+        guard window != nil, !bounds.isEmpty else { return }
+        if animationPaused {
+            stopAnimating()
+            layer.opacity = 1
+            return
+        }
+        if !force, layer.animation(forKey: "harvest.breathing-symbol") != nil { return }
+        stopAnimating()
+        layer.opacity = 1
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 0.3
+        animation.toValue = 1
+        animation.duration = 1.15
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        layer.add(animation, forKey: "harvest.breathing-symbol")
+    }
+}
+
+final class HardwareProgressShimmerView: UIView {
+    private let shimmerLayer = CAGradientLayer()
+    private var animationPaused = false
+    private var previousSize = CGSize.zero
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        clipsToBounds = true
+        shimmerLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        shimmerLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        shimmerLayer.shouldRasterize = true
+        shimmerLayer.rasterizationScale = UIScreen.main.scale
+        layer.addSublayer(shimmerLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let width = min(max(bounds.width * 0.24, 10), 30)
+        shimmerLayer.frame = CGRect(x: -width, y: -2, width: width, height: bounds.height + 4)
+        let sizeChanged = abs(previousSize.width - bounds.width) > 0.5
+            || abs(previousSize.height - bounds.height) > 0.5
+        previousSize = bounds.size
+        restartAnimationIfNeeded(force: sizeChanged)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            stopAnimating()
+        } else {
+            restartAnimationIfNeeded()
+        }
+    }
+
+    func configure(color: UIColor, paused: Bool) {
+        let needsRestart = animationPaused != paused
+        animationPaused = paused
+        shimmerLayer.colors = [
+            color.withAlphaComponent(0).cgColor,
+            UIColor.white.withAlphaComponent(0.18).cgColor,
+            UIColor.white.withAlphaComponent(0.92).cgColor,
+            color.withAlphaComponent(0.30).cgColor,
+            color.withAlphaComponent(0).cgColor
+        ]
+        shimmerLayer.locations = [0, 0.24, 0.5, 0.74, 1]
+        if needsRestart { restartAnimationIfNeeded(force: true) }
+    }
+
+    func stopAnimating() {
+        shimmerLayer.removeAnimation(forKey: "harvest.progress-shimmer")
+    }
+
+    private func restartAnimationIfNeeded(force: Bool = false) {
+        guard window != nil, bounds.width > 2, bounds.height > 0 else { return }
+        if animationPaused {
+            stopAnimating()
+            return
+        }
+        if !force, shimmerLayer.animation(forKey: "harvest.progress-shimmer") != nil { return }
+        stopAnimating()
+        let animation = CABasicAnimation(keyPath: "transform.translation.x")
+        animation.fromValue = 0
+        animation.toValue = bounds.width + shimmerLayer.bounds.width * 2
+        animation.duration = 2.2
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.repeatCount = .infinity
+        animation.isRemovedOnCompletion = false
+        shimmerLayer.add(animation, forKey: "harvest.progress-shimmer")
     }
 }
 

@@ -643,18 +643,28 @@ final class SitesViewModel: ObservableObject {
             || (lastConfigsLoadedAt.map { Date().timeIntervalSince($0) > 15 * 60 } ?? true)
         let configTask: Task<Result<Any, Error>, Never>? = shouldRefreshConfigs
             ? Task {
-                do { return .success(try await appState.api(APIPath.websiteList)) }
+                do {
+                    return .success(try await appState.api(APIPath.websiteList, timeoutInterval: 12))
+                }
                 catch { return .failure(error) }
             }
             : nil
 
         var loadedSites: [SiteItem]?
         do {
-            let raw = try await appState.api(APIPath.sites, query: ["cached": cached])
+            let raw = try await appState.api(
+                APIPath.sites,
+                query: ["cached": cached],
+                timeoutInterval: 15
+            )
             loadedSites = jsonRows(raw).map(SiteItem.init)
             cachedAt = nil
             usingCachedData = false
         } catch {
+            guard !isRequestCancellation(error) else {
+                configTask?.cancel()
+                return
+            }
             if !usingCachedData { appState.presentedError = error.localizedDescription }
         }
 
@@ -1687,8 +1697,12 @@ struct SiteTimelineView: View {
     @MainActor private func load() async {
         defer { isLoading = false }
         if model.sites.isEmpty { await model.load(appState) }
-        do { configs = jsonRows(try await appState.api(APIPath.websiteList)) }
-        catch { appState.presentedError = error.localizedDescription }
+        do {
+            configs = jsonRows(try await appState.api(APIPath.websiteList, timeoutInterval: 10))
+        } catch {
+            guard !isRequestCancellation(error) else { return }
+            appState.presentedError = error.localizedDescription
+        }
     }
 }
 
@@ -2076,7 +2090,7 @@ struct SiteConfigGeneratorSheet: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            configs = jsonRows(try await appState.api(APIPath.websiteList))
+            configs = jsonRows(try await appState.api(APIPath.websiteList, timeoutInterval: 10))
             selectedName = configNames.first(where: { $0 == "NP模板" }) ?? configNames.first ?? ""
             await loadTemplate(selectedName)
         } catch { appState.presentedError = error.localizedDescription }
@@ -2087,7 +2101,10 @@ struct SiteConfigGeneratorSheet: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            let raw = try await appState.api("\(APIPath.websiteList)/\(urlPathSegment(name))")
+            let raw = try await appState.api(
+                "\(APIPath.websiteList)/\(urlPathSegment(name))",
+                timeoutInterval: 10
+            )
             content = extractTOML(raw) ?? configToTOML(configs.first { $0.string("name", "site") == name } ?? [:])
             configName = tomlName(content) ?? name
         } catch {
@@ -3092,7 +3109,6 @@ private struct SiteHeaderCompactMetric: View {
     let value: String
     let color: Color
     let breathes: Bool
-    @State private var isBright = false
 
     init(icon: String, label: String, value: String, color: Color, breathes: Bool = false) {
         self.icon = icon
@@ -3104,18 +3120,20 @@ private struct SiteHeaderCompactMetric: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 2) {
-            Image(systemName: icon)
-                .font(.system(size: 6.5, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: 14, height: 14, alignment: .center)
-                .background(color, in: RoundedRectangle(cornerRadius: 3.5, style: .continuous))
-                .opacity(breathes && !reduceMotion ? (isBright ? 1 : 0.3) : 1)
-                .animation(
-                    breathes && !reduceMotion
-                        ? .easeInOut(duration: 1.15).repeatForever(autoreverses: true)
-                        : .default,
-                    value: isBright
+            if breathes {
+                HardwareBreathingSymbolBadge(
+                    icon: icon,
+                    color: color,
+                    paused: reduceMotion
                 )
+                .frame(width: 14, height: 14)
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: 6.5, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 14, height: 14, alignment: .center)
+                    .background(color, in: RoundedRectangle(cornerRadius: 3.5, style: .continuous))
+            }
             Text(value)
                 .font(.system(size: 8, weight: .bold).monospacedDigit())
                 .lineLimit(1)
@@ -3124,12 +3142,6 @@ private struct SiteHeaderCompactMetric: View {
         .frame(minHeight: 16, alignment: .center)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(label) \(value)")
-        .onAppear { updateBreathingState() }
-        .onChange(of: reduceMotion) { _, _ in updateBreathingState() }
-    }
-
-    private func updateBreathingState() {
-        isBright = breathes && !reduceMotion
     }
 }
 
@@ -5000,15 +5012,25 @@ struct SiteDetailView: View {
         guard !isLoading else { return }
         isLoading = true
         defer { isLoading = false }
-        async let detail = loadDetailPayload("\(APIPath.sites)/\(site.id)")
-        async let config = loadDetailPayload("\(APIPath.websiteList)/\(urlPathSegment(site.siteKey))")
+        async let detail = loadDetailPayload("\(APIPath.sites)/\(site.id)", timeoutInterval: 10)
+        async let config = loadDetailPayload(
+            "\(APIPath.websiteList)/\(urlPathSegment(site.siteKey))",
+            timeoutInterval: 10
+        )
         let values = await (detail, config)
         if let row = values.0 { latestSite = SiteItem(row) }
         if let config = values.1 { siteConfig = config }
     }
 
-    @MainActor private func loadDetailPayload(_ path: String) async -> [String: Any]? {
-        do { return jsonPayloadDictionary(try await appState.api(path)) }
+    @MainActor private func loadDetailPayload(
+        _ path: String,
+        timeoutInterval: TimeInterval = 15
+    ) async -> [String: Any]? {
+        do {
+            return jsonPayloadDictionary(
+                try await appState.api(path, timeoutInterval: timeoutInterval)
+            )
+        }
         catch {
             if !isRequestCancellation(error) {
                 await AppLogStore.shared.append(.warning, "站点详情子请求失败 \(path)：\(error.localizedDescription)")
@@ -6237,7 +6259,8 @@ struct SiteBrowserScreen: View {
         guard !browserConfigHasInterfaces(siteConfig), !site.siteKey.isEmpty else { return }
         do {
             let direct = jsonPayloadDictionary(try await appState.api(
-                "\(APIPath.websiteList)/\(urlPathSegment(site.siteKey))"
+                "\(APIPath.websiteList)/\(urlPathSegment(site.siteKey))",
+                timeoutInterval: 10
             )) ?? [:]
             if browserConfigHasInterfaces(direct) {
                 siteConfig = direct
@@ -6249,7 +6272,9 @@ struct SiteBrowserScreen: View {
         }
 
         do {
-            let configs = jsonRows(try await appState.api(APIPath.websiteList))
+            let configs = jsonRows(
+                try await appState.api(APIPath.websiteList, timeoutInterval: 10)
+            )
             let siteKey = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let siteName = site.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             let siteHost = URL(string: site.url)?.host?.lowercased()
@@ -6271,7 +6296,9 @@ struct SiteBrowserScreen: View {
     @MainActor private func loadDownloaders() async {
         guard downloaders.isEmpty else { return }
         do {
-            downloaders = jsonRows(try await appState.api(APIPath.downloaders))
+            downloaders = jsonRows(
+                try await appState.api(APIPath.downloaders, timeoutInterval: 10)
+            )
                 .map(DownloaderItem.init)
                 .filter(\.enabled)
         } catch {
@@ -6431,7 +6458,9 @@ struct SiteBrowserScreen: View {
 
     @MainActor private func resolveCreatedSite() async {
         do {
-            let sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+            let sites = jsonRows(
+                try await appState.api(APIPath.sites, timeoutInterval: 10)
+            ).map(SiteItem.init)
             guard let saved = sites.first(where: {
                 $0.siteKey.caseInsensitiveCompare(site.siteKey) == .orderedSame
             }) else { return }

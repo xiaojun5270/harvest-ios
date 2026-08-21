@@ -1054,7 +1054,7 @@ final class DownloadsViewModel: ObservableObject {
             let raw = try await appState.api(
                 APIPath.downloaders,
                 query: ["with_status": includesTorrentData],
-                timeoutInterval: includesTorrentData ? nil : 10
+                timeoutInterval: includesTorrentData ? 15 : 10
             )
             downloaders = mergingDownloaderConfigurations(
                 jsonRows(raw).map(DownloaderItem.init),
@@ -1078,7 +1078,10 @@ final class DownloadsViewModel: ObservableObject {
                     let downloaderID = downloader.id
                     group.addTask {
                         do {
-                            let main = try await appState.api("\(APIPath.downloaderMain)\(downloaderID)")
+                            let main = try await appState.api(
+                                "\(APIPath.downloaderMain)\(downloaderID)",
+                                timeoutInterval: 15
+                            )
                             guard JSONSerialization.isValidJSONObject(main),
                                   let data = try? JSONSerialization.data(withJSONObject: main) else {
                                 return (downloaderID, nil, "下载器返回了无效数据")
@@ -1122,7 +1125,7 @@ final class DownloadsViewModel: ObservableObject {
             }
             if sites.isEmpty || usingCachedData {
                 do {
-                    let siteRaw = try await appState.api(APIPath.sites)
+                    let siteRaw = try await appState.api(APIPath.sites, timeoutInterval: 12)
                     sites = jsonRows(siteRaw).map(SiteItem.init)
                 } catch {
                     if !isRequestCancellation(error) {
@@ -1132,7 +1135,9 @@ final class DownloadsViewModel: ObservableObject {
             }
             if websiteConfigs.isEmpty || usingCachedData {
                 do {
-                    websiteConfigs = jsonRows(try await appState.api(APIPath.websiteList))
+                    websiteConfigs = jsonRows(
+                        try await appState.api(APIPath.websiteList, timeoutInterval: 12)
+                    )
                 } catch {
                     if !isRequestCancellation(error) {
                         recordAppLog(.warning, "下载页站点配置刷新失败：\(error.localizedDescription)")
@@ -1801,6 +1806,8 @@ final class DownloadsViewModel: ObservableObject {
 
     private static func watchDownloaderSpeeds(_ reference: WeakReference, appState: AppState) async {
         var reconnectAttempt = 0
+        var lastErrorMessage = ""
+        var lastReconnectDelay = 0
         while reference.value?.isWatching == true && !Task.isCancelled {
             var receivedFrame = false
             do {
@@ -1814,17 +1821,28 @@ final class DownloadsViewModel: ObservableObject {
                     guard reference.value?.isWatching == true, !Task.isCancelled else { return }
                     receivedFrame = true
                     reconnectAttempt = 0
+                    lastErrorMessage = ""
+                    lastReconnectDelay = 0
                     reference.value?.applyDownloaderSpeedEvent(event, appState: appState)
                 }
             } catch {
                 guard reference.value?.isWatching == true, !Task.isCancelled else { return }
-                recordAppLog(.warning, "下载器速度连接中断：\(error.localizedDescription)")
+                guard !isRequestCancellation(error) else { return }
+                let message = error.localizedDescription
+                if message != lastErrorMessage {
+                    recordAppLog(.warning, "下载器速度连接中断：\(message)")
+                    lastErrorMessage = message
+                }
+                if isTerminalWebSocketError(error) { return }
             }
             guard reference.value?.isWatching == true, !Task.isCancelled else { return }
             if receivedFrame { reconnectAttempt = 0 }
             reconnectAttempt = min(reconnectAttempt + 1, 6)
-            let delay = min(30, 1 << reconnectAttempt)
-            recordAppLog(.warning, "下载器速度将在 \(delay) 秒后重连")
+            let delay = min(60, 1 << reconnectAttempt)
+            if delay != lastReconnectDelay {
+                recordAppLog(.warning, "下载器速度将在 \(delay) 秒后重连")
+                lastReconnectDelay = delay
+            }
             do { try await Task.sleep(for: .seconds(delay)) }
             catch { return }
         }
@@ -1882,6 +1900,8 @@ final class DownloadsViewModel: ObservableObject {
         token: UUID
     ) async {
         var reconnectAttempt = 0
+        var lastErrorMessage = ""
+        var lastReconnectDelay = 0
         while reference.value?.isCurrentWatch(downloader.id, token: token) == true && !Task.isCancelled {
             do {
                 let stream = APIClient.shared.streamWebSocket(
@@ -1900,6 +1920,8 @@ final class DownloadsViewModel: ObservableObject {
                     if !receivedFrame {
                         receivedFrame = true
                         reconnectAttempt = 0
+                        lastErrorMessage = ""
+                        lastReconnectDelay = 0
                         reference.value?.socketConnections.insert(downloader.id)
                     }
                     let payload = jsonPayloadDictionary(event) ?? event
@@ -1979,15 +2001,24 @@ final class DownloadsViewModel: ObservableObject {
                     reference.value?.socketConnections.remove(downloader.id)
                 }
             } catch {
+                guard !isRequestCancellation(error) else { return }
                 if reference.value?.isCurrentWatch(downloader.id, token: token) == true {
                     reference.value?.socketConnections.remove(downloader.id)
-                    recordAppLog(.warning, "\(downloader.name) 实时任务连接中断：\(error.localizedDescription)")
+                    let message = error.localizedDescription
+                    if message != lastErrorMessage {
+                        recordAppLog(.warning, "\(downloader.name) 实时任务连接中断：\(message)")
+                        lastErrorMessage = message
+                    }
                 }
+                if isTerminalWebSocketError(error) { return }
             }
             if reference.value?.isCurrentWatch(downloader.id, token: token) == true, !Task.isCancelled {
                 reconnectAttempt = min(reconnectAttempt + 1, 6)
-                let delay = min(30, 1 << reconnectAttempt)
-                recordAppLog(.warning, "\(downloader.name) 将在 \(delay) 秒后重连")
+                let delay = min(60, 1 << reconnectAttempt)
+                if delay != lastReconnectDelay {
+                    recordAppLog(.warning, "\(downloader.name) 将在 \(delay) 秒后重连")
+                    lastReconnectDelay = delay
+                }
                 do { try await Task.sleep(for: .seconds(delay)) }
                 catch { return }
             }
@@ -2583,7 +2614,7 @@ struct DownloaderSelectionSheet: View {
         loadError = ""
         defer { isLoading = false }
         do {
-            downloaders = jsonRows(try await appState.api(APIPath.downloaders))
+            downloaders = jsonRows(try await appState.api(APIPath.downloaders, timeoutInterval: 10))
                 .map(DownloaderItem.init)
                 .filter(\.enabled)
         } catch {
@@ -4170,7 +4201,9 @@ struct AddTorrentSheet: View {
             }
             .task {
                 do {
-                    sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+                    sites = jsonRows(
+                        try await appState.api(APIPath.sites, timeoutInterval: 10)
+                    ).map(SiteItem.init)
                     if let initialSiteID,
                        let initialSite = sites.first(where: { $0.id == initialSiteID }) {
                         siteIdentifier = initialSite.siteKey.isEmpty ? String(initialSite.id) : initialSite.siteKey
@@ -4268,7 +4301,7 @@ struct AddTorrentSheet: View {
     ) async -> Any? {
         do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
         catch {
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled, !isRequestCancellation(error) else { return nil }
             recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
             return nil
         }

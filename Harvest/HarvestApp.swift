@@ -12,6 +12,10 @@ final class HarvestAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificat
         return true
     }
 
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        Task { await AppLogStore.shared.flush() }
+    }
+
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,

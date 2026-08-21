@@ -178,6 +178,25 @@ func isRequestCancellation(_ error: Error) -> Bool {
         || message.contains("request canceled")
 }
 
+/// Returns true when reconnecting the socket is unlikely to succeed without a
+/// server-side or authentication change. These failures should not create a
+/// tight reconnect loop or repeatedly wake the app in the background.
+func isTerminalWebSocketError(_ error: Error) -> Bool {
+    if let apiError = error as? APIError,
+       [401, 403, 404, 405, 426].contains(apiError.statusCode) {
+        return true
+    }
+    let message = error.localizedDescription.lowercased()
+    return message.contains("信息太长")
+        || message.contains("消息太长")
+        || message.contains("message too long")
+        || message.contains("frame too large")
+        || message.contains("maximum frame")
+        || message.contains("payload too large")
+        || message.contains("unauthorized")
+        || message.contains("forbidden")
+}
+
 enum AppLogLevel: String, Codable, CaseIterable, Sendable {
     case verbose = "VERBOSE"
     case debug = "DEBUG"
@@ -229,6 +248,9 @@ actor AppLogStore {
 
     private let fileURL: URL
     private var records: [AppLogRecord]
+    private var pendingPersistCount = 0
+    private var lastPersistAt = Date.distantPast
+    private var persistTask: Task<Void, Never>?
 
     private init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -247,7 +269,18 @@ actor AppLogStore {
     func append(_ level: AppLogLevel, _ message: String) {
         records.append(AppLogRecord(id: UUID(), timestamp: Date(), level: level, message: message))
         if records.count > 2_000 { records.removeFirst(records.count - 2_000) }
-        persist()
+        pendingPersistCount += 1
+        if pendingPersistCount >= 12 || Date().timeIntervalSince(lastPersistAt) >= 1 {
+            persistTask?.cancel()
+            persistTask = nil
+            persist()
+        } else if persistTask == nil {
+            persistTask = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(1)) }
+                catch { return }
+                await self?.flushPendingPersistence()
+            }
+        }
         let stored = UserDefaults.standard.object(forKey: "logs.appThreshold") as? Int
         let threshold = AppLogThreshold(rawValue: stored ?? AppLogThreshold.info.rawValue) ?? .info
         guard threshold != .off, level.priority >= threshold.rawValue else { return }
@@ -257,8 +290,19 @@ actor AppLogStore {
     func snapshot() -> [AppLogRecord] { records }
 
     func clear() {
+        persistTask?.cancel()
+        persistTask = nil
         records.removeAll()
+        pendingPersistCount = 0
+        lastPersistAt = Date()
         try? FileManager.default.removeItem(at: fileURL)
+    }
+
+    func flush() {
+        persistTask?.cancel()
+        persistTask = nil
+        guard pendingPersistCount > 0 else { return }
+        persist()
     }
 
     func exportArchive() throws -> URL {
@@ -279,6 +323,14 @@ actor AppLogStore {
     private func persist() {
         guard let data = try? JSONEncoder().encode(records) else { return }
         try? data.write(to: fileURL, options: .atomic)
+        pendingPersistCount = 0
+        lastPersistAt = Date()
+    }
+
+    private func flushPendingPersistence() {
+        persistTask = nil
+        guard pendingPersistCount > 0 else { return }
+        persist()
     }
 }
 
@@ -560,13 +612,17 @@ actor AppSessionCache {
     func write(scope: String, name: String, payload: Data) {
         guard payload.count <= maximumEntryBytes else { return }
         guard let safePayload = cacheSafePayload(payload) else { return }
+        let key = memoryKey(scope: scope, name: name)
+        if let existing = memory[key], existing.payload == safePayload {
+            return
+        }
         let envelope = Envelope(
             scope: scope,
             name: name,
             cachedAt: Date(),
             payload: safePayload
         )
-        memory[memoryKey(scope: scope, name: name)] = envelope
+        memory[key] = envelope
         try? FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
         persist(envelope, to: fileURL(scope: scope, name: name))
         writesSinceTrim += 1
@@ -1010,7 +1066,8 @@ final class APIClient {
         token: String,
         method: HTTPMethod = .post,
         query: [String: Any] = [:],
-        body: [String: Any]? = nil
+        body: [String: Any]? = nil,
+        timeoutInterval: TimeInterval = 45
     ) -> AsyncThrowingStream<[String: Any], Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
@@ -1030,6 +1087,7 @@ final class APIClient {
                     }
                     var request = URLRequest(url: url)
                     request.httpMethod = method.rawValue
+                    request.timeoutInterval = timeoutInterval
                     request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
                     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
                     request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
@@ -1452,6 +1510,7 @@ final class AppState: ObservableObject {
             defaults.set(lastIDsByAccount, forKey: "notifications.lastIDByAccount")
             defaults.set(fallbackIDsByAccount, forKey: "notifications.fallbackIDsByAccount")
         } catch {
+            guard !isRequestCancellation(error) else { return }
             recordAppLog(.warning, "同步通知失败：\(error.localizedDescription)")
         }
     }
@@ -1811,6 +1870,10 @@ final class AppState: ObservableObject {
         timeoutInterval: TimeInterval? = nil,
         retry: Bool = true
     ) async throws -> Any {
+        if path.lowercased().contains(APIPath.cacheClear.lowercased())
+            && query["key"] == nil {
+            throw APIError(statusCode: 400, message: "缺少缓存 key")
+        }
         let requestAccessToken = accessToken
         do {
             let result = try await APIClient.shared.request(
@@ -1834,7 +1897,6 @@ final class AppState: ObservableObject {
                     retry: false
                 )
             }
-            await AppLogStore.shared.append(.warning, "\(method.rawValue) \(path) 返回 401，正在刷新令牌")
             try await refreshAccessToken()
             return try await api(
                 path,
@@ -2104,12 +2166,13 @@ final class AppState: ObservableObject {
             return
         }
         do {
-            let payload = jsonPayloadDictionary(try await api(APIPath.authInfo))
+            let payload = jsonPayloadDictionary(try await api(APIPath.authInfo, timeoutInterval: 10))
             let username = payload?.string("username")?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
             canOpenAdminUsers = username == "ngfchl@126.com"
         } catch {
+            guard !isRequestCancellation(error) else { return }
             canOpenAdminUsers = false
             recordAppLog(.warning, "读取授权管理访问条件失败：\(error.localizedDescription)")
         }
@@ -2130,7 +2193,8 @@ final class AppState: ObservableObject {
         let raw = try await APIClient.shared.request(
             baseURL: baseURL,
             path: APIPath.userInfo,
-            token: token
+            token: token,
+            timeoutInterval: 15
         )
         guard let payload = jsonPayloadDictionary(raw),
               payload.string("username", "name") != nil else {
@@ -2154,7 +2218,8 @@ final class AppState: ObservableObject {
                 baseURL: expectedBaseURL,
                 path: APIPath.tokenRefresh,
                 method: .post,
-                body: ["refresh": expectedRefreshToken]
+                body: ["refresh": expectedRefreshToken],
+                timeoutInterval: 10
             )
             try Task.checkCancellation()
             if let businessError = jsonBusinessError(raw, fallback: "登录已过期") {
@@ -2177,6 +2242,7 @@ final class AppState: ObservableObject {
             }
         }
         accessTokenRefresh = (refreshID, task)
+        recordAppLog(.warning, "访问令牌已失效，正在统一刷新")
         do {
             try await task.value
             if accessTokenRefresh?.id == refreshID { accessTokenRefresh = nil }

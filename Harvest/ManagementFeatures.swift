@@ -1149,7 +1149,9 @@ struct NotificationToolsView: View {
         isWorking = true
         defer { isWorking = false }
         do {
-            let sites = jsonRows(try await appState.api(APIPath.sites)).map(SiteItem.init)
+            let sites = jsonRows(
+                try await appState.api(APIPath.sites, timeoutInterval: 10)
+            ).map(SiteItem.init)
             let host = rawHost.hasPrefix("www.") ? String(rawHost.dropFirst(4)) : rawHost
             let matches = sites.filter { site in
                 let values = [site.siteKey, site.url, site.torrentsURL, site.rss].map { $0.lowercased() }
