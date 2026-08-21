@@ -1801,6 +1801,7 @@ private struct HardwareFlowingBorder: UIViewRepresentable {
 }
 
 private final class HardwareFlowingBorderView: UIView {
+    private let clippedEffectLayer = CALayer()
     private let gradientLayer = CAGradientLayer()
     private let borderMaskLayer = CAShapeLayer()
     private var glowColor = UIColor.systemBlue
@@ -1816,17 +1817,20 @@ private final class HardwareFlowingBorderView: UIView {
         isOpaque = false
         clipsToBounds = false
 
+        clippedEffectLayer.mask = borderMaskLayer
+        clippedEffectLayer.masksToBounds = false
+        clippedEffectLayer.shadowOffset = .zero
+        layer.addSublayer(clippedEffectLayer)
+
         gradientLayer.type = .conic
         gradientLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
         // SwiftUI AngularGradient starts at the trailing edge. Matching that
         // origin keeps the hardware-rendered highlight in its original position.
         gradientLayer.endPoint = CGPoint(x: 1, y: 0.5)
-        gradientLayer.mask = borderMaskLayer
         gradientLayer.masksToBounds = false
         gradientLayer.shouldRasterize = true
         gradientLayer.rasterizationScale = UIScreen.main.scale
-        gradientLayer.shadowOffset = .zero
-        layer.addSublayer(gradientLayer)
+        clippedEffectLayer.addSublayer(gradientLayer)
 
         borderMaskLayer.fillColor = UIColor.clear.cgColor
         borderMaskLayer.strokeColor = UIColor.white.cgColor
@@ -1840,8 +1844,15 @@ private final class HardwareFlowingBorderView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        gradientLayer.frame = bounds
-        borderMaskLayer.frame = bounds
+        clippedEffectLayer.frame = bounds
+        let gradientSide = hypot(bounds.width, bounds.height)
+        gradientLayer.frame = CGRect(
+            x: (bounds.width - gradientSide) / 2,
+            y: (bounds.height - gradientSide) / 2,
+            width: gradientSide,
+            height: gradientSide
+        )
+        borderMaskLayer.frame = clippedEffectLayer.bounds
         let inset = borderLineWidth / 2
         let pathRect = bounds.insetBy(dx: inset, dy: inset)
         borderMaskLayer.path = isCircular
@@ -1851,9 +1862,9 @@ private final class HardwareFlowingBorderView: UIView {
                 cornerRadius: max(0, borderCornerRadius - inset)
             ).cgPath
         borderMaskLayer.lineWidth = borderLineWidth
-        gradientLayer.shadowColor = glowColor.cgColor
-        gradientLayer.shadowOpacity = isCircular ? 0.28 : 0.30
-        gradientLayer.shadowRadius = isCircular
+        clippedEffectLayer.shadowColor = glowColor.cgColor
+        clippedEffectLayer.shadowOpacity = isCircular ? 0.28 : 0.30
+        clippedEffectLayer.shadowRadius = isCircular
             ? 2
             : max(1.2, min(bounds.width, bounds.height) * 0.055)
         restartAnimationIfNeeded()
