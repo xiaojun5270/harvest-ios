@@ -852,6 +852,7 @@ final class SitesViewModel: ObservableObject {
 
 struct SitesView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.openURL) private var openURL
     @StateObject private var model = SitesViewModel()
     @State private var showAdd = false
     @State private var showFilters = false
@@ -915,6 +916,7 @@ struct SitesView: View {
                                 milestone: model.milestone(for: site),
                                 onOpenDetails: { selectedSite = site },
                                 onOpenBrowser: { openBrowser(for: site) },
+                                onOpenExternalBrowser: { openExternalBrowser(for: site) },
                                 onOpenLevel: { levelSite = site },
                                 onOpenSignIn: { signInSite = site }
                             )
@@ -1039,18 +1041,37 @@ struct SitesView: View {
     }
 
     private func openBrowser(for site: SiteItem) {
-        var url = model.browserURL(for: site)
-        if url.hasPrefix("//") {
-            url = "https:\(url)"
-        } else if URL(string: url)?.scheme == nil, !url.isEmpty {
-            url = "https://\(url)"
-        }
-        guard let parsedURL = URL(string: url),
-              ["http", "https"].contains(parsedURL.scheme?.lowercased() ?? "") else {
+        guard let parsedURL = normalizedSiteURL(for: site) else {
             appState.presentedError = "站点地址无效，无法打开"
             return
         }
-        browserTarget = SiteBrowserTarget(site: site, url: url, config: model.config(for: site) ?? [:])
+        browserTarget = SiteBrowserTarget(
+            site: site,
+            url: parsedURL.absoluteString,
+            config: model.config(for: site) ?? [:]
+        )
+    }
+
+    private func openExternalBrowser(for site: SiteItem) {
+        guard let url = normalizedSiteURL(for: site) else {
+            appState.presentedError = "站点地址无效，无法打开外部浏览器"
+            return
+        }
+        openURL(url)
+    }
+
+    private func normalizedSiteURL(for site: SiteItem) -> URL? {
+        var value = model.browserURL(for: site).trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("//") {
+            value = "https:\(value)"
+        } else if URL(string: value)?.scheme == nil, !value.isEmpty {
+            value = "https://\(value)"
+        }
+        guard let url = URL(string: value),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            return nil
+        }
+        return url
     }
 
     @ViewBuilder private func SiteActions(site: SiteItem, model: SitesViewModel) -> some View {
@@ -2654,6 +2675,7 @@ struct SiteRow: View {
     let milestone: SiteLevelMilestone?
     let onOpenDetails: () -> Void
     let onOpenBrowser: () -> Void
+    let onOpenExternalBrowser: () -> Void
     let onOpenLevel: () -> Void
     let onOpenSignIn: () -> Void
 
@@ -2664,6 +2686,7 @@ struct SiteRow: View {
         milestone: SiteLevelMilestone? = nil,
         onOpenDetails: @escaping () -> Void = {},
         onOpenBrowser: @escaping () -> Void = {},
+        onOpenExternalBrowser: @escaping () -> Void = {},
         onOpenLevel: @escaping () -> Void = {},
         onOpenSignIn: @escaping () -> Void = {}
     ) {
@@ -2673,6 +2696,7 @@ struct SiteRow: View {
         self.milestone = milestone
         self.onOpenDetails = onOpenDetails
         self.onOpenBrowser = onOpenBrowser
+        self.onOpenExternalBrowser = onOpenExternalBrowser
         self.onOpenLevel = onOpenLevel
         self.onOpenSignIn = onOpenSignIn
     }
@@ -2736,11 +2760,26 @@ struct SiteRow: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: 9) {
-            Button(action: onOpenBrowser) {
-                siteLogo(size: 48)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("进入\(privacyMaskedText(site.name, enabled: privacy))站点")
+            siteLogo(size: 48)
+                .contentShape(Circle())
+                .highPriorityGesture(
+                    LongPressGesture(minimumDuration: 0.45)
+                        .exclusively(before: TapGesture())
+                        .onEnded { result in
+                            switch result {
+                            case .first(_):
+                                onOpenExternalBrowser()
+                            case .second(_):
+                                onOpenBrowser()
+                            }
+                        }
+                )
+                .accessibilityElement()
+                .accessibilityAddTraits(.isButton)
+                .accessibilityLabel("进入\(privacyMaskedText(site.name, enabled: privacy))站点")
+                .accessibilityHint("轻点进入内置浏览器，长按使用外部浏览器打开")
+                .accessibilityAction { onOpenBrowser() }
+                .accessibilityAction(named: "在外部浏览器中打开") { onOpenExternalBrowser() }
             VStack(alignment: .leading, spacing: 5) {
                 HStack(alignment: .center, spacing: 5) {
                     Button(action: onOpenDetails) {
@@ -2950,6 +2989,13 @@ struct SiteRow: View {
             Circle()
                 .stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
         }
+        .overlay {
+            FlowingCircleBorder(
+                color: site.enabled ? HarvestTheme.blue : Color.secondary,
+                rotation: metricGlowRotation,
+                lineWidth: 1.8
+            )
+        }
         .overlay(alignment: .bottomTrailing) {
             Circle()
                 .fill(site.enabled ? HarvestTheme.green : HarvestTheme.coral)
@@ -3122,48 +3168,13 @@ private struct SiteMetricIcon: View {
     let size: CGFloat
     let glowRotation: Double
 
-    private var cornerRadius: CGFloat { max(5, size * 0.2) }
-    private var glowLineWidth: CGFloat { max(1.15, size * 0.05) }
-    private var phaseOffset: Double {
-        Double(icon.unicodeScalars.reduce(0) { ($0 + Int($1.value)) % 360 })
-    }
-
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .fill(color)
-                .padding(1.1)
-
-            Image(systemName: icon)
-                .font(.system(size: size * 0.4, weight: .semibold))
-                .symbolRenderingMode(.monochrome)
-                .foregroundStyle(.white)
-
-            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(color.opacity(0.24), lineWidth: 0.7)
-
-            AngularGradient(
-                gradient: Gradient(stops: [
-                    .init(color: .clear, location: 0),
-                    .init(color: .clear, location: 0.54),
-                    .init(color: color.opacity(0.06), location: 0.62),
-                    .init(color: color.opacity(0.24), location: 0.74),
-                    .init(color: color.opacity(0.56), location: 0.86),
-                    .init(color: Color.white.opacity(0.9), location: 0.93),
-                    .init(color: color.opacity(0.22), location: 0.975),
-                    .init(color: .clear, location: 1)
-                ]),
-                center: .center
-            )
-            .rotationEffect(.degrees(glowRotation + phaseOffset))
-            .mask {
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(lineWidth: glowLineWidth)
-            }
-            .shadow(color: color.opacity(0.3), radius: max(1.2, size * 0.055))
-        }
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
+        FlowingSymbolBadge(
+            icon: icon,
+            color: color,
+            size: size,
+            glowRotation: glowRotation
+        )
     }
 }
 
@@ -5676,6 +5687,7 @@ private let browserFirefoxWindowsUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win6
 
 struct SiteBrowserScreen: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.openURL) private var openURL
     let site: SiteItem
     let urlString: String
     let title: String
@@ -5830,6 +5842,10 @@ struct SiteBrowserScreen: View {
                     Image(systemName: "globe")
                 }
                 .accessibilityLabel("切换 User-Agent")
+                Button { openCurrentPageExternally() } label: {
+                    Image(systemName: "arrow.up.right.square")
+                }
+                .accessibilityLabel("在外部浏览器中打开")
                 Spacer()
                 Menu {
                     if !browserShortcuts.isEmpty {
@@ -5887,8 +5903,10 @@ struct SiteBrowserScreen: View {
                     Button { Task { await clearBrowserData() } } label: {
                         Label("清理当前站点数据", systemImage: "trash")
                     }
-                    if let url = session.currentURL ?? URL(string: urlString) {
-                        Link(destination: url) { Label("在 Safari 中打开", systemImage: "safari") }
+                    if let url = currentExternalURL {
+                        Button { openURL(url) } label: {
+                            Label("在外部浏览器中打开", systemImage: "arrow.up.right.square")
+                        }
                         ShareLink(item: url) { Label("分享当前页面", systemImage: "square.and.arrow.up") }
                     }
                 } label: {
@@ -6124,6 +6142,23 @@ struct SiteBrowserScreen: View {
             return
         }
         session.load(url)
+    }
+
+    private var currentExternalURL: URL? {
+        let candidate = session.currentURL ?? URL(string: urlString)
+        guard let candidate,
+              ["http", "https"].contains(candidate.scheme?.lowercased() ?? "") else {
+            return nil
+        }
+        return candidate
+    }
+
+    private func openCurrentPageExternally() {
+        guard let url = currentExternalURL else {
+            appState.presentedError = "当前页面地址无效，无法打开外部浏览器"
+            return
+        }
+        openURL(url)
     }
 
     @MainActor private func captureLongScreenshot() async {
@@ -7083,6 +7118,12 @@ private struct SiteDetailIcon: View {
         .overlay {
             Circle().stroke(Color.primary.opacity(0.12), lineWidth: 0.75)
         }
+        .overlay {
+            FlowingCircleBorder(
+                color: site.enabled ? HarvestTheme.blue : Color.secondary,
+                lineWidth: 1.8
+            )
+        }
     }
 }
 
@@ -7196,8 +7237,10 @@ struct SiteEditorSheet: View {
                             }
                         }
                         .disabled(availableSites.isEmpty)
+                        .listRowInsets(compactEditorInsets)
                     } else {
                         LabeledContent("站点配置", value: siteKey)
+                            .listRowInsets(compactEditorInsets)
                     }
                     editorField("显示名称", text: $name)
                     HStack(alignment: .top, spacing: 12) {
@@ -7205,17 +7248,18 @@ struct SiteEditorSheet: View {
                             .frame(maxWidth: 120)
                         Spacer(minLength: 0)
                     }
+                    .listRowInsets(compactEditorInsets)
                     editorField("镜像地址（可选）", text: $url, keyboardType: .URL, isURL: true)
                 }
                 Section("登录凭据") {
                     editorField("用户 ID（可选）", text: $userID, isURL: true)
                     editorField("用户名（可选）", text: $username, isURL: true)
-                    editorTextEditor("Cookie", text: $cookie, minHeight: 96)
+                    editorTextEditor("Cookie", text: $cookie, minHeight: 56)
                     editorField("User-Agent（可选）", text: $userAgent, isURL: true)
                     editorField("邮箱（可选）", text: $email, keyboardType: .emailAddress, isURL: true)
                     editorField("Passkey（可选）", text: $passkey, isURL: true)
                     editorField("Authkey（可选）", text: $authkey, isURL: true)
-                    editorTextEditor("LocalStorage JSON（可选）", text: $localStorage, minHeight: 128, monospaced: true)
+                    editorTextEditor("LocalStorage JSON（可选）", text: $localStorage, minHeight: 72, monospaced: true)
                 }
                 Section("地址与标签") {
                     editorField("RSS 地址（可选）", text: $rss, keyboardType: .URL, isURL: true)
@@ -7224,22 +7268,34 @@ struct SiteEditorSheet: View {
                     editorField("标签（使用逗号分隔）", text: $tags)
                 }
                 Section("同步能力") {
-                    Toggle("站点可用", isOn: $enabled)
-                    Toggle("获取数据", isOn: $getInfo)
-                    Toggle("参与签到", isOn: $signin)
-                    Toggle("参与辅种", isOn: $repeatTorrents)
-                    Toggle("允许搜索", isOn: $searchTorrents)
+                    SiteToggleGrid {
+                        compactToggle("站点可用", isOn: $enabled)
+                        compactToggle("获取数据", isOn: $getInfo)
+                        compactToggle("参与签到", isOn: $signin)
+                        compactToggle("参与辅种", isOn: $repeatTorrents)
+                        compactToggle("允许搜索", isOn: $searchTorrents)
+                    }
                 }
                 Section("自动任务") {
-                    Toggle("抓取免费种", isOn: $brushFree)
-                    Toggle("抓取 RSS", isOn: $brushRSS)
-                    Toggle("识别 HR", isOn: $hrDiscern)
-                    Toggle("打包种子文件", isOn: $packageFile)
+                    SiteToggleGrid {
+                        compactToggle("抓取免费种", isOn: $brushFree)
+                        compactToggle("抓取 RSS", isOn: $brushRSS)
+                        compactToggle("识别 HR", isOn: $hrDiscern)
+                        compactToggle("打包种子文件", isOn: $packageFile)
+                    }
                 }
                 Section("显示") {
-                    Toggle("显示在仪表盘", isOn: $showInDashboard)
+                    SiteToggleGrid {
+                        compactToggle("显示在仪表盘", isOn: $showInDashboard)
+                            .gridCellColumns(2)
+                    }
                 }
             }
+            .listStyle(.insetGrouped)
+            .listRowSpacing(0)
+            .listSectionSpacing(2)
+            .environment(\.defaultMinListRowHeight, 30)
+            .contentMargins(.vertical, 6, for: .scrollContent)
             .navigationTitle(site == nil ? "添加站点" : "编辑站点").navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showSitePicker) {
                 NavigationStack {
@@ -7356,13 +7412,17 @@ struct SiteEditorSheet: View {
         hrDiscern = config.bool("hr_discern", "hrDiscern") ?? hrDiscern
     }
 
+    private var compactEditorInsets: EdgeInsets {
+        EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16)
+    }
+
     private func editorField(
         _ title: String,
         text: Binding<String>,
         keyboardType: UIKeyboardType = .default,
         isURL: Bool = false
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
@@ -7372,7 +7432,8 @@ struct SiteEditorSheet: View {
                 .keyboardType(keyboardType)
                 .textFieldStyle(.plain)
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 2)
+        .listRowInsets(compactEditorInsets)
     }
 
     private func editorTextEditor(
@@ -7381,15 +7442,15 @@ struct SiteEditorSheet: View {
         minHeight: CGFloat,
         monospaced: Bool = false
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
             TextEditor(text: text)
                 .font(monospaced ? .system(.caption, design: .monospaced) : .body)
-                .frame(minHeight: minHeight)
+                .frame(height: minHeight)
                 .scrollContentBackground(.hidden)
-                .padding(8)
+                .padding(5)
                 .background(
                     Color(uiColor: .tertiarySystemGroupedBackground),
                     in: RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -7399,7 +7460,8 @@ struct SiteEditorSheet: View {
                         .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
                 }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 2)
+        .listRowInsets(compactEditorInsets)
     }
 
     private var filteredAvailableSites: [String] {
@@ -7420,5 +7482,50 @@ struct SiteEditorSheet: View {
     private func nullableText(_ value: String) -> Any {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return normalized.isEmpty ? NSNull() : normalized
+    }
+
+    @ViewBuilder
+    private func compactToggle(_ title: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.footnote)
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+            Spacer(minLength: 0)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .scaleEffect(0.76)
+                .frame(width: 34, height: 22)
+                .accessibilityLabel(title)
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+        }
+    }
+}
+
+private struct SiteToggleGrid<Content: View>: View {
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        LazyVGrid(
+            columns: [
+                GridItem(.flexible(), spacing: 5, alignment: .leading),
+                GridItem(.flexible(), spacing: 5, alignment: .leading)
+            ],
+            alignment: .leading,
+            spacing: 5,
+            content: content
+        )
+        .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+        .listRowBackground(Color.clear)
     }
 }

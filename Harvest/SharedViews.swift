@@ -8,11 +8,12 @@ actor RemoteImageDataCache {
     static let shared = RemoteImageDataCache()
 
     private static let cachePolicyVersionKey = "images.cachePolicyVersion"
-    private static let cachePolicyVersion = 1
+    private static let cachePolicyVersion = 2
 
     private let memoryCache: NSCache<NSString, NSData>
     private let diskCache: URLCache
     private let persistentImageDirectory: URL?
+    private let legacyPersistentImageDirectory: URL?
     private let session: URLSession
     private let privateSession: URLSession
     private var inFlight: [String: Task<Data, Error>] = [:]
@@ -44,15 +45,17 @@ actor RemoteImageDataCache {
         privateConfiguration.waitsForConnectivity = true
         privateConfiguration.httpShouldSetCookies = false
         privateConfiguration.httpCookieStorage = nil
-        let persistentDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
+        let persistentDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first?
+            .appendingPathComponent("Harvest", isDirectory: true)
+            .appendingPathComponent("PersistentImages", isDirectory: true)
+        let legacyPersistentDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
             .first?
             .appendingPathComponent("HarvestPersistentImages", isDirectory: true)
         let defaults = UserDefaults.standard
-        if defaults.integer(forKey: Self.cachePolicyVersionKey) < Self.cachePolicyVersion {
+        let previousCachePolicyVersion = defaults.integer(forKey: Self.cachePolicyVersionKey)
+        if previousCachePolicyVersion < Self.cachePolicyVersion {
             cache.removeAllCachedResponses()
-            if let persistentDirectory {
-                try? FileManager.default.removeItem(at: persistentDirectory)
-            }
             defaults.set(Self.cachePolicyVersion, forKey: Self.cachePolicyVersionKey)
         }
         if let persistentDirectory {
@@ -64,6 +67,7 @@ actor RemoteImageDataCache {
         memoryCache = memory
         diskCache = cache
         persistentImageDirectory = persistentDirectory
+        legacyPersistentImageDirectory = legacyPersistentDirectory
         session = publicSession
         privateSession = URLSession(configuration: privateConfiguration)
     }
@@ -77,7 +81,11 @@ actor RemoteImageDataCache {
             throw APIError(statusCode: 0, message: "图片地址无效")
         }
         let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
-        let persistToDisk = isPublicCacheURL(normalizedURL) && !hasSensitiveImageHeaders(effectiveHeaders)
+        // 站点图标接口可能需要 Bearer 认证，但落盘内容只有图片数据，不包含请求头。
+        // 仅对明确标记为 site-icon 的资源允许持久化，避免放宽其它敏感图片缓存。
+        let isSiteIcon = isSiteIconCache(persistentCacheID)
+        let persistToDisk = (isPublicCacheURL(normalizedURL) || isSiteIcon)
+            && (!hasSensitiveImageHeaders(effectiveHeaders) || isSiteIcon)
         let persistentID = persistToDisk ? persistentCacheID : nil
         if !persistToDisk, let persistentCacheID {
             removePersistentData(for: persistentCacheID)
@@ -169,15 +177,21 @@ actor RemoteImageDataCache {
                 withIntermediateDirectories: true
             )
         }
+        if let legacyPersistentImageDirectory {
+            try? FileManager.default.removeItem(at: legacyPersistentImageDirectory)
+        }
         RemoteDecodedImageCache.shared.removeAll()
         RemoteAnimatedImageCache.shared.removeAll()
     }
 
     func persistentData(for cacheID: String) -> Data? {
-        guard let url = persistentFileURL(for: cacheID),
-              let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
-              !data.isEmpty,
-              data.count <= 20 * 1_024 * 1_024 else { return nil }
+        guard let url = persistentFileURL(for: cacheID) else { return nil }
+        if let data = validPersistentData(at: url) {
+            return data
+        }
+        guard let legacyURL = legacyPersistentFileURL(for: cacheID),
+              let data = validPersistentData(at: legacyURL) else { return nil }
+        try? data.write(to: url, options: .atomic)
         return data
     }
 
@@ -186,7 +200,10 @@ actor RemoteImageDataCache {
         requestURL: URL,
         headers: [String: String]
     ) -> Data? {
-        guard isPublicCacheURL(requestURL), !hasSensitiveImageHeaders(headers) else {
+        let isSiteIcon = isSiteIconCache(cacheID)
+        let canPersist = (isPublicCacheURL(requestURL) || isSiteIcon)
+            && (!hasSensitiveImageHeaders(headers) || isSiteIcon)
+        guard canPersist else {
             removePersistentData(for: cacheID)
             return nil
         }
@@ -194,8 +211,12 @@ actor RemoteImageDataCache {
     }
 
     func removePersistentData(for cacheID: String) {
-        guard let url = persistentFileURL(for: cacheID) else { return }
-        try? FileManager.default.removeItem(at: url)
+        if let url = persistentFileURL(for: cacheID) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let legacyURL = legacyPersistentFileURL(for: cacheID) {
+            try? FileManager.default.removeItem(at: legacyURL)
+        }
     }
 
     private func storePersistentData(_ data: Data, for cacheID: String) {
@@ -205,10 +226,26 @@ actor RemoteImageDataCache {
 
     private func persistentFileURL(for cacheID: String) -> URL? {
         guard !cacheID.isEmpty, let persistentImageDirectory else { return nil }
+        return persistentImageDirectory.appendingPathComponent(persistentFileName(for: cacheID), isDirectory: false)
+    }
+
+    private func legacyPersistentFileURL(for cacheID: String) -> URL? {
+        guard !cacheID.isEmpty, let legacyPersistentImageDirectory else { return nil }
+        return legacyPersistentImageDirectory.appendingPathComponent(persistentFileName(for: cacheID), isDirectory: false)
+    }
+
+    private func persistentFileName(for cacheID: String) -> String {
         let digest = SHA256.hash(data: Data(cacheID.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
-        return persistentImageDirectory.appendingPathComponent(digest, isDirectory: false)
+        return digest
+    }
+
+    private func validPersistentData(at url: URL) -> Data? {
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              !data.isEmpty,
+              data.count <= 20 * 1_024 * 1_024 else { return nil }
+        return data
     }
 
     private func isPublicCacheURL(_ url: URL) -> Bool {
@@ -237,6 +274,11 @@ actor RemoteImageDataCache {
             let normalized = key.lowercased()
             return normalized == "cookie" || normalized == "authorization" || normalized.contains("token")
         }
+    }
+
+    private func isSiteIconCache(_ cacheID: String?) -> Bool {
+        guard let cacheID else { return false }
+        return cacheID.hasPrefix("site-icon|")
     }
 }
 
@@ -1620,6 +1662,145 @@ struct SymbolBadge: View {
                 RoundedRectangle(cornerRadius: min(12, size * 0.32), style: .continuous)
                     .stroke(Color.white.opacity(0.18))
             )
+    }
+}
+
+struct FlowingSymbolBadge: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.flowingGlowRotation) private var environmentGlowRotation
+
+    let icon: String
+    let color: Color
+    var size: CGFloat = 38
+    var glowRotation: Double?
+    var showsProgress = false
+
+    private var cornerRadius: CGFloat { max(5, size * 0.2) }
+    private var glowLineWidth: CGFloat { max(1.15, size * 0.05) }
+    private var phaseOffset: Double {
+        Double(icon.unicodeScalars.reduce(0) { ($0 + Int($1.value)) % 360 })
+    }
+
+    var body: some View {
+        let effectiveGlowRotation = glowRotation ?? environmentGlowRotation
+        Group {
+            if let effectiveGlowRotation {
+                badge(rotation: effectiveGlowRotation)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+                    badge(rotation: reduceMotion ? 42 : rotation(at: context.date))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private func rotation(at date: Date) -> Double {
+        let duration = 3.6
+        let elapsed = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: duration)
+        return elapsed / duration * 360
+    }
+
+    private func badge(rotation: Double) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(color)
+                .padding(1.1)
+
+            if showsProgress {
+                ProgressView()
+                    .tint(.white)
+                    .controlSize(size >= 40 ? .regular : .small)
+            } else {
+                Image(systemName: icon)
+                    .font(.system(size: size * 0.4, weight: .semibold))
+                    .symbolRenderingMode(.monochrome)
+                    .foregroundStyle(.white)
+            }
+
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(color.opacity(0.24), lineWidth: 0.7)
+
+            AngularGradient(
+                gradient: Gradient(stops: [
+                    .init(color: .clear, location: 0),
+                    .init(color: .clear, location: 0.54),
+                    .init(color: color.opacity(0.06), location: 0.62),
+                    .init(color: color.opacity(0.24), location: 0.74),
+                    .init(color: color.opacity(0.56), location: 0.86),
+                    .init(color: Color.white.opacity(0.9), location: 0.93),
+                    .init(color: color.opacity(0.22), location: 0.975),
+                    .init(color: .clear, location: 1)
+                ]),
+                center: .center
+            )
+            .rotationEffect(.degrees(rotation + phaseOffset))
+            .mask {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(lineWidth: glowLineWidth)
+            }
+            .shadow(color: color.opacity(0.3), radius: max(1.2, size * 0.055))
+        }
+    }
+}
+
+struct FlowingCircleBorder: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.flowingGlowRotation) private var environmentGlowRotation
+
+    let color: Color
+    var rotation: Double?
+    var lineWidth: CGFloat = 1.8
+
+    var body: some View {
+        let effectiveRotation = rotation ?? environmentGlowRotation
+        Group {
+            if let effectiveRotation {
+                border(rotation: effectiveRotation)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+                    border(rotation: reduceMotion ? 42 : rotation(at: context.date))
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func rotation(at date: Date) -> Double {
+        let duration = 3.6
+        let elapsed = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: duration)
+        return elapsed / duration * 360
+    }
+
+    private func border(rotation: Double) -> some View {
+        AngularGradient(
+            gradient: Gradient(stops: [
+                .init(color: .clear, location: 0),
+                .init(color: .clear, location: 0.54),
+                .init(color: color.opacity(0.08), location: 0.62),
+                .init(color: color.opacity(0.28), location: 0.74),
+                .init(color: color.opacity(0.62), location: 0.86),
+                .init(color: Color.white.opacity(0.92), location: 0.93),
+                .init(color: color.opacity(0.24), location: 0.975),
+                .init(color: .clear, location: 1)
+            ]),
+            center: .center
+        )
+        .rotationEffect(.degrees(rotation))
+        .mask { Circle().strokeBorder(lineWidth: lineWidth) }
+        .shadow(color: color.opacity(0.28), radius: 2)
+    }
+}
+
+private struct FlowingGlowRotationKey: EnvironmentKey {
+    static let defaultValue: Double? = nil
+}
+
+extension EnvironmentValues {
+    var flowingGlowRotation: Double? {
+        get { self[FlowingGlowRotationKey.self] }
+        set { self[FlowingGlowRotationKey.self] = newValue }
     }
 }
 

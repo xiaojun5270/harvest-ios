@@ -1450,6 +1450,7 @@ private struct DashboardCacheClearSheet: View {
 
 struct DashboardView: View {
     @EnvironmentObject private var appState: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model = DashboardViewModel()
     @AppStorage("dashboard.trendDays") private var trendDays = 7
     @AppStorage("dashboard.autoRefresh") private var autoRefresh = true
@@ -1484,6 +1485,7 @@ struct DashboardView: View {
     @State private var isRenderingShare = false
     @State private var runningQuickAction: DashboardQuickAction?
     @State private var showAccountAgeWeeks = false
+    @State private var dashboardGlowRotation = 0.0
 
     private var moduleOrder: [DashboardModule] { DashboardModule.decode(moduleOrderRaw) }
 
@@ -1514,13 +1516,17 @@ struct DashboardView: View {
             .padding(16)
         }
         .background(Color(uiColor: .systemGroupedBackground))
+        .environment(\.flowingGlowRotation, dashboardGlowRotation)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack(spacing: 8) {
                 Spacer()
                 Button { showSettings = true } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(HarvestTheme.blue)
+                    FlowingSymbolBadge(
+                        icon: "slider.horizontal.3",
+                        color: HarvestTheme.blue,
+                        size: 34,
+                        glowRotation: dashboardGlowRotation
+                    )
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
                 }
@@ -1533,9 +1539,12 @@ struct DashboardView: View {
                 .shadow(color: Color.black.opacity(0.12), radius: 8, y: 3)
                 .accessibilityLabel("仪表盘卡片设置")
                 Button { showCacheClear = true } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(Color.primary)
+                    FlowingSymbolBadge(
+                        icon: "trash",
+                        color: HarvestTheme.coral,
+                        size: 34,
+                        glowRotation: dashboardGlowRotation
+                    )
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
                 }
@@ -1552,7 +1561,12 @@ struct DashboardView: View {
             .padding(.vertical, 6)
         }
         .refreshable { await model.load(appState, days: trendDays) }
-        .onAppear { migrateDesignationOrderIfNeeded() }
+        .onAppear {
+            migrateDesignationOrderIfNeeded()
+            updateDashboardGlowAnimation()
+        }
+        .onDisappear { stopDashboardGlowAnimation() }
+        .onChange(of: reduceMotion) { _, _ in updateDashboardGlowAnimation() }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
             await model.load(appState, days: trendDays)
             guard !Task.isCancelled else { return }
@@ -1585,12 +1599,25 @@ struct DashboardView: View {
                     Button { Task { await runGlobal(APIPath.siteStatus) } } label: { Label("刷新全部站点", systemImage: "arrow.clockwise") }
                     Button { Task { await runGlobal(APIPath.siteSign) } } label: { Label("全部站点签到", systemImage: "checkmark.seal") }
                     Button { showCacheClear = true } label: { Label("缓存清理", systemImage: "trash.slash") }
-                } label: { Image(systemName: "bolt.circle") }
+                } label: {
+                    FlowingSymbolBadge(
+                        icon: "bolt.fill",
+                        color: HarvestTheme.amber,
+                        size: 26,
+                        glowRotation: dashboardGlowRotation
+                    )
+                }
+                .accessibilityLabel("仪表盘快捷操作")
                 Button {
                     Task { await renderShareImage() }
                 } label: {
-                    if isRenderingShare { ProgressView().controlSize(.small) }
-                    else { Image(systemName: "square.and.arrow.up") }
+                    FlowingSymbolBadge(
+                        icon: "square.and.arrow.up",
+                        color: HarvestTheme.blue,
+                        size: 26,
+                        glowRotation: dashboardGlowRotation,
+                        showsProgress: isRenderingShare
+                    )
                 }
                     .disabled(isRenderingShare)
                     .accessibilityLabel("分享仪表盘长图")
@@ -1617,6 +1644,26 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showShare) {
             if let shareImage { ActivityShareSheet(items: [shareImage]) }
+        }
+    }
+
+    private func updateDashboardGlowAnimation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            dashboardGlowRotation = reduceMotion ? 42 : 0
+        }
+        guard !reduceMotion else { return }
+        withAnimation(.linear(duration: 3.6).repeatForever(autoreverses: false)) {
+            dashboardGlowRotation = 360
+        }
+    }
+
+    private func stopDashboardGlowAnimation() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            dashboardGlowRotation = 0
         }
     }
 
@@ -1953,21 +2000,29 @@ private struct DashboardServerResourcesView: View {
             }
             Spacer(minLength: 0)
             Button { model.toggleServerMonitoring(appState) } label: {
-                Image(systemName: model.serverMonitoring ? "pause.fill" : "play.fill")
-                    .frame(width: 30, height: 30)
+                FlowingSymbolBadge(
+                    icon: model.serverMonitoring ? "pause.fill" : "play.fill",
+                    color: model.serverMonitoring ? HarvestTheme.amber : HarvestTheme.green,
+                    size: 30
+                )
+                .frame(width: 40, height: 40)
+                .contentShape(Circle())
             }
-            .buttonStyle(.bordered)
-            .clipShape(Circle())
+            .buttonStyle(.plain)
             .accessibilityLabel(model.serverMonitoring ? "暂停服务器资源监控" : "开始服务器资源监控")
         }
     }
 
     private var hostSummary: some View {
         HStack(spacing: 8) {
-            Label(
-                hostLabel,
-                systemImage: model.latestServerPoint?.isDocker == true ? "shippingbox" : "server.rack"
-            )
+            HStack(spacing: 5) {
+                FlowingSymbolBadge(
+                    icon: model.latestServerPoint?.isDocker == true ? "shippingbox" : "server.rack",
+                    color: HarvestTheme.blue,
+                    size: 20
+                )
+                Text(hostLabel)
+            }
             .lineLimit(1)
             Spacer()
             if let latest = model.latestServerPoint {
@@ -2005,10 +2060,16 @@ private struct DashboardServerResourcesView: View {
 
     private var transferSummary: some View {
         HStack {
-            Label(formatSpeed(model.latestServerPoint?.downloadSpeed ?? 0), systemImage: "arrow.down")
+            HStack(spacing: 4) {
+                FlowingSymbolBadge(icon: "arrow.down", color: HarvestTheme.blue, size: 18)
+                Text(formatSpeed(model.latestServerPoint?.downloadSpeed ?? 0))
+            }
                 .foregroundStyle(HarvestTheme.blue)
             Spacer()
-            Label(formatSpeed(model.latestServerPoint?.uploadSpeed ?? 0), systemImage: "arrow.up")
+            HStack(spacing: 4) {
+                FlowingSymbolBadge(icon: "arrow.up", color: HarvestTheme.green, size: 18)
+                Text(formatSpeed(model.latestServerPoint?.uploadSpeed ?? 0))
+            }
                 .foregroundStyle(HarvestTheme.green)
         }
         .font(.caption.monospacedDigit())
@@ -2109,7 +2170,7 @@ private struct DashboardHeroView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
-                SymbolBadge(icon: "chart.xyaxis.line", color: statusColor, size: 44)
+                FlowingSymbolBadge(icon: "chart.xyaxis.line", color: statusColor, size: 44)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(greeting)
                         .font(.title2.weight(.bold))
@@ -2269,7 +2330,10 @@ private struct DashboardOverviewView: View {
 
     private func overviewPrimaryMetric(label: String, value: String, detail: String? = nil, icon: String, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(label, systemImage: icon)
+            HStack(spacing: 5) {
+                FlowingSymbolBadge(icon: icon, color: color, size: 22)
+                Text(label)
+            }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(color)
             Text(value)
@@ -2297,7 +2361,7 @@ private struct DashboardStatLine: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            SymbolBadge(icon: icon, color: color, size: 32)
+            FlowingSymbolBadge(icon: icon, color: color, size: 32)
             VStack(alignment: .leading, spacing: 1) {
                 Text(label)
                     .font(.caption.weight(.semibold))
@@ -2362,7 +2426,7 @@ private struct DashboardUserInfoView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top, spacing: 12) {
-                SymbolBadge(icon: "person.crop.circle.fill", color: HarvestTheme.blue, size: 44)
+                FlowingSymbolBadge(icon: "person.crop.circle.fill", color: HarvestTheme.blue, size: 44)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text("用户信息").font(.title3.weight(.bold))
@@ -2379,7 +2443,11 @@ private struct DashboardUserInfoView: View {
                 }
                 Spacer()
                 Button(role: .destructive) { confirmingLogout = true } label: {
-                    Image(systemName: "rectangle.portrait.and.arrow.right")
+                    FlowingSymbolBadge(
+                        icon: "rectangle.portrait.and.arrow.right",
+                        color: HarvestTheme.coral,
+                        size: 30
+                    )
                         .frame(width: 32, height: 32)
                 }
                 .buttonStyle(.plain)
@@ -2418,7 +2486,10 @@ private struct DashboardUserMetricView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label(label, systemImage: icon)
+            HStack(spacing: 5) {
+                FlowingSymbolBadge(icon: icon, color: color, size: 22)
+                Text(label)
+            }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(color)
                 .lineLimit(1)
@@ -2477,7 +2548,7 @@ private struct DashboardDesignationView: View {
             HStack {
                 SectionHeader(title: "称号进度", subtitle: "\(siteCount) 个站点接入")
                 Spacer()
-                SymbolBadge(icon: "medal.fill", color: HarvestTheme.coral, size: 44)
+                FlowingSymbolBadge(icon: "medal.fill", color: HarvestTheme.coral, size: 44)
             }
             HStack(alignment: .firstTextBaseline) {
                 Text(current?.title ?? "无称号")
@@ -2512,17 +2583,12 @@ private struct DashboardQuickActionsView: View {
                 ForEach(actions) { action in
                     Button { onAction(action) } label: {
                         VStack(spacing: 9) {
-                            Group {
-                                if running == action {
-                                    ProgressView().tint(.white)
-                                } else {
-                                    Image(systemName: action.icon)
-                                        .font(.title3.weight(.semibold))
-                                        .foregroundStyle(.white)
-                                }
-                            }
-                            .frame(width: 42, height: 42)
-                            .background(action.color, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            FlowingSymbolBadge(
+                                icon: action.icon,
+                                color: action.color,
+                                size: 42,
+                                showsProgress: running == action
+                            )
                             Text(action.title)
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.primary)
@@ -2577,7 +2643,10 @@ private struct DashboardSiteStatusView: View {
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             if item.published > 0 {
-                                Label(formatCompactNumber(item.published), systemImage: "paperplane")
+                                HStack(spacing: 4) {
+                                    FlowingSymbolBadge(icon: "paperplane", color: HarvestTheme.coral, size: 18)
+                                    Text(formatCompactNumber(item.published))
+                                }
                                     .font(.caption2.weight(.semibold).monospacedDigit())
                                     .foregroundStyle(HarvestTheme.coral)
                                     .padding(.horizontal, 6)
@@ -2622,7 +2691,10 @@ private struct DashboardSiteStatusView: View {
         emphasizesLeadingEdge: Bool
     ) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Label(dashboardCompactBytes(value), systemImage: icon)
+            HStack(spacing: 4) {
+                FlowingSymbolBadge(icon: icon, color: color, size: 18)
+                Text(dashboardCompactBytes(value))
+            }
                 .font(.caption2.weight(.medium).monospacedDigit())
                 .foregroundStyle(color)
                 .lineLimit(1)
@@ -2706,7 +2778,10 @@ private struct DashboardIncrementRankingView: View {
     }
 
     private func incrementMetric(_ value: Double, icon: String, color: Color) -> some View {
-        Label(dashboardCompactBytes(value), systemImage: icon)
+        HStack(spacing: 4) {
+            FlowingSymbolBadge(icon: icon, color: color, size: 18)
+            Text(dashboardCompactBytes(value))
+        }
             .font(.caption2.weight(.medium).monospacedDigit())
             .foregroundStyle(color)
             .lineLimit(1)
@@ -2889,7 +2964,9 @@ private struct DistributionView: View {
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             HStack(spacing: 4) {
-                                if let icon = metric.icon { Image(systemName: icon) }
+                                if let icon = metric.icon {
+                                    FlowingSymbolBadge(icon: icon, color: metric.color, size: 18)
+                                }
                                 Text(metric.format(item.value))
                             }
                             .font(.caption.monospacedDigit())
@@ -3143,19 +3220,7 @@ private struct DashboardScrollableModule<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 9) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 30, height: 30)
-                    .background(
-                        LinearGradient(
-                            colors: [color.opacity(0.72), color],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    )
-                    .shadow(color: color.opacity(0.18), radius: 5, x: 0, y: 2)
+                FlowingSymbolBadge(icon: icon, color: color, size: 30)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title).font(.headline.weight(.bold))
                     Text(subtitle)
