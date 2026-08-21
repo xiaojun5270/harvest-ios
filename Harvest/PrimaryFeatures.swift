@@ -3022,6 +3022,12 @@ private struct DashboardMetricBar: View {
                 }
                     .frame(width: filledWidth)
                     .clipShape(Capsule())
+                    .shadow(
+                        color: emphasizesLeadingEdge ? color.opacity(0.24) : .clear,
+                        radius: 4,
+                        x: 0,
+                        y: 1
+                    )
             }
         }
         .frame(height: height)

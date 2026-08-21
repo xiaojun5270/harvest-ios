@@ -1803,6 +1803,7 @@ private struct HardwareFlowingBorder: UIViewRepresentable {
 private final class HardwareFlowingBorderView: UIView {
     private let gradientLayer = CAGradientLayer()
     private let borderMaskLayer = CAShapeLayer()
+    private var glowColor = UIColor.systemBlue
     private var borderLineWidth: CGFloat = 1.8
     private var borderCornerRadius: CGFloat = 0
     private var isCircular = false
@@ -1817,10 +1818,14 @@ private final class HardwareFlowingBorderView: UIView {
 
         gradientLayer.type = .conic
         gradientLayer.startPoint = CGPoint(x: 0.5, y: 0.5)
-        gradientLayer.endPoint = CGPoint(x: 0.5, y: 0)
+        // SwiftUI AngularGradient starts at the trailing edge. Matching that
+        // origin keeps the hardware-rendered highlight in its original position.
+        gradientLayer.endPoint = CGPoint(x: 1, y: 0.5)
         gradientLayer.mask = borderMaskLayer
+        gradientLayer.masksToBounds = false
         gradientLayer.shouldRasterize = true
         gradientLayer.rasterizationScale = UIScreen.main.scale
+        gradientLayer.shadowOffset = .zero
         layer.addSublayer(gradientLayer)
 
         borderMaskLayer.fillColor = UIColor.clear.cgColor
@@ -1837,7 +1842,7 @@ private final class HardwareFlowingBorderView: UIView {
         super.layoutSubviews()
         gradientLayer.frame = bounds
         borderMaskLayer.frame = bounds
-        let inset = borderLineWidth / 2 + 0.5
+        let inset = borderLineWidth / 2
         let pathRect = bounds.insetBy(dx: inset, dy: inset)
         borderMaskLayer.path = isCircular
             ? UIBezierPath(ovalIn: pathRect).cgPath
@@ -1846,6 +1851,11 @@ private final class HardwareFlowingBorderView: UIView {
                 cornerRadius: max(0, borderCornerRadius - inset)
             ).cgPath
         borderMaskLayer.lineWidth = borderLineWidth
+        gradientLayer.shadowColor = glowColor.cgColor
+        gradientLayer.shadowOpacity = isCircular ? 0.28 : 0.30
+        gradientLayer.shadowRadius = isCircular
+            ? 2
+            : max(1.2, min(bounds.width, bounds.height) * 0.055)
         restartAnimationIfNeeded()
     }
 
@@ -1867,21 +1877,33 @@ private final class HardwareFlowingBorderView: UIView {
         paused: Bool
     ) {
         let needsAnimationRestart = self.phaseOffset != phaseOffset || animationPaused != paused
+        glowColor = color
         borderLineWidth = max(0.75, lineWidth)
         borderCornerRadius = cornerRadius
         isCircular = circular
         self.phaseOffset = phaseOffset
         animationPaused = paused
-        gradientLayer.colors = [
-            color.withAlphaComponent(0).cgColor,
-            color.withAlphaComponent(0).cgColor,
-            color.withAlphaComponent(0.08).cgColor,
-            color.withAlphaComponent(0.28).cgColor,
-            color.withAlphaComponent(0.62).cgColor,
-            UIColor.white.withAlphaComponent(0.92).cgColor,
-            color.withAlphaComponent(0.24).cgColor,
-            color.withAlphaComponent(0).cgColor
-        ]
+        gradientLayer.colors = isCircular
+            ? [
+                color.withAlphaComponent(0).cgColor,
+                color.withAlphaComponent(0).cgColor,
+                color.withAlphaComponent(0.08).cgColor,
+                color.withAlphaComponent(0.28).cgColor,
+                color.withAlphaComponent(0.62).cgColor,
+                UIColor.white.withAlphaComponent(0.92).cgColor,
+                color.withAlphaComponent(0.24).cgColor,
+                color.withAlphaComponent(0).cgColor
+            ]
+            : [
+                color.withAlphaComponent(0).cgColor,
+                color.withAlphaComponent(0).cgColor,
+                color.withAlphaComponent(0.06).cgColor,
+                color.withAlphaComponent(0.24).cgColor,
+                color.withAlphaComponent(0.56).cgColor,
+                UIColor.white.withAlphaComponent(0.90).cgColor,
+                color.withAlphaComponent(0.22).cgColor,
+                color.withAlphaComponent(0).cgColor
+            ]
         gradientLayer.locations = [0, 0.54, 0.62, 0.74, 0.86, 0.93, 0.975, 1]
         setNeedsLayout()
         if needsAnimationRestart { restartAnimationIfNeeded(force: true) }
@@ -1897,7 +1919,9 @@ private final class HardwareFlowingBorderView: UIView {
             stopAnimating()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            gradientLayer.setAffineTransform(CGAffineTransform(rotationAngle: .pi / 4))
+            gradientLayer.setAffineTransform(
+                CGAffineTransform(rotationAngle: (42 + phaseOffset) * .pi / 180)
+            )
             CATransaction.commit()
             return
         }
@@ -1907,10 +1931,14 @@ private final class HardwareFlowingBorderView: UIView {
         CATransaction.setDisableActions(true)
         gradientLayer.setAffineTransform(.identity)
         CATransaction.commit()
+        let duration = 3.6
+        let elapsed = Date().timeIntervalSinceReferenceDate
+            .truncatingRemainder(dividingBy: duration)
+        let globalPhase = elapsed / duration * Double.pi * 2
         let animation = CABasicAnimation(keyPath: "transform.rotation.z")
-        animation.fromValue = phaseOffset * .pi / 180
+        animation.fromValue = globalPhase + phaseOffset * .pi / 180
         animation.byValue = Double.pi * 2
-        animation.duration = 3.6
+        animation.duration = duration
         animation.timingFunction = CAMediaTimingFunction(name: .linear)
         animation.repeatCount = .infinity
         animation.isRemovedOnCompletion = false
