@@ -2667,8 +2667,6 @@ private func safeFileName(_ value: String) -> String {
 
 struct SiteRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var metricGlowRotation = 0.0
     let site: SiteItem
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
@@ -2728,34 +2726,11 @@ struct SiteRow: View {
         .padding(.vertical, 1)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .accessibilityElement(children: .contain)
-        .onAppear { updateMetricGlowAnimation() }
-        .onDisappear { stopMetricGlowAnimation() }
-        .onChange(of: reduceMotion) { _, _ in updateMetricGlowAnimation() }
     }
 
     private var metricColumns: [GridItem] {
         let count = dynamicTypeSize.isAccessibilitySize ? 2 : 4
         return Array(repeating: GridItem(.flexible(), spacing: 6), count: count)
-    }
-
-    private func updateMetricGlowAnimation() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            metricGlowRotation = reduceMotion ? 42 : 0
-        }
-        guard !reduceMotion else { return }
-        withAnimation(.linear(duration: 3.6).repeatForever(autoreverses: false)) {
-            metricGlowRotation = 360
-        }
-    }
-
-    private func stopMetricGlowAnimation() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            metricGlowRotation = 0
-        }
     }
 
     private var header: some View {
@@ -2900,8 +2875,7 @@ struct SiteRow: View {
             value: formatBytes(site.uploaded),
             delta: dailyDeltaText(site.uploadDelta),
             icon: "arrow.up",
-            color: HarvestTheme.green,
-            glowRotation: metricGlowRotation
+            color: HarvestTheme.green
         )
     }
 
@@ -2911,21 +2885,20 @@ struct SiteRow: View {
             value: formatBytes(site.downloaded),
             delta: dailyDeltaText(site.downloadDelta),
             icon: "arrow.down",
-            color: HarvestTheme.blue,
-            glowRotation: metricGlowRotation
+            color: HarvestTheme.blue
         )
     }
 
     private var coreMetrics: some View {
         LazyVGrid(columns: metricColumns, spacing: 5) {
-            SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: wanMetricText(site.magic), color: HarvestTheme.amber, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "diamond.fill", label: "积分", value: wanMetricText(site.score), color: HarvestTheme.coral, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "timer", label: "时魔", value: integerMetricText(site.bonusHour), color: HarvestTheme.purple, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.orange, glowRotation: metricGlowRotation)
-            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.indigo, glowRotation: metricGlowRotation)
+            SiteCardMetric(icon: "leaf.fill", label: "做种", value: "\(site.seeding)", color: HarvestTheme.green)
+            SiteCardMetric(icon: "arrow.down.circle.fill", label: "下载中", value: "\(site.leeching)", color: HarvestTheme.blue)
+            SiteCardMetric(icon: "bolt.fill", label: "魔力", value: wanMetricText(site.magic), color: HarvestTheme.amber)
+            SiteCardMetric(icon: "diamond.fill", label: "积分", value: wanMetricText(site.score), color: HarvestTheme.coral)
+            SiteCardMetric(icon: "arrow.triangle.2.circlepath", label: "分享率", value: ratioText, color: ratioColor)
+            SiteCardMetric(icon: "timer", label: "时魔", value: integerMetricText(site.bonusHour), color: HarvestTheme.purple)
+            SiteCardMetric(icon: "paperplane.fill", label: "发种", value: "\(site.published)", color: HarvestTheme.orange)
+            SiteCardMetric(icon: "externaldrive.fill", label: "做种量", value: formatBytes(site.seedVolume), color: HarvestTheme.indigo)
         }
         .padding(.horizontal, 5)
         .padding(.vertical, 7)
@@ -2943,8 +2916,7 @@ struct SiteRow: View {
                     icon: "clock.arrow.circlepath",
                     label: "最近时间",
                     value: recentTimeText(relativeTo: context.date),
-                    color: HarvestTheme.green,
-                    glowRotation: metricGlowRotation
+                    color: HarvestTheme.green
                 )
                 if hasHRContent {
                     SiteHeaderCompactMetric(
@@ -2992,7 +2964,6 @@ struct SiteRow: View {
         .overlay {
             FlowingCircleBorder(
                 color: site.enabled ? HarvestTheme.blue : Color.secondary,
-                rotation: metricGlowRotation,
                 lineWidth: 1.8
             )
         }
@@ -3166,14 +3137,12 @@ private struct SiteMetricIcon: View {
     let icon: String
     let color: Color
     let size: CGFloat
-    let glowRotation: Double
 
     var body: some View {
         FlowingSymbolBadge(
             icon: icon,
             color: color,
-            size: size,
-            glowRotation: glowRotation
+            size: size
         )
     }
 }
@@ -3184,11 +3153,10 @@ private struct SiteTrafficMetric: View {
     let delta: String
     let icon: String
     let color: Color
-    let glowRotation: Double
 
     var body: some View {
         HStack(spacing: 8) {
-            SiteMetricIcon(icon: icon, color: color, size: 32, glowRotation: glowRotation)
+            SiteMetricIcon(icon: icon, color: color, size: 32)
             VStack(alignment: .leading, spacing: 2) {
                 Text(label)
                     .font(.caption)
@@ -3216,12 +3184,11 @@ private struct SiteCardMetric: View {
     let label: String
     let value: String
     let color: Color
-    let glowRotation: Double
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
-                SiteMetricIcon(icon: icon, color: color, size: 24, glowRotation: glowRotation)
+                SiteMetricIcon(icon: icon, color: color, size: 24)
                 Text(label)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -3248,20 +3215,18 @@ private struct SiteDetailLine: View {
     let value: String
     let color: Color
     let lineLimit: Int?
-    let glowRotation: Double
 
-    init(icon: String, label: String, value: String, color: Color, lineLimit: Int? = 1, glowRotation: Double = 0) {
+    init(icon: String, label: String, value: String, color: Color, lineLimit: Int? = 1) {
         self.icon = icon
         self.label = label
         self.value = value
         self.color = color
         self.lineLimit = lineLimit
-        self.glowRotation = glowRotation
     }
 
     var body: some View {
         HStack(alignment: .center, spacing: 8) {
-            SiteMetricIcon(icon: icon, color: color, size: 22, glowRotation: glowRotation)
+            SiteMetricIcon(icon: icon, color: color, size: 22)
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)

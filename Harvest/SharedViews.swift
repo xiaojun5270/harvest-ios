@@ -1667,12 +1667,10 @@ struct SymbolBadge: View {
 
 struct FlowingSymbolBadge: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.flowingGlowRotation) private var environmentGlowRotation
 
     let icon: String
     let color: Color
     var size: CGFloat = 38
-    var glowRotation: Double?
     var showsProgress = false
 
     private var cornerRadius: CGFloat { max(5, size * 0.2) }
@@ -1682,15 +1680,8 @@ struct FlowingSymbolBadge: View {
     }
 
     var body: some View {
-        let effectiveGlowRotation = glowRotation ?? environmentGlowRotation
-        Group {
-            if let effectiveGlowRotation {
-                badge(rotation: effectiveGlowRotation)
-            } else {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
-                    badge(rotation: reduceMotion ? 42 : rotation(at: context.date))
-                }
-            }
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+            badge(rotation: reduceMotion ? 42 : rotation(at: context.date))
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
@@ -1747,22 +1738,13 @@ struct FlowingSymbolBadge: View {
 
 struct FlowingCircleBorder: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.flowingGlowRotation) private var environmentGlowRotation
 
     let color: Color
-    var rotation: Double?
     var lineWidth: CGFloat = 1.8
 
     var body: some View {
-        let effectiveRotation = rotation ?? environmentGlowRotation
-        Group {
-            if let effectiveRotation {
-                border(rotation: effectiveRotation)
-            } else {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
-                    border(rotation: reduceMotion ? 42 : rotation(at: context.date))
-                }
-            }
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { context in
+            border(rotation: reduceMotion ? 42 : rotation(at: context.date))
         }
         .allowsHitTesting(false)
     }
@@ -1790,17 +1772,6 @@ struct FlowingCircleBorder: View {
         .rotationEffect(.degrees(rotation))
         .mask { Circle().strokeBorder(lineWidth: lineWidth) }
         .shadow(color: color.opacity(0.28), radius: 2)
-    }
-}
-
-private struct FlowingGlowRotationKey: EnvironmentKey {
-    static let defaultValue: Double? = nil
-}
-
-extension EnvironmentValues {
-    var flowingGlowRotation: Double? {
-        get { self[FlowingGlowRotationKey.self] }
-        set { self[FlowingGlowRotationKey.self] = newValue }
     }
 }
 

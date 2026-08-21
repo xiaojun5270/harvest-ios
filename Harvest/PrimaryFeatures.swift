@@ -1450,7 +1450,6 @@ private struct DashboardCacheClearSheet: View {
 
 struct DashboardView: View {
     @EnvironmentObject private var appState: AppState
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model = DashboardViewModel()
     @AppStorage("dashboard.trendDays") private var trendDays = 7
     @AppStorage("dashboard.autoRefresh") private var autoRefresh = true
@@ -1485,7 +1484,6 @@ struct DashboardView: View {
     @State private var isRenderingShare = false
     @State private var runningQuickAction: DashboardQuickAction?
     @State private var showAccountAgeWeeks = false
-    @State private var dashboardGlowRotation = 0.0
 
     private var moduleOrder: [DashboardModule] { DashboardModule.decode(moduleOrderRaw) }
 
@@ -1516,7 +1514,6 @@ struct DashboardView: View {
             .padding(16)
         }
         .background(Color(uiColor: .systemGroupedBackground))
-        .environment(\.flowingGlowRotation, dashboardGlowRotation)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             HStack(spacing: 8) {
                 Spacer()
@@ -1524,8 +1521,7 @@ struct DashboardView: View {
                     FlowingSymbolBadge(
                         icon: "slider.horizontal.3",
                         color: HarvestTheme.blue,
-                        size: 34,
-                        glowRotation: dashboardGlowRotation
+                        size: 34
                     )
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
@@ -1542,8 +1538,7 @@ struct DashboardView: View {
                     FlowingSymbolBadge(
                         icon: "trash",
                         color: HarvestTheme.coral,
-                        size: 34,
-                        glowRotation: dashboardGlowRotation
+                        size: 34
                     )
                         .frame(width: 40, height: 40)
                         .contentShape(Circle())
@@ -1561,12 +1556,7 @@ struct DashboardView: View {
             .padding(.vertical, 6)
         }
         .refreshable { await model.load(appState, days: trendDays) }
-        .onAppear {
-            migrateDesignationOrderIfNeeded()
-            updateDashboardGlowAnimation()
-        }
-        .onDisappear { stopDashboardGlowAnimation() }
-        .onChange(of: reduceMotion) { _, _ in updateDashboardGlowAnimation() }
+        .onAppear { migrateDesignationOrderIfNeeded() }
         .task(id: "\(trendDays)-\(autoRefresh)-\(refreshInterval)") {
             await model.load(appState, days: trendDays)
             guard !Task.isCancelled else { return }
@@ -1603,8 +1593,7 @@ struct DashboardView: View {
                     FlowingSymbolBadge(
                         icon: "bolt.fill",
                         color: HarvestTheme.amber,
-                        size: 26,
-                        glowRotation: dashboardGlowRotation
+                        size: 26
                     )
                 }
                 .accessibilityLabel("仪表盘快捷操作")
@@ -1615,7 +1604,6 @@ struct DashboardView: View {
                         icon: "square.and.arrow.up",
                         color: HarvestTheme.blue,
                         size: 26,
-                        glowRotation: dashboardGlowRotation,
                         showsProgress: isRenderingShare
                     )
                 }
@@ -1644,26 +1632,6 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showShare) {
             if let shareImage { ActivityShareSheet(items: [shareImage]) }
-        }
-    }
-
-    private func updateDashboardGlowAnimation() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            dashboardGlowRotation = reduceMotion ? 42 : 0
-        }
-        guard !reduceMotion else { return }
-        withAnimation(.linear(duration: 3.6).repeatForever(autoreverses: false)) {
-            dashboardGlowRotation = 360
-        }
-    }
-
-    private func stopDashboardGlowAnimation() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            dashboardGlowRotation = 0
         }
     }
 
