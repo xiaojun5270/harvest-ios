@@ -75,28 +75,22 @@ struct NoticeView: View {
             .navigationTitle("消息")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItemGroup(placement: .confirmationAction) {
                     if !notices.isEmpty {
-                        Menu {
-                            if notices.contains(where: { !$0.read }) {
-                                Button {
-                                    Task {
-                                        if await appState.perform(APIPath.noticesRead) {
-                                            notices = notices.map {
-                                                var item = $0
-                                                item.read = true
-                                                return item
-                                            }
-                                            appState.clearDeliveredNotices()
-                                            await syncUnreadCount()
-                                            await persistCache()
-                                        }
-                                    }
-                                } label: { Label("全部已读", systemImage: "checkmark.circle") }
-                            }
-                            Button(role: .destructive) { confirmDeleteAll = true } label: { Label("删除全部", systemImage: "trash") }
-                        } label: { Image(systemName: "ellipsis.circle") }
-                        .accessibilityLabel("消息操作")
+                        Button {
+                            Task { await markAllRead() }
+                        } label: {
+                            Image(systemName: "checkmark.circle")
+                        }
+                        .disabled(!hasUnreadNotices)
+                        .accessibilityLabel("全部已读")
+
+                        Button(role: .destructive) {
+                            confirmDeleteAll = true
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .accessibilityLabel("删除全部消息")
                     }
                 }
             }
@@ -112,6 +106,24 @@ struct NoticeView: View {
             .confirmationDialog("确定删除全部消息？", isPresented: $confirmDeleteAll, titleVisibility: .visible) {
                 Button("删除全部", role: .destructive) { Task { await deleteAll() } }
             }
+        }
+    }
+
+    private var hasUnreadNotices: Bool {
+        notices.contains { !$0.read }
+    }
+
+    private func markAllRead() async {
+        guard hasUnreadNotices else { return }
+        if await appState.perform(APIPath.noticesRead) {
+            notices = notices.map {
+                var item = $0
+                item.read = true
+                return item
+            }
+            appState.clearDeliveredNotices()
+            await syncUnreadCount()
+            await persistCache()
         }
     }
 

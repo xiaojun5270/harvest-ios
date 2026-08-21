@@ -7420,11 +7420,12 @@ struct SiteEditorSheet: View {
             Text(title)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
-            TextField(title, text: text)
+            TextField("", text: text)
                 .textInputAutocapitalization(isURL ? .never : .sentences)
                 .autocorrectionDisabled(isURL)
                 .keyboardType(keyboardType)
                 .textFieldStyle(.plain)
+                .accessibilityLabel(title)
         }
         .padding(.vertical, 2)
         .listRowInsets(compactEditorInsets)

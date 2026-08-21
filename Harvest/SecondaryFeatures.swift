@@ -1626,9 +1626,16 @@ final class SearchViewModel: ObservableObject {
     }
 
     func siteLabel(_ value: String) -> String {
-        sites.first {
-            String($0.id) == value || $0.siteKey == value || $0.name == value
-        }?.name ?? value
+        site(for: value)?.name ?? value
+    }
+
+    func site(for value: String) -> SiteItem? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return sites.first {
+            String($0.id) == normalized
+                || $0.siteKey.caseInsensitiveCompare(normalized) == .orderedSame
+                || $0.name.caseInsensitiveCompare(normalized) == .orderedSame
+        }
     }
 
     func resourceSiteValue(_ item: [String: Any]) -> String {
@@ -1932,6 +1939,78 @@ final class SearchViewModel: ObservableObject {
 private struct ResourceSelection: Identifiable {
     let id = UUID()
     let value: [String: Any]
+    let site: SiteItem?
+
+    init(value: [String: Any], site: SiteItem? = nil) {
+        self.value = value
+        self.site = site
+    }
+}
+
+private struct ResourceDetailBrowserTarget: Identifiable {
+    let id = UUID()
+    let site: SiteItem
+    let url: URL
+    let title: String
+}
+
+private func resourceSiteBaseURL(_ site: SiteItem?) -> URL? {
+    guard let site else { return nil }
+    var value = site.url.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return nil }
+    if value.hasPrefix("//") {
+        value = "https:\(value)"
+    } else if URL(string: value)?.scheme == nil {
+        value = "https://\(value)"
+    }
+    if !value.hasSuffix("/") { value += "/" }
+    return URL(string: value)
+}
+
+private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?) -> URL? {
+    var normalized = value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "&amp;", with: "&")
+    guard !normalized.isEmpty else { return nil }
+    if normalized.hasPrefix("//") {
+        normalized = "\(resourceSiteBaseURL(site)?.scheme ?? "https"):\(normalized)"
+    }
+    if let absolute = URL(string: normalized),
+       ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
+        return absolute
+    }
+    guard let baseURL = resourceSiteBaseURL(site),
+          let relative = URL(string: normalized, relativeTo: baseURL)?.absoluteURL,
+          ["http", "https"].contains(relative.scheme?.lowercased() ?? "") else {
+        return nil
+    }
+    return relative
+}
+
+private func resourceCoverURL(_ item: [String: Any], site: SiteItem?) -> URL? {
+    resourceResolvedURL(mediaImageValue(item), relativeTo: site)
+}
+
+private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
+    let value = item.string(
+        "detail_url", "detailUrl", "details_url", "detailsUrl",
+        "torrent_detail_url", "torrentDetailUrl", "url", "link"
+    ) ?? ""
+    return resourceResolvedURL(value, relativeTo: site)
+}
+
+private func resourceImageHeaders(for url: URL?, site: SiteItem?) -> [String: String] {
+    var headers: [String: String] = [:]
+    if let site {
+        let cookie = site.cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        let userAgent = site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cookie.isEmpty { headers["Cookie"] = cookie }
+        if !userAgent.isEmpty { headers["User-Agent"] = userAgent }
+        if let referer = resourceSiteBaseURL(site)?.absoluteString {
+            headers["Referer"] = referer
+        }
+    }
+    return remoteImageHeaders(for: url, additional: headers)
 }
 
 private struct ResourcePushSelection: Identifiable {
@@ -1945,6 +2024,8 @@ struct SearchView: View {
     @StateObject private var model = SearchViewModel()
     @State private var selectedMedia: MediaItem?
     @State private var selectedResource: ResourceSelection?
+    @State private var selectedResourceDetail: ResourceSelection?
+    @State private var resourceDetailBrowserTarget: ResourceDetailBrowserTarget?
     @State private var pendingResourcePush: ResourcePushSelection?
     @State private var resourcePushSelection: ResourcePushSelection?
     @State private var showSettings = false
@@ -2104,13 +2185,18 @@ struct SearchView: View {
                         }
                     } else {
                         ForEach(model.displayedResourceItems) { item in
-                            Button { selectedResource = ResourceSelection(value: item.value) } label: {
-                                ResourceRowItem(
-                                    item: item.value,
-                                    siteLabel: model.siteLabel(item.siteValue)
-                                )
-                            }
-                                .buttonStyle(.plain)
+                            let site = model.site(for: item.siteValue)
+                            ResourceResultRow(
+                                item: item.value,
+                                siteLabel: model.siteLabel(item.siteValue),
+                                site: site,
+                                onTap: {
+                                    selectedResource = ResourceSelection(value: item.value, site: site)
+                                },
+                                onLongPress: {
+                                    openResourceDetail(item.value, site: site)
+                                }
+                            )
                         }
                     }
                 }
@@ -2126,6 +2212,9 @@ struct SearchView: View {
             }
             .environmentObject(appState)
         }
+        .sheet(item: $selectedResourceDetail) { selection in
+            ResourceDetailSheet(item: selection.value, site: selection.site)
+        }
         .sheet(item: $resourcePushSelection) { selection in
             ResourcePushSheet(item: selection.value, downloader: selection.downloader)
                 .environmentObject(appState)
@@ -2139,6 +2228,21 @@ struct SearchView: View {
         .sheet(isPresented: $showResourceFilters) {
             ResourceFilterSheet(model: model)
                 .presentationDetents([.large])
+        }
+        .fullScreenCover(item: $resourceDetailBrowserTarget) { target in
+            NavigationStack {
+                SiteBrowserScreen(
+                    site: target.site,
+                    urlString: target.url.absoluteString,
+                    title: target.title
+                )
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("关闭") { resourceDetailBrowserTarget = nil }
+                    }
+                }
+            }
+            .environmentObject(appState)
         }
         .task { await model.loadSites(appState); consumePendingResourceSearch() }
         .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
@@ -2284,6 +2388,18 @@ struct SearchView: View {
         guard let pendingResourcePush else { return }
         self.pendingResourcePush = nil
         resourcePushSelection = pendingResourcePush
+    }
+
+    private func openResourceDetail(_ item: [String: Any], site: SiteItem?) {
+        if let site, let url = resourceDetailURL(item, site: site) {
+            resourceDetailBrowserTarget = ResourceDetailBrowserTarget(
+                site: site,
+                url: url,
+                title: item.string("title", "name") ?? "种子详情"
+            )
+        } else {
+            selectedResourceDetail = ResourceSelection(value: item, site: site)
+        }
     }
 
     private var currentResultsAreEmpty: Bool {
@@ -2678,12 +2794,57 @@ struct MediaRow: View {
     }
 }
 
+private struct ResourceResultRow: View {
+    let item: [String: Any]
+    let siteLabel: String
+    let site: SiteItem?
+    let onTap: () -> Void
+    let onLongPress: () -> Void
+
+    var body: some View {
+        ResourceRowItem(item: item, siteLabel: siteLabel, site: site)
+            .contentShape(Rectangle())
+            .gesture(
+                LongPressGesture(minimumDuration: 0.45)
+                    .exclusively(before: TapGesture())
+                    .onEnded { value in
+                        switch value {
+                        case .first(true): onLongPress()
+                        case .second(_): onTap()
+                        default: break
+                        }
+                    }
+            )
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { onTap() }
+            .accessibilityAction(named: "查看种子详情") { onLongPress() }
+    }
+}
+
 struct ResourceRowItem: View {
     let item: [String: Any]
     let siteLabel: String
+    let site: SiteItem?
+
+    private var coverURL: URL? { resourceCoverURL(item, site: site) }
 
     var body: some View {
         HStack(spacing: 12) {
+            CachedRemoteImage(
+                url: coverURL,
+                headers: resourceImageHeaders(for: coverURL, site: site)
+            ) { image in
+                image.resizable().scaledToFill()
+            } placeholder: {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(HarvestTheme.blue.opacity(0.08))
+                    .overlay {
+                        Image(systemName: "doc.richtext")
+                            .foregroundStyle(HarvestTheme.blue.opacity(0.55))
+                    }
+            }
+            .frame(width: 54, height: 76)
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
             VStack(alignment: .leading, spacing: 7) {
                 Text(item.string("title", "name") ?? "未命名资源")
                     .font(.subheadline.weight(.semibold))
@@ -2731,6 +2892,142 @@ struct ResourceRowItem: View {
         if resourceHasHRValue(item) { values.append("HR") }
         if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty { values.append(published) }
         return values
+    }
+}
+
+private struct ResourceDetailSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let item: [String: Any]
+    let site: SiteItem?
+
+    private var title: String { item.string("title", "name") ?? "未命名资源" }
+    private var subtitle: String { item.string("subtitle", "sub_title", "description") ?? "" }
+    private var siteLabel: String {
+        site?.name ?? item.string("site_name", "siteName", "site") ?? "未知站点"
+    }
+    private var coverURL: URL? { resourceCoverURL(item, site: site) }
+    private var detailURL: URL? { resourceDetailURL(item, site: site) }
+    private var downloadURL: String {
+        item.string("magnet_url", "magnetUrl", "download_url", "downloadUrl", "torrent_url", "torrentUrl") ?? ""
+    }
+    private var tags: [String] {
+        let values = item.strings("tags")
+        if !values.isEmpty { return values }
+        return (item.string("tags") ?? "")
+            .components(separatedBy: CharacterSet(charactersIn: ",，#"))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+    private var metadata: [(String, String)] {
+        var values: [(String, String)] = [("站点", siteLabel)]
+        values.append(("大小", sizeLabel))
+        values.append(("做种", "\(item.int("seeders", "seed", "seeder") ?? 0)"))
+        values.append(("下载", "\(item.int("leechers", "leecher", "leech") ?? 0)"))
+        values.append(("完成", "\(item.int("completers", "completed", "snatched") ?? 0)"))
+        if let category = item.string("category", "category_name", "categoryName"), !category.isEmpty {
+            values.append(("分类", category))
+        }
+        if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty {
+            values.append(("发布时间", published))
+        }
+        return values
+    }
+    private var sizeLabel: String {
+        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
+            return item.string("size", "length") ?? "未知大小"
+        }
+        return formatBytes(bytes)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .top, spacing: 14) {
+                        CachedRemoteImage(
+                            url: coverURL,
+                            headers: resourceImageHeaders(for: coverURL, site: site)
+                        ) { image in
+                            image.resizable().scaledToFill()
+                        } placeholder: {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(HarvestTheme.blue.opacity(0.08))
+                                .overlay(Image(systemName: "doc.richtext").font(.title2).foregroundStyle(.secondary))
+                        }
+                        .frame(width: 104, height: 146)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(title)
+                                .font(.title3.weight(.semibold))
+                                .lineLimit(4)
+                            if !subtitle.isEmpty {
+                                Text(subtitle)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(5)
+                            }
+                            Text(siteLabel)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(HarvestTheme.green)
+                        }
+                    }
+
+                    VStack(spacing: 0) {
+                        ForEach(Array(metadata.enumerated()), id: \.offset) { _, entry in
+                            HStack {
+                                Text(entry.0).foregroundStyle(.secondary)
+                                Spacer(minLength: 16)
+                                Text(entry.1).multilineTextAlignment(.trailing)
+                            }
+                            .font(.subheadline)
+                            .padding(.vertical, 9)
+                            if entry.0 != metadata.last?.0 { Divider() }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                    if !tags.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("标签").font(.headline)
+                            Text(tags.joined(separator: " · "))
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if !downloadURL.isEmpty {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text("下载地址").font(.headline)
+                            Text(downloadURL)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .lineLimit(5)
+                        }
+                    }
+
+                    if let detailURL {
+                        Link(destination: detailURL) {
+                            Label("打开站点详情页", systemImage: "safari")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(HarvestTheme.blue)
+                    }
+                }
+                .padding(16)
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("种子详情")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
     }
 }
 
