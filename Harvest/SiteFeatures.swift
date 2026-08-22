@@ -3099,6 +3099,55 @@ private func safeFileName(_ value: String) -> String {
     return value.components(separatedBy: invalid).joined(separator: "_").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// 站点等级的统一配色。优先使用等级名称中的语义，其次按站点配置的等级编号
+/// 递进配色，保证站点卡片和等级详情中的同一等级始终使用相同颜色。
+private func siteLevelColor(level: String, levelID: Int? = nil) -> Color {
+    let normalized = level
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    let semanticColors: [(tokens: [String], color: Color)] = [
+        (["管理员", "总版主", "站长", "staff", "admin", "owner", "moderator"], HarvestTheme.coral),
+        (["vip", "贵宾", "至尊", "皇帝", "王者", "master", "elite", "torrent master"], HarvestTheme.purple),
+        (["毕业", "graduat", "保号", "keep"], HarvestTheme.amber),
+        (["高级", "精英", "expert", "power user"], HarvestTheme.orange),
+        (["新手", "新人", "学徒", "初级", "junior", "rookie"], HarvestTheme.teal)
+    ]
+    if let match = semanticColors.first(where: { entry in
+        entry.tokens.contains { normalized.contains($0) }
+    }) {
+        return match.color
+    }
+
+    if let levelID, levelID > 0 {
+        switch levelID {
+        case 1: return HarvestTheme.teal
+        case 2: return HarvestTheme.blue
+        case 3: return HarvestTheme.indigo
+        case 4: return HarvestTheme.purple
+        case 5: return HarvestTheme.orange
+        default: return levelID >= 6 ? HarvestTheme.amber : HarvestTheme.blue
+        }
+    }
+
+    // 没有编号时使用名称生成稳定索引，避免同一等级因刷新变色。
+    let checksum = normalized.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
+    return [HarvestTheme.teal, HarvestTheme.blue, HarvestTheme.indigo, HarvestTheme.purple, HarvestTheme.orange][
+        abs(checksum) % 5
+    ]
+}
+
+private func siteReportedLevelID(_ site: SiteItem) -> Int? {
+    if let direct = site.raw.int("level_id", "levelId", "current_level_id", "currentLevelId"), direct > 0 {
+        return direct
+    }
+    let statusMap = site.raw.dict("status") ?? [:]
+    let latestStatus = statusMap.keys.sorted().last.flatMap { statusMap[$0] as? [String: Any] }
+    if let latest = latestStatus?.int("level_id", "levelId", "current_level_id", "currentLevelId"), latest > 0 {
+        return latest
+    }
+    return nil
+}
+
 struct SiteRow: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let site: SiteItem
@@ -3424,7 +3473,13 @@ struct SiteRow: View {
     private var levelStatus: SiteStatusDescriptor? {
         let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !level.isEmpty else { return nil }
-        return SiteStatusDescriptor(id: "level", label: level, icon: "medal.fill", color: HarvestTheme.blue)
+        let levelID = siteReportedLevelID(site)
+        return SiteStatusDescriptor(
+            id: "level",
+            label: level,
+            icon: "medal.fill",
+            color: siteLevelColor(level: level, levelID: levelID)
+        )
     }
 
     private var milestoneStatus: SiteStatusDescriptor? {
@@ -4611,15 +4666,7 @@ private struct SiteLevelProgressView: View {
     let levels: [SiteLevelRequirement]
 
     private var reportedLevelID: Int? {
-        if let direct = site.raw.int("level_id", "levelId", "current_level_id", "currentLevelId"), direct > 0 {
-            return direct
-        }
-        let statusMap = site.raw.dict("status") ?? [:]
-        let latestStatus = statusMap.keys.sorted().last.flatMap { statusMap[$0] as? [String: Any] }
-        if let latest = latestStatus?.int("level_id", "levelId", "current_level_id", "currentLevelId"), latest > 0 {
-            return latest
-        }
-        return nil
+        siteReportedLevelID(site)
     }
     private var currentLevel: SiteLevelRequirement? {
         if let reportedLevelID,
@@ -4655,7 +4702,18 @@ private struct SiteLevelProgressView: View {
     var body: some View {
         List {
             Section("当前等级") {
-                LabeledContent("等级", value: site.level.isEmpty ? "未知" : site.level)
+                HStack {
+                    Text("等级")
+                    Spacer()
+                    Text(site.level.isEmpty ? "未知" : site.level)
+                        .foregroundStyle(
+                            siteLevelColor(
+                                level: site.level.isEmpty ? "未知" : site.level,
+                                levelID: reportedLevelID
+                            )
+                        )
+                        .fontWeight(.semibold)
+                }
                 if reachedLevels.contains(where: { $0.graduation }) {
                     Label("已达到毕业等级", systemImage: "graduationcap.fill").foregroundStyle(HarvestTheme.amber)
                 } else if reachedLevels.contains(where: { $0.keepAccount }) {
@@ -4685,10 +4743,20 @@ private struct SiteLevelProgressView: View {
                     ForEach(levels) { level in
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
-                                Text(level.displayName).font(.subheadline.weight(.semibold))
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(siteLevelColor(level: level.displayName, levelID: level.levelID))
+                                        .frame(width: 8, height: 8)
+                                    Text(level.displayName)
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(siteLevelColor(level: level.displayName, levelID: level.levelID))
+                                }
                                 Spacer()
                                 if currentLevel?.id == level.id {
-                                    StatusPill(label: "当前", color: HarvestTheme.green)
+                                    StatusPill(
+                                        label: "当前",
+                                        color: siteLevelColor(level: level.displayName, levelID: level.levelID)
+                                    )
                                 }
                             }
                             Text(levelSummary(level)).font(.caption).foregroundStyle(.secondary)
