@@ -1967,10 +1967,29 @@ private func resourceSiteBaseURL(_ site: SiteItem?) -> URL? {
     return URL(string: value)
 }
 
-private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?) -> URL? {
+private func resourceItemBaseURL(_ item: [String: Any], site: SiteItem?) -> URL? {
+    if let siteURL = resourceSiteBaseURL(site) { return siteURL }
+    for key in ["site_url", "siteUrl", "base_url", "baseUrl", "mirror", "origin"] {
+        if let value = item.string(key), let url = resourceResolvedURL(value, relativeTo: nil) {
+            return url
+        }
+    }
+    if let detail = item.string("detail_url", "detailUrl", "details_url", "detailsUrl"),
+       let detailURL = resourceResolvedURL(detail, relativeTo: nil) {
+        var components = URLComponents(url: detailURL, resolvingAgainstBaseURL: false)
+        components?.path = components?.path.isEmpty == false ? (components?.path ?? "/") : "/"
+        components?.query = nil
+        components?.fragment = nil
+        return components?.url
+    }
+    return nil
+}
+
+private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?, item: [String: Any]? = nil) -> URL? {
     var normalized = value
         .trimmingCharacters(in: .whitespacesAndNewlines)
         .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "\\/", with: "/")
     guard !normalized.isEmpty else { return nil }
     if normalized.hasPrefix("//") {
         normalized = "\(resourceSiteBaseURL(site)?.scheme ?? "https"):\(normalized)"
@@ -1979,16 +1998,42 @@ private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?) ->
        ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
         return absolute
     }
-    guard let baseURL = resourceSiteBaseURL(site),
-          let relative = URL(string: normalized, relativeTo: baseURL)?.absoluteURL,
+    if let escaped = normalized.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+       let absolute = URL(string: escaped),
+       ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
+        return absolute
+    }
+    guard let baseURL = item.flatMap({ resourceItemBaseURL($0, site: site) }) ?? resourceSiteBaseURL(site),
+          let relative = (URL(string: normalized, relativeTo: baseURL)
+              ?? normalized.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed)
+                  .flatMap { URL(string: $0, relativeTo: baseURL) })?.absoluteURL,
           ["http", "https"].contains(relative.scheme?.lowercased() ?? "") else {
         return nil
     }
     return relative
 }
 
+private func resourceImageValue(_ item: [String: Any]) -> String {
+    let keys = [
+        "poster", "poster_url", "posterUrl", "torrent_poster", "torrentPoster",
+        "torrent_poster_url", "torrentPosterUrl", "cover", "cover_url", "coverUrl",
+        "cover_image", "coverImage", "thumbnail", "thumbnail_url", "thumbnailUrl",
+        "pic", "image", "image_url", "imageUrl", "img"
+    ]
+    for key in keys {
+        if let value = mediaStringValue(item[key]), !value.isEmpty { return value }
+    }
+    for key in ["torrent", "detail", "data", "result"] {
+        if let nested = item[key] as? [String: Any] {
+            let value = resourceImageValue(nested)
+            if !value.isEmpty { return value }
+        }
+    }
+    return mediaImageValue(item)
+}
+
 private func resourceCoverURL(_ item: [String: Any], site: SiteItem?) -> URL? {
-    resourceResolvedURL(mediaImageValue(item), relativeTo: site)
+    resourceResolvedURL(resourceImageValue(item), relativeTo: site, item: item)
 }
 
 private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
@@ -1996,10 +2041,10 @@ private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
         "detail_url", "detailUrl", "details_url", "detailsUrl",
         "torrent_detail_url", "torrentDetailUrl", "url", "link"
     ) ?? ""
-    return resourceResolvedURL(value, relativeTo: site)
+    return resourceResolvedURL(value, relativeTo: site, item: item)
 }
 
-private func resourceImageHeaders(for url: URL?, site: SiteItem?) -> [String: String] {
+private func resourceImageHeaders(for url: URL?, item: [String: Any], site: SiteItem?) -> [String: String] {
     var headers: [String: String] = [:]
     if let site {
         let cookie = site.cookie.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2009,6 +2054,12 @@ private func resourceImageHeaders(for url: URL?, site: SiteItem?) -> [String: St
         if let referer = resourceSiteBaseURL(site)?.absoluteString {
             headers["Referer"] = referer
         }
+    }
+    if let cookie = item.string("cookie", "cookies")?.trimmingCharacters(in: .whitespacesAndNewlines), !cookie.isEmpty {
+        headers["Cookie"] = cookie
+    }
+    if let userAgent = item.string("user_agent", "userAgent")?.trimmingCharacters(in: .whitespacesAndNewlines), !userAgent.isEmpty {
+        headers["User-Agent"] = userAgent
     }
     return remoteImageHeaders(for: url, additional: headers)
 }
@@ -2832,7 +2883,7 @@ struct ResourceRowItem: View {
         HStack(spacing: 12) {
             CachedRemoteImage(
                 url: coverURL,
-                headers: resourceImageHeaders(for: coverURL, site: site)
+                headers: resourceImageHeaders(for: coverURL, item: item, site: site)
             ) { image in
                 image.resizable().scaledToFill()
             } placeholder: {
@@ -2946,7 +2997,7 @@ private struct ResourceDetailSheet: View {
                     HStack(alignment: .top, spacing: 14) {
                         CachedRemoteImage(
                             url: coverURL,
-                            headers: resourceImageHeaders(for: coverURL, site: site)
+                            headers: resourceImageHeaders(for: coverURL, item: item, site: site)
                         ) { image in
                             image.resizable().scaledToFill()
                         } placeholder: {

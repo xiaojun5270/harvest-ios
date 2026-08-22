@@ -895,7 +895,10 @@ struct SitesView: View {
                 openTimeline: { showTimeline = true }
             )
             Group {
-                if model.isLoading { LoadingState() }
+                // Keep cached rows visible while a background refresh is in flight.
+                // A transient refresh must not replace an already usable site list
+                // with a full-page spinner.
+                if model.isLoading && model.sites.isEmpty { LoadingState() }
                 else if model.filtered.isEmpty {
                     EmptyState(
                         icon: "globe.badge.chevron.backward",
