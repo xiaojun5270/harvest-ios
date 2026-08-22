@@ -669,7 +669,7 @@ private func remoteImageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
 }
 
 private func remoteImageURLFromResponse(_ data: Data, baseURL: URL) -> URL? {
-    guard let object = try? JSONSerialization.jsonObject(data: data, options: [.fragmentsAllowed]) else {
+    guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
         return nil
     }
 

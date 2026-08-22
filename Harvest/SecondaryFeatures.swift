@@ -2111,6 +2111,7 @@ private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?, it
     return relative
 }
 
+@MainActor
 private func resourceBackendBaseURL(_ appState: AppState) -> URL? {
     var value = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
     while value.hasSuffix("/") { value.removeLast() }
@@ -2171,6 +2172,7 @@ private func resourceCachedSite(
     }
 }
 
+@MainActor
 private func resourceImageResolvedURL(
     _ value: String,
     relativeTo site: SiteItem?,
@@ -2209,6 +2211,7 @@ private func resourceImageResolvedURL(
     return resourceResolvedURL(normalized, relativeTo: site, item: item)
 }
 
+@MainActor
 private func resourceSiteImageProxyURL(
     _ value: String,
     site: SiteItem?,
@@ -2688,6 +2691,7 @@ private func resourceSiteValueForCache(_ item: [String: Any]) -> String {
     ) ?? "unknown"
 }
 
+@MainActor
 private func resourceSiteIconCandidates(
     _ item: [String: Any],
     site: SiteItem?,
