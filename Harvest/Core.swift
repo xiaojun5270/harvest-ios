@@ -609,6 +609,42 @@ actor AppSessionCache {
         return AppSessionCacheRecord(payload: envelope.payload, cachedAt: envelope.cachedAt)
     }
 
+    func readLatest(scopePrefixes: [String], name: String) -> AppSessionCacheRecord? {
+        let prefixes = scopePrefixes.filter { !$0.isEmpty }
+        guard !prefixes.isEmpty else { return nil }
+
+        func matches(_ envelope: Envelope) -> Bool {
+            envelope.name == name && prefixes.contains { envelope.scope.hasPrefix($0) }
+        }
+
+        var latest = memory.values.filter(matches).max { $0.cachedAt < $1.cachedAt }
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        for url in urls {
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(Envelope.self, from: data),
+                  matches(decoded),
+                  decoded.cachedAt >= Date().addingTimeInterval(-maximumAge),
+                  decoded.payload.count <= maximumEntryBytes,
+                  latest.map({ decoded.cachedAt > $0.cachedAt }) ?? true,
+                  let safePayload = cacheSafePayload(decoded.payload) else { continue }
+            let envelope = Envelope(
+                scope: decoded.scope,
+                name: decoded.name,
+                cachedAt: decoded.cachedAt,
+                payload: safePayload
+            )
+            memory[memoryKey(scope: envelope.scope, name: envelope.name)] = envelope
+            if safePayload != decoded.payload { persist(envelope, to: url) }
+            latest = envelope
+        }
+        guard let latest else { return nil }
+        return AppSessionCacheRecord(payload: latest.payload, cachedAt: latest.cachedAt)
+    }
+
     func write(scope: String, name: String, payload: Data) {
         guard payload.count <= maximumEntryBytes else { return }
         guard let safePayload = cacheSafePayload(payload) else { return }
@@ -1363,6 +1399,19 @@ final class AppState: ObservableObject {
 
     var colorScheme: ColorScheme? { appearance.scheme }
     var loginHistory: [LoginRecord] { loadLoginHistory() }
+    /// Allows the main shell to hydrate from local snapshots while the stored
+    /// access token is being validated in the background.
+    var hasStoredSession: Bool { !baseURL.isEmpty && !accessToken.isEmpty }
+    /// Stable across a cold session restore, but changes when the user switches
+    /// accounts. View state can use this identity without being rebuilt after
+    /// token validation finishes.
+    var sessionUIIdentity: String {
+        let storedUsername = UserDefaults.standard.string(forKey: "harvest.sessionUsername") ?? ""
+        let username = (profile?.username ?? storedUsername)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return "\(normalizeServer(baseURL))|\(username)"
+    }
 
     init() {
         let defaults = UserDefaults.standard
@@ -1379,6 +1428,14 @@ final class AppState: ObservableObject {
         let savedRefreshMinutes = defaults.object(forKey: "app.autoRefreshMinutes") == nil ? 10 : defaults.integer(forKey: "app.autoRefreshMinutes")
         autoRefreshMinutes = min(max(savedRefreshMinutes, 1), 1_440)
         unreadNoticeCount = max(0, defaults.integer(forKey: "notifications.unreadCount"))
+        // Older builds did not persist the profile username separately. Seed the
+        // cache lookup hint from the most recent matching login record so cached
+        // site/dashboard rows can be restored before /userinfo finishes.
+        if defaults.string(forKey: "harvest.sessionUsername")?.isEmpty != false,
+           !baseURL.isEmpty,
+           let record = loadLoginHistory().first(where: { normalizeServer($0.server) == normalizeServer(baseURL) }) {
+            defaults.set(record.username, forKey: "harvest.sessionUsername")
+        }
         recordAppLog(.info, "Harvest iOS 启动")
         Task { await restoreSession() }
     }
@@ -1635,6 +1692,7 @@ final class AppState: ObservableObject {
         do {
             try await loadProfile()
             isAuthenticated = true
+            sessionGeneration &+= 1
             await refreshAuthorizationAccess()
             recordAppLog(.info, "已恢复 \(profile?.username ?? "用户") 的登录会话")
             await refreshNoticeState(deliverNew: false)
@@ -1643,6 +1701,7 @@ final class AppState: ObservableObject {
                 try await refreshAccessToken()
                 try await loadProfile()
                 isAuthenticated = true
+                sessionGeneration &+= 1
                 await refreshAuthorizationAccess()
                 recordAppLog(.info, "刷新令牌后恢复登录会话")
                 await refreshNoticeState(deliverNew: false)
@@ -1710,6 +1769,7 @@ final class AppState: ObservableObject {
             pendingResourceSearch = nil
             selectedTab = nextProfile.isSuperuser ? 2 : 3
             UserDefaults.standard.set(normalized, forKey: "harvest.baseURL")
+            UserDefaults.standard.set(nextProfile.username, forKey: "harvest.sessionUsername")
             KeychainStore.set(accessToken, for: "accessToken")
             KeychainStore.set(refreshToken, for: "refreshToken")
             KeychainStore.set(password, for: "password.\(normalized).\(username)")
@@ -1834,24 +1894,63 @@ final class AppState: ObservableObject {
     }
 
     func readSessionCacheData(_ name: String) async -> (payload: Data, cachedAt: Date)? {
-        guard let scope = sessionCacheScope,
-              let record = await AppSessionCache.shared.read(scope: scope, name: name) else { return nil }
-        return (record.payload, record.cachedAt)
+        // Prefer the account-scoped snapshot when an account alias is known.
+        // This avoids showing another account's site metrics on shared servers.
+        for scope in sessionCacheScopes {
+            if let record = await AppSessionCache.shared.read(scope: scope, name: name) {
+                return (record.payload, record.cachedAt)
+            }
+        }
+        // If the profile/username alias changed, use the same-server snapshot
+        // as a short-lived visual fallback while the network refresh runs.
+        if isSiteSnapshotCacheName(name),
+           let scope = siteSnapshotScope,
+           let record = await AppSessionCache.shared.read(scope: scope, name: name) {
+            return (record.payload, record.cachedAt)
+        }
+        // Site snapshots are already stripped of credentials and identity
+        // fields. If a previous build wrote them under a login alias that is no
+        // longer known, recover the newest snapshot for the same server.
+        if ["site.info.list", "site.config.list"].contains(name),
+           let record = await AppSessionCache.shared.readLatest(
+                scopePrefixes: sessionCacheServerPrefixes,
+                name: name
+           ) {
+            return (record.payload, record.cachedAt)
+        }
+        return nil
     }
 
     func writeSessionCacheData(_ payload: Data, name: String) async {
-        guard let scope = sessionCacheScope, !payload.isEmpty else { return }
-        await AppSessionCache.shared.write(scope: scope, name: name, payload: payload)
+        guard !payload.isEmpty else { return }
+        if let scope = sessionCacheScope {
+            var hints = UserDefaults.standard.dictionary(forKey: "harvest.sessionCacheScopes") as? [String: String] ?? [:]
+            hints[normalizeServer(baseURL)] = scope
+            UserDefaults.standard.set(hints, forKey: "harvest.sessionCacheScopes")
+            await AppSessionCache.shared.write(scope: scope, name: name, payload: payload)
+        }
+        if isSiteSnapshotCacheName(name), let snapshotScope = siteSnapshotScope {
+            await AppSessionCache.shared.write(scope: snapshotScope, name: name, payload: payload)
+        }
     }
 
     func removeSessionCache(_ name: String) async {
-        guard let scope = sessionCacheScope else { return }
-        await AppSessionCache.shared.remove(scope: scope, name: name)
+        for scope in sessionCacheScopes {
+            await AppSessionCache.shared.remove(scope: scope, name: name)
+        }
+        if isSiteSnapshotCacheName(name), let snapshotScope = siteSnapshotScope {
+            await AppSessionCache.shared.remove(scope: snapshotScope, name: name)
+        }
     }
 
     func clearSessionCache() async {
-        guard let scope = sessionCacheScope else { return }
-        await AppSessionCache.shared.clear(scope: scope)
+        for scope in sessionCacheScopes {
+            await AppSessionCache.shared.clear(scope: scope)
+        }
+        if let snapshotScope = siteSnapshotScope {
+            await AppSessionCache.shared.clear(scope: snapshotScope)
+        }
+        SitesViewModel.clearCachedSitesSnapshot()
     }
 
     func removeLoginRecord(_ record: LoginRecord) {
@@ -2262,6 +2361,8 @@ final class AppState: ObservableObject {
         isAuthenticated = false
         unreadNoticeCount = 0
         UserDefaults.standard.set(0, forKey: "notifications.unreadCount")
+        UserDefaults.standard.removeObject(forKey: "harvest.sessionUsername")
+        SitesViewModel.clearCachedSitesSnapshot()
         KeychainStore.delete("accessToken")
         KeychainStore.delete("refreshToken")
         Task { _ = try? await UNUserNotificationCenter.current().setBadgeCount(0) }
@@ -2288,9 +2389,52 @@ final class AppState: ObservableObject {
     }
 
     private var sessionCacheScope: String? {
-        let username = profile?.username.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !baseURL.isEmpty, !username.isEmpty else { return nil }
-        return "\(baseURL)|\(username.lowercased())"
+        sessionCacheScopes.first
+    }
+
+    private func isSiteSnapshotCacheName(_ name: String) -> Bool {
+        name == "site.info.list" || name == "site.config.list"
+    }
+
+    private var siteSnapshotScope: String? {
+        guard !baseURL.isEmpty else { return nil }
+        return "\(normalizeServer(baseURL))|__site_snapshot__"
+    }
+
+    private var sessionCacheServerPrefixes: [String] {
+        guard !baseURL.isEmpty else { return [] }
+        let normalizedBaseURL = normalizeServer(baseURL)
+        return [baseURL, normalizedBaseURL].reduce(into: [String]()) { result, server in
+            let prefix = "\(server)|"
+            if !server.isEmpty, !result.contains(prefix) { result.append(prefix) }
+        }
+    }
+
+    // Login identifiers can differ from the username returned by /userinfo
+    // (case, email alias, or a legacy account name). Read all known aliases so
+    // a cold launch can still restore the cache written by an earlier session.
+    private var sessionCacheScopes: [String] {
+        guard !baseURL.isEmpty else { return [] }
+        let defaults = UserDefaults.standard
+        let storedUsername = defaults.string(forKey: "harvest.sessionUsername") ?? ""
+        let profileUsername = profile?.username ?? ""
+        let normalizedBaseURL = normalizeServer(baseURL)
+        let hintedScope = (defaults.dictionary(forKey: "harvest.sessionCacheScopes") as? [String: String])?[normalizedBaseURL]
+        let historyUsernames = loginHistory
+            .filter { normalizeServer($0.server) == normalizedBaseURL }
+            .map(\.username)
+        var usernames: [String] = [profileUsername, storedUsername] + historyUsernames
+        var seen = Set<String>()
+        usernames = usernames.compactMap { raw in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
+        var scopes = sessionCacheServerPrefixes.flatMap { prefix in usernames.map { "\(prefix)\($0)" } }
+        if let hintedScope, !hintedScope.isEmpty, !scopes.contains(hintedScope) {
+            scopes.insert(hintedScope, at: 0)
+        }
+        return scopes
     }
 
     private func saveLoginRecord(server: String, username: String) {

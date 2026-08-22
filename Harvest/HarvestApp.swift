@@ -74,11 +74,11 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if appState.isRestoringSession {
-                LaunchView()
-            } else if appState.isAuthenticated {
+            if appState.isAuthenticated || (appState.isRestoringSession && appState.hasStoredSession) {
                 MainShellView()
-                    .id(appState.sessionGeneration)
+                    .id(appState.sessionUIIdentity)
+            } else if appState.isRestoringSession {
+                LaunchView()
             } else {
                 LoginView()
             }

@@ -8,7 +8,7 @@ actor RemoteImageDataCache {
     static let shared = RemoteImageDataCache()
 
     private static let cachePolicyVersionKey = "images.cachePolicyVersion"
-    private static let cachePolicyVersion = 2
+    private static let cachePolicyVersion = 3
 
     private let memoryCache: NSCache<NSString, NSData>
     private let diskCache: URLCache
@@ -25,14 +25,14 @@ actor RemoteImageDataCache {
         let cache = URLCache(
             memoryCapacity: 32 * 1_024 * 1_024,
             diskCapacity: 192 * 1_024 * 1_024,
-            diskPath: "harvest-public-images-v2"
+            diskPath: "harvest-public-images-v3"
         )
         let configuration = URLSessionConfiguration.default
         configuration.urlCache = cache
         configuration.requestCachePolicy = .returnCacheDataElseLoad
-        configuration.timeoutIntervalForRequest = 20
-        configuration.timeoutIntervalForResource = 45
-        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 15
+        configuration.waitsForConnectivity = false
         configuration.httpMaximumConnectionsPerHost = 6
         configuration.httpShouldSetCookies = false
         configuration.httpCookieStorage = nil
@@ -40,9 +40,9 @@ actor RemoteImageDataCache {
         let privateConfiguration = URLSessionConfiguration.ephemeral
         privateConfiguration.urlCache = nil
         privateConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        privateConfiguration.timeoutIntervalForRequest = 20
-        privateConfiguration.timeoutIntervalForResource = 45
-        privateConfiguration.waitsForConnectivity = true
+        privateConfiguration.timeoutIntervalForRequest = 8
+        privateConfiguration.timeoutIntervalForResource = 15
+        privateConfiguration.waitsForConnectivity = false
         privateConfiguration.httpShouldSetCookies = false
         privateConfiguration.httpCookieStorage = nil
         let persistentDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
@@ -84,8 +84,13 @@ actor RemoteImageDataCache {
         // 站点图标接口可能需要 Bearer 认证，但落盘内容只有图片数据，不包含请求头。
         // 仅对明确标记为 site-icon 的资源允许持久化，避免放宽其它敏感图片缓存。
         let isSiteIcon = isSiteIconCache(persistentCacheID)
-        let persistToDisk = (isPublicCacheURL(normalizedURL) || isSiteIcon)
-            && (!hasSensitiveImageHeaders(effectiveHeaders) || isSiteIcon)
+        let isResourceCover = isResourceCoverCache(persistentCacheID)
+        // A private tracker cover may require Cookie/Referer to download, but
+        // the persisted file contains only decoded image bytes and its filename
+        // is a SHA-256 digest. Allow explicitly marked resource covers to remain
+        // available offline just like site icons.
+        let persistToDisk = (isPublicCacheURL(normalizedURL) || isSiteIcon || isResourceCover)
+            && (!hasSensitiveImageHeaders(effectiveHeaders) || isSiteIcon || isResourceCover)
         let persistentID = persistToDisk ? persistentCacheID : nil
         if !persistToDisk, let persistentCacheID {
             removePersistentData(for: persistentCacheID)
@@ -104,7 +109,9 @@ actor RemoteImageDataCache {
         }
 
         let cachePolicy: URLRequest.CachePolicy = persistToDisk ? .returnCacheDataElseLoad : .reloadIgnoringLocalCacheData
-        var request = URLRequest(url: normalizedURL, cachePolicy: cachePolicy, timeoutInterval: 20)
+        // A failed tracker image must not stall every visible search card for
+        // twenty seconds before the next candidate can be attempted.
+        var request = URLRequest(url: normalizedURL, cachePolicy: cachePolicy, timeoutInterval: 8)
         request.setValue("image/avif,image/webp,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
         for (name, value) in effectiveHeaders {
             request.setValue(value, forHTTPHeaderField: name)
@@ -114,7 +121,10 @@ actor RemoteImageDataCache {
                 (200..<300).contains($0.statusCode)
             } ?? true
             let isNotHTML = !((cached.response.mimeType ?? "").lowercased().contains("html"))
-            if isSuccessful, isNotHTML, !cached.data.isEmpty {
+            let isPlaceholder = (cached.response as? HTTPURLResponse).map {
+                isRemoteImagePlaceholderResponse($0, data: cached.data, url: normalizedURL)
+            } ?? false
+            if isSuccessful, isNotHTML, !isPlaceholder, !cached.data.isEmpty {
                 if let persistentID {
                     storePersistentData(cached.data, for: persistentID)
                 }
@@ -137,9 +147,45 @@ actor RemoteImageDataCache {
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 throw APIError(statusCode: http.statusCode, message: "图片加载失败（\(http.statusCode)）")
             }
-            if let mimeType = (response as? HTTPURLResponse)?.mimeType?.lowercased(),
-               mimeType.contains("html") {
-                throw APIError(statusCode: 0, message: "图片服务返回了网页内容")
+            if let http = response as? HTTPURLResponse,
+               isRemoteImagePlaceholderResponse(http, data: data, url: normalizedURL) {
+                throw APIError(statusCode: 0, message: "图片代理返回了占位图")
+            }
+            let mimeType = (response as? HTTPURLResponse)?.mimeType?.lowercased() ?? ""
+            let bodyPrefix = String(data: data.prefix(512), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased() ?? ""
+            if let nestedImageURL = remoteImageURLFromResponse(data, baseURL: normalizedURL),
+               nestedImageURL != normalizedURL {
+                var forwardedHeaders = effectiveHeaders
+                if forwardedHeaders.keys.first(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) == nil {
+                    forwardedHeaders["Referer"] = normalizedURL.absoluteString
+                }
+                return try await self.data(
+                    for: nestedImageURL,
+                    headers: forwardedHeaders,
+                    persistentCacheID: persistentCacheID
+                )
+            }
+            if mimeType.contains("html") || bodyPrefix.hasPrefix("<!doctype html")
+                || bodyPrefix.hasPrefix("<html") || bodyPrefix.hasPrefix("<head") {
+                // A number of trackers protect their poster endpoint and return
+                // a small HTML page containing the real image URL. Follow the
+                // common OpenGraph/lazy-image values instead of treating that
+                // response as a hard image failure.
+                guard let imageURL = remoteImageURLFromHTML(data, baseURL: normalizedURL),
+                      imageURL != normalizedURL else {
+                    throw APIError(statusCode: 0, message: "图片服务返回了网页内容")
+                }
+                var forwardedHeaders = effectiveHeaders
+                if forwardedHeaders.keys.first(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) == nil {
+                    forwardedHeaders["Referer"] = normalizedURL.absoluteString
+                }
+                return try await self.data(
+                    for: imageURL,
+                    headers: forwardedHeaders,
+                    persistentCacheID: persistentCacheID
+                )
             }
             guard !data.isEmpty, data.count <= 20 * 1_024 * 1_024 else {
                 throw APIError(statusCode: 0, message: "图片数据无效")
@@ -201,8 +247,9 @@ actor RemoteImageDataCache {
         headers: [String: String]
     ) -> Data? {
         let isSiteIcon = isSiteIconCache(cacheID)
-        let canPersist = (isPublicCacheURL(requestURL) || isSiteIcon)
-            && (!hasSensitiveImageHeaders(headers) || isSiteIcon)
+        let isResourceCover = isResourceCoverCache(cacheID)
+        let canPersist = (isPublicCacheURL(requestURL) || isSiteIcon || isResourceCover)
+            && (!hasSensitiveImageHeaders(headers) || isSiteIcon || isResourceCover)
         guard canPersist else {
             removePersistentData(for: cacheID)
             return nil
@@ -280,6 +327,18 @@ actor RemoteImageDataCache {
         guard let cacheID else { return false }
         return cacheID.hasPrefix("site-icon|")
     }
+
+    private func isResourceCoverCache(_ cacheID: String?) -> Bool {
+        guard let cacheID else { return false }
+        return cacheID.hasPrefix("resource-cover|")
+    }
+
+    private func isBackendImageProxyURL(_ url: URL) -> Bool {
+        let path = url.path.lowercased()
+        return path.hasPrefix("/api/v1/site/image/")
+            || path.hasPrefix("/api/v1/media/image/")
+            || path.hasPrefix("/api/v1/system/image/")
+    }
 }
 
 private final class RemoteDecodedImageCache: @unchecked Sendable {
@@ -316,6 +375,33 @@ private func decodedRemoteDisplayImage(_ data: Data, maximumPixelSize: Int = 1_2
     }
     guard let decoded = UIImage(data: data) else { return nil }
     return decoded.preparingForDisplay() ?? decoded
+}
+
+private func isRemoteImagePlaceholderResponse(
+    _ response: HTTPURLResponse,
+    data: Data,
+    url: URL
+) -> Bool {
+    let path = url.path.lowercased()
+    guard path.hasPrefix("/api/v1/site/image/")
+            || path.hasPrefix("/api/v1/media/image/")
+            || path.hasPrefix("/api/v1/system/image/") else {
+        return false
+    }
+
+    // The backend uses no-cache headers for both successful proxy responses
+    // and its fallback image. Headers alone therefore cannot identify the
+    // placeholder; inspect the actual PNG dimensions and payload size instead.
+    // Harvest's fallback is a very small 200 x 280 PNG. Detect it even when an
+    // intermediary strips or changes the response headers.
+    guard data.count <= 2_048,
+          let source = CGImageSourceCreateWithData(data as CFData, nil),
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+          let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+        return false
+    }
+    return width == 200 && height == 280
 }
 
 private final class RemoteAnimatedImage: NSObject, @unchecked Sendable {
@@ -525,6 +611,107 @@ func normalizedRemoteImageURL(_ value: String) -> String {
         }
     }
     return normalized
+}
+
+private func remoteImageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
+    // Tracker pages are not consistently UTF-8. Lossy decoding still preserves
+    // ASCII attribute names and URLs, which are the only parts needed here.
+    let html = String(decoding: data, as: UTF8.self)
+    guard !html.isEmpty else { return nil }
+    let patterns = [
+        #"(?is)<meta[^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"'][^>]+content\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)<meta[^>]+content\s*=\s*[\"']([^\"']+)[\"'][^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"']"#,
+        #"(?is)<link[^>]+rel\s*=\s*[\"']image_src[\"'][^>]+href\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)<img[^>]+(?:class|id)\s*=\s*[\"'][^\"']*(?:poster|cover|torrentpic|screenshot)[^\"']*[\"'][^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb|srcset)\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb|srcset)\s*=\s*[\"']([^\"']+)[\"'][^>]+(?:class|id)\s*=\s*[\"'][^\"']*(?:poster|cover|torrentpic|screenshot)[^\"']*[\"']"#,
+        #"(?is)(?:data-poster|data-cover|data-image|data-preview)\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)[\"'](?:poster|poster_url|cover|cover_url|image|image_url)[\"']\s*:\s*[\"'](https?:\\?/\\?/[^\"']+)[\"']"#,
+        #"(?is)<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb)\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)background-image\s*:\s*url\(\s*[\"']?([^\"')\s]+)"#,
+        #"(?is)(?:srcset|data-srcset)\s*=\s*[\"']([^\"']+)[\"']"#
+    ]
+    for pattern in patterns {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        for match in expression.matches(in: html, range: range) {
+            guard match.numberOfRanges > 1,
+                  let valueRange = Range(match.range(at: 1), in: html) else { continue }
+            var value = String(html[valueRange])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&#x2F;", with: "/")
+                .replacingOccurrences(of: "&#47;", with: "/")
+                .replacingOccurrences(of: "\\/", with: "/")
+            // srcset stores density/width descriptors after each URL. The
+            // first source is sufficient for the compact resource card.
+            if value.contains(",") || value.range(of: #"\s(?:\d+(?:\.\d+)?x|\d+w)(?:\s|,|$)"#, options: .regularExpression) != nil {
+                if let firstSource = value.split(separator: ",", maxSplits: 1).first,
+                   let sourceURL = firstSource
+                    .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                    .first {
+                    value = String(sourceURL)
+                }
+            }
+            if value.hasPrefix("//") { value = "https:\(value)" }
+            guard !value.isEmpty,
+                  !value.lowercased().hasPrefix("data:") else { continue }
+            if let absolute = URL(string: value), ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
+                return absolute
+            }
+            if let relative = URL(string: value, relativeTo: baseURL)?.absoluteURL,
+               ["http", "https"].contains(relative.scheme?.lowercased() ?? "") {
+                return relative
+            }
+        }
+    }
+    return nil
+}
+
+private func remoteImageURLFromResponse(_ data: Data, baseURL: URL) -> URL? {
+    guard let object = try? JSONSerialization.jsonObject(data: data, options: [.fragmentsAllowed]) else {
+        return nil
+    }
+
+    func strings(_ value: Any, depth: Int = 0) -> [String] {
+        guard depth < 6 else { return [] }
+        if let text = value as? String {
+            let normalized = text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "&amp;", with: "&")
+                .replacingOccurrences(of: "\\/", with: "/")
+            if normalized.hasPrefix("<") {
+                return remoteImageURLFromHTML(Data(normalized.utf8), baseURL: baseURL)
+                    .map { [$0.absoluteString] } ?? []
+            }
+            return normalized.isEmpty ? [] : [normalized]
+        }
+        if let dictionary = value as? [String: Any] {
+            var result: [String] = []
+            for (key, nested) in dictionary {
+                let normalizedKey = key.lowercased()
+                if normalizedKey.contains("image") || normalizedKey.contains("poster")
+                    || normalizedKey.contains("cover") || normalizedKey.contains("thumb")
+                    || ["url", "src", "href", "path"].contains(normalizedKey) {
+                    result.append(contentsOf: strings(nested, depth: depth + 1))
+                } else if depth < 3 {
+                    result.append(contentsOf: strings(nested, depth: depth + 1))
+                }
+            }
+            return result
+        }
+        if let array = value as? [Any] {
+            return array.flatMap { strings($0, depth: depth + 1) }
+        }
+        return []
+    }
+
+    for value in strings(object) {
+        guard let url = URL(string: value),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { continue }
+        return url
+    }
+    return nil
 }
 
 func remoteImageHeaders(for url: URL?, additional: [String: String] = [:]) -> [String: String] {
@@ -1301,8 +1488,13 @@ struct MainShellView: View {
         appState.mediaTMDBEnabled || appState.mediaDoubanEnabled
     }
 
+    private var showsAdminTabs: Bool {
+        appState.profile?.isSuperuser == true
+            || (appState.isRestoringSession && appState.hasStoredSession)
+    }
+
     private var defaultContentTab: Int {
-        appState.profile?.isSuperuser == true ? 2 : 3
+        showsAdminTabs ? 2 : 3
     }
 
     var body: some View {
@@ -1416,6 +1608,12 @@ struct MainShellView: View {
                 lastNonSearchTab = defaultContentTab
             }
         }
+        .onChange(of: appState.profile?.isSuperuser) { _, isSuperuser in
+            guard isSuperuser != true,
+                  !appState.isRestoringSession,
+                  (appState.selectedTab == 1 || appState.selectedTab == 2) else { return }
+            appState.selectedTab = 3
+        }
         .onChange(of: appState.searchPresentationGeneration) { _, _ in
             appState.selectedTab = 5
         }
@@ -1434,7 +1632,7 @@ struct MainShellView: View {
             if showsNewsTab {
                 Tab("资讯", systemImage: "newspaper.fill", value: 0) { NewsView() }
             }
-            if appState.profile?.isSuperuser == true {
+            if showsAdminTabs {
                 Tab("站点", systemImage: "globe.asia.australia.fill", value: 1) { SitesView() }
                 Tab("仪表盘", systemImage: "chart.bar.xaxis", value: 2) { DashboardView() }
             }
@@ -1451,7 +1649,7 @@ struct MainShellView: View {
             if showsNewsTab {
                 NewsView().tabItem { Label("资讯", systemImage: "newspaper.fill") }.tag(0)
             }
-            if appState.profile?.isSuperuser == true {
+            if showsAdminTabs {
                 SitesView().tabItem { Label("站点", systemImage: "globe.asia.australia.fill") }.tag(1)
                 DashboardView().tabItem { Label("仪表盘", systemImage: "chart.bar.xaxis") }.tag(2)
             }
@@ -1472,7 +1670,7 @@ struct MainShellView: View {
     private func validContentTab(_ candidate: Int) -> Int {
         if candidate == 0, showsNewsTab { return candidate }
         if candidate == 3 { return candidate }
-        if appState.profile?.isSuperuser == true, (1...3).contains(candidate) { return candidate }
+        if showsAdminTabs, (1...3).contains(candidate) { return candidate }
         return defaultContentTab
     }
 }

@@ -1218,6 +1218,7 @@ final class SearchViewModel: ObservableObject {
     private var pendingResourceItems: [ResourceSearchListItem] = []
     private var resourceFlushTask: Task<Void, Never>?
     private var resourceProjectionTask: Task<Void, Never>?
+    private var sitesLoadInProgress = false
 
     init() {
         let defaults = UserDefaults.standard
@@ -1520,15 +1521,33 @@ final class SearchViewModel: ObservableObject {
     }
 
     func loadSites(_ appState: AppState) async {
-        do {
-            let raw = try await appState.api(APIPath.sites, timeoutInterval: 12)
-            sites = jsonRows(raw)
-                .map(SiteItem.init)
+        guard !sitesLoadInProgress else { return }
+        sitesLoadInProgress = true
+        defer { sitesLoadInProgress = false }
+
+        func publishSearchSites(_ values: [SiteItem]) {
+            sites = values
                 .filter { $0.enabled && $0.searchTorrents }
                 .sorted {
                     if $0.sortID != $1.sortID { return $0.sortID < $1.sortID }
                     return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 }
+        }
+
+        if sites.isEmpty {
+            publishSearchSites(SitesViewModel.cachedSitesSnapshot(for: appState.baseURL))
+        }
+        if sites.isEmpty, let cached = await appState.readSessionCache("site.info.list") {
+            publishSearchSites(jsonRows(cached.value).map(SiteItem.init))
+            // The search screen can use cached site identities immediately while
+            // this call continues to refresh labels and credentials.
+            await Task.yield()
+        }
+        do {
+            let raw = try await appState.api(APIPath.sites, timeoutInterval: 12)
+            let allSites = jsonRows(raw)
+            publishSearchSites(allSites.map(SiteItem.init))
+            await appState.writeSessionCache(allSites, name: "site.info.list")
         } catch {
             guard !isRequestCancellation(error) else { return }
             recordAppLog(.warning, "加载资源搜索站点失败：\(error.localizedDescription)")
@@ -1629,25 +1648,86 @@ final class SearchViewModel: ObservableObject {
         site(for: value)?.name ?? value
     }
 
+    func siteLabel(_ item: [String: Any]) -> String {
+        if let site = site(for: item) { return site.name }
+        return item.string(
+            "site_name", "siteName", "website_name", "websiteName", "nickname",
+            "site_code", "siteCode", "site", "site_id", "siteId"
+        ) ?? ""
+    }
+
     func site(for value: String) -> SiteItem? {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return sites.first {
-            String($0.id) == normalized
-                || $0.siteKey.caseInsensitiveCompare(normalized) == .orderedSame
-                || $0.name.caseInsensitiveCompare(normalized) == .orderedSame
+        let normalizedHost = URL(string: normalized)?.host?.lowercased() ?? ""
+        let normalizedNumericID = Int(normalized)
+        return sites.first { site in
+            String(site.id) == normalized
+                || (normalizedNumericID.map { $0 == site.id } ?? false)
+                || site.siteKey.caseInsensitiveCompare(normalized) == .orderedSame
+                || site.name.caseInsensitiveCompare(normalized) == .orderedSame
+                || (!normalizedHost.isEmpty && URL(string: site.url)?.host?.lowercased() == normalizedHost)
         }
     }
 
+    func site(for item: [String: Any]) -> SiteItem? {
+        var identities = [
+            item.string("site_id", "siteId"),
+            item.string("site_code", "siteCode"),
+            item.string("site_name", "siteName", "website_name", "websiteName"),
+            item.string("site", "website", "tracker", "source_name", "sourceName"),
+            item.string("site_url", "siteUrl", "website_url", "websiteUrl")
+        ].compactMap { $0 }
+        for key in ["site", "source", "website"] {
+            if let nested = item.dict(key) {
+                identities.append(contentsOf: [
+                    nested.string("id", "site_id", "siteId"),
+                    nested.string("code", "site_code", "siteCode"),
+                    nested.string("name", "site", "nickname", "title", "tracker"),
+                    nested.string("url", "base_url", "baseUrl", "mirror")
+                ].compactMap { $0 })
+            }
+        }
+        for identity in identities where !identity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let site = site(for: identity) { return site }
+        }
+        return nil
+    }
+
     func resourceSiteValue(_ item: [String: Any]) -> String {
-        item.string("site_id", "siteId", "site", "site_name", "siteName") ?? ""
+        if let direct = item.string(
+            "site_id", "siteId", "site", "site_name", "siteName",
+            "site_code", "siteCode", "website", "website_name", "websiteName",
+            "tracker", "source_name", "sourceName"
+        ), !direct.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return direct
+        }
+        for key in ["site", "source", "website"] {
+            let nested: [String: Any]
+            if let value = item[key] as? [String: Any] {
+                nested = value
+            } else if let value = item[key] as? [AnyHashable: Any] {
+                nested = value.reduce(into: [String: Any]()) { result, entry in
+                    if let key = entry.key as? String { result[key] = entry.value }
+                }
+            } else {
+                continue
+            }
+            if let value = nested.string(
+                "id", "site_id", "siteId", "site_code", "siteCode", "name", "site",
+                "nickname", "title", "tracker"
+            ), !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return value
+            }
+        }
+        return ""
     }
 
     func resourceTitle(_ item: [String: Any]) -> String {
-        item.string("title", "name") ?? ""
+        item.string("title", "name", "torrent_title", "torrentTitle") ?? ""
     }
 
     func resourceSubtitle(_ item: [String: Any]) -> String {
-        item.string("subtitle", "sub_title", "description") ?? ""
+        item.string("subtitle", "sub_title", "description", "desc") ?? ""
     }
 
     func resourceSaleValue(_ item: [String: Any]) -> String {
@@ -1660,11 +1740,11 @@ final class SearchViewModel: ObservableObject {
     }
 
     func resourceTagValues(_ item: [String: Any]) -> [String] {
-        let direct = item.strings("tags")
+        let direct = item.strings("tags", "labels")
         if !direct.isEmpty {
             return direct.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         }
-        guard let text = item.string("tags"), !text.isEmpty else { return [] }
+        guard let text = item.string("tags", "labels"), !text.isEmpty else { return [] }
         return text.components(separatedBy: CharacterSet(charactersIn: ",，#"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -1679,11 +1759,15 @@ final class SearchViewModel: ObservableObject {
     }
 
     func resourceLeechers(_ item: [String: Any]) -> Int {
-        item.int("leechers", "leecher", "leech") ?? Int(item.string("leechers", "leecher", "leech") ?? "") ?? 0
+        item.int("leechers", "leecher", "leech", "peers", "peer")
+            ?? Int(item.string("leechers", "leecher", "leech", "peers", "peer") ?? "")
+            ?? 0
     }
 
     func resourceCompleters(_ item: [String: Any]) -> Int {
-        item.int("completers", "completed", "snatched") ?? Int(item.string("completers", "completed", "snatched") ?? "") ?? 0
+        item.int("completers", "completed", "snatched", "grabs", "grab")
+            ?? Int(item.string("completers", "completed", "snatched", "grabs", "grab") ?? "")
+            ?? 0
     }
 
     func resourceSize(_ item: [String: Any]) -> Double {
@@ -1703,7 +1787,7 @@ final class SearchViewModel: ObservableObject {
     }
 
     func resourcePublished(_ item: [String: Any]) -> String {
-        item.string("published", "pubdate", "created_at", "date") ?? ""
+        item.string("published", "pubdate", "pubDate", "created_at", "createdAt", "date") ?? ""
     }
 
     func resourceResolutionValues(_ item: [String: Any]) -> [String] {
@@ -1895,7 +1979,7 @@ final class SearchViewModel: ObservableObject {
         let parts = [
             resourceSiteValue(item),
             item.string("id", "torrent_id", "torrentId", "tid", "hash", "info_hash", "infoHash") ?? "",
-            item.string("download_url", "downloadUrl", "details_url", "detail_url", "url", "link") ?? "",
+            item.string("download_url", "downloadUrl", "enclosure", "details_url", "detail_url", "pageUrl", "page_url", "url", "link") ?? "",
             resourceTitle(item),
             resourceSubtitle(item),
             item.string("size", "length", "size_bytes", "sizeBytes") ?? "",
@@ -1969,7 +2053,7 @@ private func resourceSiteBaseURL(_ site: SiteItem?) -> URL? {
 
 private func resourceItemBaseURL(_ item: [String: Any], site: SiteItem?) -> URL? {
     if let siteURL = resourceSiteBaseURL(site) { return siteURL }
-    let baseKeys = ["site_url", "siteUrl", "base_url", "baseUrl", "mirror", "origin", "url"]
+    let baseKeys = ["site_url", "siteUrl", "base_url", "baseUrl", "mirror", "origin", "url", "website_url", "websiteUrl"]
     for key in baseKeys {
         if let value = item.string(key), let url = resourceResolvedURL(value, relativeTo: nil) {
             return url
@@ -1984,7 +2068,10 @@ private func resourceItemBaseURL(_ item: [String: Any], site: SiteItem?) -> URL?
             }
         }
     }
-    if let detail = item.string("detail_url", "detailUrl", "details_url", "detailsUrl"),
+    if let detail = item.string(
+        "detail_url", "detailUrl", "details_url", "detailsUrl", "detail", "details",
+        "page_url", "pageUrl", "torrent_url", "torrentUrl", "href"
+    ),
        let detailURL = resourceResolvedURL(detail, relativeTo: nil) {
         var components = URLComponents(url: detailURL, resolvingAgainstBaseURL: false)
         let path = components?.path ?? ""
@@ -2024,13 +2111,192 @@ private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?, it
     return relative
 }
 
+private func resourceBackendBaseURL(_ appState: AppState) -> URL? {
+    var value = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    while value.hasSuffix("/") { value.removeLast() }
+    guard !value.isEmpty else { return nil }
+    if value.hasPrefix("//") { value = "https:\(value)" }
+    else if URL(string: value)?.scheme == nil { value = "https://\(value)" }
+    guard var url = URL(string: value) else { return nil }
+    if !url.absoluteString.hasSuffix("/") { url.appendPathComponent("") }
+    return url
+}
+
+private func resourceSiteCode(_ item: [String: Any], site: SiteItem?) -> String? {
+    if let siteCode = site?.siteKey.trimmingCharacters(in: .whitespacesAndNewlines),
+       !siteCode.isEmpty {
+        return siteCode
+    }
+    let explicitValues = [
+        item.string("site_code", "siteCode", "website_code", "websiteCode"),
+        item.dict("site", "source", "website")?.string("code", "site_code", "siteCode", "name", "site")
+    ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+    if let explicit = explicitValues.first(where: { !$0.isEmpty }) { return explicit }
+
+    // The legacy `/api/mysite/search` response declares site_id as a string.
+    // Most servers return a numeric account-site ID, while some return the
+    // tracker code directly. Numeric values must be resolved through SiteItem;
+    // textual values are already valid proxy/icon identities.
+    for value in [
+        item.string("site_id", "siteId"),
+        item.string("site", "website", "tracker")
+    ] {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !normalized.isEmpty, Int(normalized) == nil { return normalized }
+    }
+    return nil
+}
+
+@MainActor
+private func resourceCachedSite(
+    _ item: [String: Any],
+    site: SiteItem?,
+    appState: AppState
+) -> SiteItem? {
+    if let site { return site }
+    let identities = [
+        item.string("site_id", "siteId"),
+        item.string("site_code", "siteCode"),
+        item.string("site_name", "siteName", "website_name", "websiteName"),
+        item.string("site", "website", "tracker")
+    ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+    guard !identities.isEmpty else { return nil }
+    let cachedSites = SitesViewModel.cachedSitesSnapshot(for: appState.baseURL)
+    return cachedSites.first { candidate in
+        identities.contains { identity in
+            String(candidate.id) == identity
+                || candidate.siteKey.caseInsensitiveCompare(identity) == .orderedSame
+                || candidate.name.caseInsensitiveCompare(identity) == .orderedSame
+        }
+    }
+}
+
+private func resourceImageResolvedURL(
+    _ value: String,
+    relativeTo site: SiteItem?,
+    item: [String: Any]? = nil,
+    appState: AppState
+) -> URL? {
+    let normalized = value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "\\/", with: "/")
+    let pathCandidate = normalized.lowercased().hasPrefix("api/v1/") ? "/\(normalized)" : normalized
+    let parsedURL = URL(string: pathCandidate)
+    let path = parsedURL?.path.lowercased() ?? pathCandidate.lowercased()
+    let isHarvestImagePath = path.hasPrefix("/api/v1/site/image/")
+        || path.hasPrefix("/api/v1/media/image/")
+        || path.hasPrefix("/api/v1/system/image/")
+    if isHarvestImagePath, let backendBaseURL = resourceBackendBaseURL(appState) {
+        // The server may serialize an internal hostname (for example
+        // 127.0.0.1 or a Docker service name). Always anchor proxy paths to
+        // the externally configured Harvest base URL while preserving query
+        // parameters used by the system-image endpoint.
+        if var components = parsedURL.flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) }),
+           let baseComponents = URLComponents(url: backendBaseURL, resolvingAgainstBaseURL: false) {
+            components.scheme = baseComponents.scheme
+            components.host = baseComponents.host
+            components.port = baseComponents.port
+            components.user = nil
+            components.password = nil
+            if let url = components.url { return url }
+        }
+        if let url = URL(string: pathCandidate, relativeTo: backendBaseURL)?.absoluteURL,
+           ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            return url
+        }
+    }
+    return resourceResolvedURL(normalized, relativeTo: site, item: item)
+}
+
+private func resourceSiteImageProxyURL(
+    _ value: String,
+    site: SiteItem?,
+    item: [String: Any],
+    appState: AppState
+) -> URL? {
+    let normalized = value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "\\/", with: "/")
+    guard let sourceURL = URL(string: normalized),
+          ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? "") else { return nil }
+    let sourcePath = sourceURL.path.lowercased()
+    guard !sourcePath.hasPrefix("/api/v1/site/image/") else { return nil }
+    var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    while server.hasSuffix("/") { server.removeLast() }
+    guard !server.isEmpty else { return nil }
+    guard let siteCode = resourceSiteCode(item, site: site) else { return nil }
+    let encodedURL = Data(normalized.utf8)
+        .base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+    guard let encodedSite = urlPathSegment(siteCode).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+          let baseURL = URL(string: server),
+          let proxyURL = URL(string: "/api/v1/site/image/\(encodedSite)/\(encodedURL)", relativeTo: baseURL)?.absoluteURL else {
+        return nil
+    }
+    return proxyURL
+}
+
+private func resourceDecodedImageProxyURL(_ url: URL) -> URL? {
+    let path = url.path
+    let lowercasedPath = path.lowercased()
+    guard lowercasedPath.hasPrefix("/api/v1/site/image/")
+            || lowercasedPath.hasPrefix("/api/v1/media/image/")
+            || lowercasedPath.hasPrefix("/api/v1/system/image/") else {
+        return nil
+    }
+    guard let encoded = path.split(separator: "/", omittingEmptySubsequences: true).last else {
+        return nil
+    }
+    var base64 = String(encoded).removingPercentEncoding ?? String(encoded)
+    base64 = base64
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+    let padding = base64.count % 4
+    if padding != 0 { base64 += String(repeating: "=", count: 4 - padding) }
+    guard let data = Data(base64Encoded: base64),
+          let value = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          let decodedURL = URL(string: value),
+          ["http", "https"].contains(decodedURL.scheme?.lowercased() ?? "") else {
+        return nil
+    }
+    return decodedURL
+}
+
 private func resourceImageStrings(_ value: Any?, depth: Int = 0) -> [String] {
     guard depth < 5 else { return [] }
     if let value = value as? String {
         var normalized = value
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#x2F;", with: "/")
+            .replacingOccurrences(of: "&#47;", with: "/")
             .replacingOccurrences(of: "\\/", with: "/")
+        if ["null", "none", "nil", "undefined", "-", "0"].contains(normalized.lowercased()) {
+            return []
+        }
+        let placeholderTokens = ["no-image", "no_image", "noimage", "noposter", "no-poster", "placeholder", "default-cover", "default_cover"]
+        if placeholderTokens.contains(where: { normalized.lowercased().contains($0) }) {
+            return []
+        }
+        if normalized.hasPrefix("data:image/") { return [] }
+        // Some API serializers return poster metadata as a JSON string rather
+        // than an object/array. Decode it before treating it as a URL.
+        if let first = normalized.first,
+           (first == "{" || first == "["),
+           let jsonData = normalized.data(using: .utf8),
+           let decoded = try? JSONSerialization.jsonObject(with: jsonData, options: [.fragmentsAllowed]) {
+            return resourceImageStrings(decoded, depth: depth + 1)
+        }
+        if let decoded = normalized.removingPercentEncoding,
+           decoded != normalized,
+           (decoded.hasPrefix("http") || decoded.hasPrefix("//") || decoded.hasPrefix("/")) {
+            normalized = decoded
+        }
         if normalized.lowercased().hasPrefix("url("), normalized.hasSuffix(")") {
             normalized = String(normalized.dropFirst(4).dropLast())
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2046,17 +2312,56 @@ private func resourceImageStrings(_ value: Any?, depth: Int = 0) -> [String] {
                 return candidate.isEmpty ? nil : candidate
             }
         }
+        // A few tracker parsers return a style attribute rather than the
+        // extracted URL. Keep the image URL, not the CSS declaration itself.
+        if normalized.lowercased().contains("background-image") {
+            let pattern = #"(?i)url\(\s*[\"']?([^\"')\s]+)[\"']?\s*\)"#
+            if let expression = try? NSRegularExpression(pattern: pattern),
+               let match = expression.firstMatch(
+                    in: normalized,
+                    range: NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+               ),
+               match.numberOfRanges > 1,
+               let capture = Range(match.range(at: 1), in: normalized) {
+                return resourceImageStrings(String(normalized[capture]), depth: depth + 1)
+            }
+        }
+        // Some site parsers return the complete image element instead of its
+        // src attribute. Extract every common lazy-loading attribute before
+        // falling back to the raw value.
+        if normalized.contains("<") {
+            let pattern = #"(?i)(?:src|data-src|data-original|data-lazy-src|data-image|data-thumb|href)\s*=\s*[\"']([^\"']+)[\"']"#
+            let range = NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)
+            let extracted = (try? NSRegularExpression(pattern: pattern))?.matches(in: normalized, range: range).compactMap {
+                guard $0.numberOfRanges > 1, let capture = Range($0.range(at: 1), in: normalized) else { return nil }
+                return String(normalized[capture])
+            } ?? []
+            if !extracted.isEmpty { return extracted.flatMap { resourceImageStrings($0, depth: depth + 1) } }
+        }
         return normalized.isEmpty ? [] : [normalized]
     }
     if let dictionary = value as? [String: Any] {
         var values: [String] = []
         for key in [
             "url", "src", "href", "large", "normal", "medium", "small", "original",
-            "path", "file", "srcset", "source", "value", "@src"
+            "path", "file", "srcset", "source", "value", "@src",
+            "image_url", "imageUrl", "poster_url", "posterUrl", "cover_url", "coverUrl",
+            "data-src", "data-original", "data-lazy-src", "data-thumb", "content"
         ] {
             values.append(contentsOf: resourceImageStrings(dictionary[key], depth: depth + 1))
         }
+        for (key, nestedValue) in dictionary where key.lowercased().contains("image") || key.lowercased().contains("poster") || key.lowercased().contains("cover") {
+            values.append(contentsOf: resourceImageStrings(nestedValue, depth: depth + 1))
+        }
         return values
+    }
+    if let dictionary = value as? [AnyHashable: Any] {
+        return resourceImageStrings(
+            dictionary.reduce(into: [String: Any]()) { result, entry in
+                if let key = entry.key as? String { result[key] = entry.value }
+            },
+            depth: depth + 1
+        )
     }
     if let values = value as? [Any] {
         return values.flatMap { resourceImageStrings($0, depth: depth + 1) }
@@ -2067,11 +2372,15 @@ private func resourceImageStrings(_ value: Any?, depth: Int = 0) -> [String] {
 private func resourceImageValues(_ item: [String: Any], depth: Int = 0) -> [String] {
     guard depth < 5 else { return [] }
     let keys = [
-        "poster", "poster_url", "posterUrl", "torrent_poster", "torrentPoster",
+        "poster", "poster_url", "posterUrl", "poster_path", "posterPath",
+        "poster_proxy", "posterProxy", "poster_gif", "posterGif",
+        "poster_gif_proxy", "posterGifProxy",
+        "torrent_poster", "torrentPoster",
         "torrent_poster_url", "torrentPosterUrl", "cover", "cover_url", "coverUrl",
-        "cover_image", "coverImage", "thumbnail", "thumbnail_url", "thumbnailUrl",
+        "cover_proxy", "coverProxy", "cover_gif", "coverGif", "cover_gif_proxy", "coverGifProxy",
+        "cover_image", "coverImage", "cover_path", "coverPath", "thumbnail", "thumbnail_url", "thumbnailUrl",
         "pic", "image", "image_url", "imageUrl", "img", "images", "photos",
-        "poster_path", "cover_path", "thumbnail_path"
+        "thumb", "icon", "logo", "thumbnail_path", "thumbnailPath"
     ]
     var values = keys.flatMap { resourceImageStrings(item[$0]) }
     for (key, value) in item {
@@ -2082,28 +2391,213 @@ private func resourceImageValues(_ item: [String: Any], depth: Int = 0) -> [Stri
             values.append(contentsOf: resourceImageStrings(value))
         }
     }
-    for key in ["torrent", "detail", "data", "result", "site", "source"] {
+    // Keep the same permissive image fallback used by the media decoder. This
+    // covers API rows where the poster is exposed under an uncommon key.
+    let mediaFallback = mediaImageValue(item)
+    if !mediaFallback.isEmpty { values.append(mediaFallback) }
+    for key in [
+        "torrent", "detail", "details", "data", "result", "site", "source",
+        "metadata", "meta", "media", "tmdb", "tmdb_media", "tmdbMedia"
+    ] {
         if let nested = item[key] as? [String: Any] {
             values.append(contentsOf: resourceImageValues(nested, depth: depth + 1))
+        } else if let nested = item[key] as? [AnyHashable: Any] {
+            let converted = nested.reduce(into: [String: Any]()) { result, entry in
+                if let key = entry.key as? String { result[key] = entry.value }
+            }
+            values.append(contentsOf: resourceImageValues(converted, depth: depth + 1))
         }
     }
     var seen = Set<String>()
     return values.filter { seen.insert($0).inserted }
 }
 
-private func resourceImageCandidates(_ item: [String: Any], site: SiteItem?) -> [RemoteImageCandidate] {
-    var candidates: [RemoteImageCandidate] = []
-    var seen = Set<String>()
-    for value in resourceImageValues(item) {
-        guard let url = resourceResolvedURL(value, relativeTo: site, item: item) else { continue }
-        var urls = [url]
-        if let scheme = url.scheme?.lowercased(), let alternateScheme = scheme == "https" ? "http" : (scheme == "http" ? "https" : nil),
-           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-            components.scheme = alternateScheme
-            if let alternateURL = components.url { urls.append(alternateURL) }
+private func resourceMetadataImageValues(_ item: [String: Any]) -> [String] {
+    var values: [String] = []
+    for key in ["tmdbMedia", "tmdb_media", "tmdb"] {
+        guard let media = item.dict(key) else { continue }
+        for rawValue in resourceImageStrings(
+            media["poster"] ?? media["posterPath"] ?? media["poster_path"]
+        ) {
+            let value = mediaPosterURL(rawValue, source: "TMDB")
+            if !value.isEmpty { values.append(value) }
         }
-        for candidateURL in urls {
-            let useCredentials = candidateURL.scheme?.lowercased() == url.scheme?.lowercased()
+    }
+    for key in ["doubanMedia", "douban_media", "douban"] {
+        guard let media = item.dict(key) else { continue }
+        for rawValue in resourceImageStrings(
+            media["poster"] ?? media["cover"] ?? media["coverUrl"] ?? media["cover_url"]
+        ) {
+            let value = mediaPosterURL(rawValue, source: "豆瓣")
+            if !value.isEmpty { values.append(value) }
+        }
+    }
+    var seen = Set<String>()
+    return values.filter { seen.insert($0).inserted }
+}
+
+@MainActor
+private func resourceImageCandidates(
+    _ item: [String: Any],
+    site providedSite: SiteItem?,
+    appState: AppState
+) -> [RemoteImageCandidate] {
+    // Search rows can arrive before the account site list finishes loading.
+    // Resolve numeric site_id values from the persisted site snapshot so the
+    // image proxy still receives the real site code on the first render.
+    let site = resourceCachedSite(item, site: providedSite, appState: appState)
+    var candidates: [RemoteImageCandidate] = []
+    var fallbackCandidates: [RemoteImageCandidate] = []
+    var seen = Set<String>()
+
+    func appendCandidate(
+        _ url: URL,
+        headers: [String: String],
+        persistentCacheID: String? = nil,
+        fallback: Bool = false
+    ) {
+        let candidate = RemoteImageCandidate(
+            url: url,
+            headers: headers,
+            persistentCacheID: persistentCacheID
+        )
+        guard seen.insert(candidate.id).inserted else { return }
+        if fallback { fallbackCandidates.append(candidate) }
+        else { candidates.append(candidate) }
+    }
+
+    func coverCacheID(_ url: URL) -> String {
+        let siteIdentity = (site?.siteKey ?? resourceSiteCode(item, site: nil) ?? resourceSiteValueForCache(item))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return "resource-cover|\(siteIdentity)|\(url.absoluteString)"
+    }
+
+    // TMDB poster values are commonly path-only (for example /abc.jpg). They
+    // must be resolved against the TMDB image CDN instead of the tracker host.
+    for value in resourceMetadataImageValues(item) {
+        guard let url = URL(string: normalizedRemoteImageURL(value)) else { continue }
+        appendCandidate(
+            url,
+            headers: mediaImageHeaders(source: value.contains("douban") ? "豆瓣" : "TMDB", raw: item),
+            persistentCacheID: "resource-cover|\(url.absoluteString)"
+        )
+    }
+
+    // Use the cover returned by the search response first. A detail page can
+    // take several seconds (or require a tracker login); putting it first made
+    // every visible card look like a placeholder while those HTML requests
+    // occupied the image session. The detail page remains a reliable fallback
+    // for trackers that only expose the poster in their HTML.
+    // The legacy `/api/mysite/search` contract calls this field exactly
+    // `poster`. Handle it explicitly before the permissive recursive extractor
+    // so a relative poster can use the resolved site's URL and Cookie without
+    // being hidden behind a failed proxy candidate.
+    let explicitPosterValues = [
+        "poster", "poster_url", "posterUrl", "poster_gif", "posterGif",
+        "cover", "cover_url", "coverUrl"
+    ].flatMap { resourceImageStrings(item[$0]) }
+    for value in explicitPosterValues {
+        guard let url = resourceImageResolvedURL(value, relativeTo: site, item: item, appState: appState) else { continue }
+        let path = url.path.lowercased()
+        let isBackendImageProxy = path.hasPrefix("/api/v1/site/image/")
+            || path.hasPrefix("/api/v1/media/image/")
+            || path.hasPrefix("/api/v1/system/image/")
+        var urls: [(url: URL, fallback: Bool)] = [(url, false)]
+        if !isBackendImageProxy,
+           let proxyURL = resourceSiteImageProxyURL(
+                url.absoluteString,
+                site: site,
+                item: item,
+                appState: appState
+           ), proxyURL != url {
+            // A client-built proxy URL may not yet be present in the server's
+            // image whitelist. Keep it as a fallback after the authenticated
+            // tracker request; proxy URLs returned by the server stay first.
+            urls.append((proxyURL, true))
+        }
+        for entry in urls {
+            let candidateURL = entry.url
+            let candidatePath = candidateURL.path.lowercased()
+            let candidateIsBackendImageProxy = candidatePath.hasPrefix("/api/v1/site/image/")
+                || candidatePath.hasPrefix("/api/v1/media/image/")
+                || candidatePath.hasPrefix("/api/v1/system/image/")
+            let authenticatedHeaders = resourceImageHeaders(
+                for: candidateURL,
+                item: item,
+                site: site,
+                includeSiteCredentials: !candidateIsBackendImageProxy,
+                includeItemCredentials: !candidateIsBackendImageProxy
+            )
+            let publicHeaders = resourceImageHeaders(
+                for: candidateURL,
+                item: item,
+                site: site,
+                includeSiteCredentials: false,
+                includeItemCredentials: false
+            )
+            if candidateIsBackendImageProxy {
+                appendCandidate(
+                    candidateURL,
+                    headers: publicHeaders,
+                    persistentCacheID: coverCacheID(candidateURL),
+                    fallback: entry.fallback
+                )
+            } else {
+                appendCandidate(
+                    candidateURL,
+                    headers: authenticatedHeaders,
+                    persistentCacheID: coverCacheID(candidateURL),
+                    fallback: entry.fallback
+                )
+                if authenticatedHeaders != publicHeaders {
+                    appendCandidate(
+                        candidateURL,
+                        headers: publicHeaders,
+                        persistentCacheID: coverCacheID(candidateURL),
+                        fallback: true
+                    )
+                }
+            }
+        }
+    }
+
+    for value in resourceImageValues(item) {
+        // The backend normally returns a server-proxied cover. Resolve that
+        // path against the Harvest server; resolving it against the tracker
+        // host produces a valid-looking but unusable URL.
+        guard let url = resourceImageResolvedURL(value, relativeTo: site, item: item, appState: appState) else { continue }
+        var urls: [URL] = []
+        let sourcePath = url.path.lowercased()
+        let isBackendImageProxy = sourcePath.hasPrefix("/api/v1/site/image/")
+            || sourcePath.hasPrefix("/api/v1/media/image/")
+            || sourcePath.hasPrefix("/api/v1/system/image/")
+        if isBackendImageProxy {
+            // Harvest's site proxy does not forward the tracker Cookie. The
+            // original image URL is embedded in the proxy path, so recover it
+            // and keep it as a credentialed fallback. The public proxy remains
+            // first because it can use the server-side image cache and proxy.
+            urls.append(url)
+            if let decodedURL = resourceDecodedImageProxyURL(url), decodedURL != url {
+                urls.append(decodedURL)
+            }
+        } else {
+            urls.append(url)
+            if let proxyURL = resourceSiteImageProxyURL(
+                url.absoluteString,
+                site: site,
+                item: item,
+                appState: appState
+            ), proxyURL != url {
+                urls.append(proxyURL)
+            }
+        }
+        for (candidateIndex, candidateURL) in urls.enumerated() {
+            let candidatePath = candidateURL.path.lowercased()
+            let candidateIsBackendImageProxy = candidatePath.hasPrefix("/api/v1/site/image/")
+                || candidatePath.hasPrefix("/api/v1/media/image/")
+                || candidatePath.hasPrefix("/api/v1/system/image/")
+            let useCredentials = !candidateIsBackendImageProxy
             let authenticatedHeaders = resourceImageHeaders(
                 for: candidateURL,
                 item: item,
@@ -2118,18 +2612,155 @@ private func resourceImageCandidates(_ item: [String: Any], site: SiteItem?) -> 
                 includeSiteCredentials: false,
                 includeItemCredentials: false
             )
-            let variants: [([String: String], String?)] = [
-                (authenticatedHeaders, nil),
-                (publicHeaders, "resource-cover|\(candidateURL.absoluteString)")
-            ]
-            for (headers, persistentID) in variants {
-                let key = remoteImageCacheKey(url: candidateURL, headers: headers)
-                guard seen.insert(key).inserted else { continue }
-                candidates.append(RemoteImageCandidate(
-                    url: candidateURL,
-                    headers: headers,
-                    persistentCacheID: persistentID
-                ))
+            if candidateIsBackendImageProxy {
+                // Image proxy routes are public. Avoid adding Authorization:
+                // doing so forced the shared loader onto its private session
+                // and prevented successful covers from being persisted.
+                appendCandidate(
+                    candidateURL,
+                    headers: publicHeaders,
+                    persistentCacheID: coverCacheID(candidateURL),
+                    fallback: !isBackendImageProxy && candidateIndex > 0
+                )
+            } else {
+                appendCandidate(
+                    candidateURL,
+                    headers: authenticatedHeaders,
+                    persistentCacheID: coverCacheID(candidateURL)
+                )
+                if authenticatedHeaders != publicHeaders {
+                    appendCandidate(
+                        candidateURL,
+                        headers: publicHeaders,
+                        persistentCacheID: coverCacheID(candidateURL),
+                        fallback: true
+                    )
+                }
+            }
+        }
+    }
+    if let detailURL = resourceDetailURL(item, site: site) {
+        let headers = resourceImageHeaders(
+            for: detailURL,
+            item: item,
+            site: site,
+            includeSiteCredentials: true,
+            includeItemCredentials: true
+        )
+        let candidate = RemoteImageCandidate(url: detailURL, headers: headers)
+        if seen.insert(candidate.id).inserted { fallbackCandidates.append(candidate) }
+    }
+    // When a tracker only exposes the poster in its detail document, let the
+    // shared image loader extract og:image/lazy <img> URLs from that document.
+    candidates.append(contentsOf: fallbackCandidates)
+    // If a site does not expose a torrent poster, keep the card visual instead
+    // of showing a blank placeholder by falling back to the site's own icon.
+    if let site {
+        for iconCandidate in resourceSiteIconCandidates(item, site: site, appState: appState) {
+            if seen.insert(iconCandidate.id).inserted { candidates.append(iconCandidate) }
+        }
+    } else if let nestedSite = item.dict("site", "source") {
+        let iconValue = nestedSite.string(
+            "icon", "logo", "favicon", "icon_url", "iconUrl", "logo_url", "logoUrl"
+        ) ?? ""
+        if let iconURL = resourceResolvedURL(iconValue, relativeTo: nil, item: item) {
+            let iconCandidate = RemoteImageCandidate(
+                url: iconURL,
+                headers: resourceImageHeaders(
+                    for: iconURL,
+                    item: item,
+                    site: nil,
+                    includeSiteCredentials: false,
+                    includeItemCredentials: false
+                ),
+                persistentCacheID: "site-icon|\(iconURL.absoluteString)"
+            )
+            if seen.insert(iconCandidate.id).inserted { candidates.append(iconCandidate) }
+        }
+    }
+    return candidates
+}
+
+private func resourceSiteValueForCache(_ item: [String: Any]) -> String {
+    item.string(
+        "site_id", "siteId", "site_code", "siteCode", "site", "site_name", "siteName",
+        "website", "website_name", "websiteName", "tracker", "source_name", "sourceName"
+    ) ?? "unknown"
+}
+
+private func resourceSiteIconCandidates(
+    _ item: [String: Any],
+    site: SiteItem?,
+    appState: AppState
+) -> [RemoteImageCandidate] {
+    var candidates: [RemoteImageCandidate] = []
+    var seen = Set<String>()
+
+    func append(_ url: URL, headers: [String: String] = [:]) {
+        let candidate = RemoteImageCandidate(
+            url: url,
+            headers: headers,
+            persistentCacheID: "site-icon|\(url.absoluteString)"
+        )
+        if seen.insert(candidate.id).inserted { candidates.append(candidate) }
+    }
+
+    if let site {
+        let iconValue = site.iconURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = resourceResolvedURL(iconValue, relativeTo: site) {
+            append(url, headers: resourceImageHeaders(
+                for: url,
+                item: item,
+                site: site,
+                includeSiteCredentials: false,
+                includeItemCredentials: false
+            ))
+        }
+
+        var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while server.hasSuffix("/") { server.removeLast() }
+        let siteName = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !server.isEmpty, !siteName.isEmpty, let serverURL = URL(string: server + "/") {
+            let headers = appState.accessToken.isEmpty
+                ? [:]
+                : ["Authorization": "Bearer \(appState.accessToken)"]
+            if let url = URL(
+                string: "static/site_favicon/\(urlPathSegment(siteName)).png",
+                relativeTo: serverURL
+            )?.absoluteURL {
+                append(url)
+            }
+            for fileExtension in ["gif", "png", "jpg", "jpeg", "webp", "ico"] {
+                let path = "local/icons/\(urlPathSegment(siteName)).\(fileExtension)"
+                if let url = URL(string: path, relativeTo: serverURL)?.absoluteURL {
+                    append(url, headers: headers)
+                }
+            }
+        }
+        if let favicon = resourceSiteBaseURL(site)?.appendingPathComponent("favicon.ico") {
+            append(favicon)
+        }
+    } else if let nestedSite = item.dict("site", "source") {
+        let iconValue = nestedSite.string(
+            "icon", "logo", "favicon", "icon_url", "iconUrl", "logo_url", "logoUrl"
+        ) ?? ""
+        if let url = resourceResolvedURL(iconValue, relativeTo: nil, item: item) {
+            append(url)
+        }
+    } else if let siteValue = resourceSiteCode(item, site: nil) {
+        // Resource SSE rows commonly carry only site_id. Use the server's
+        // persisted icon path as an immediate visual fallback while the full
+        // site list is still being hydrated.
+        var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while server.hasSuffix("/") { server.removeLast() }
+        if !server.isEmpty, let serverURL = URL(string: server + "/") {
+            let headers = appState.accessToken.isEmpty
+                ? [:]
+                : ["Authorization": "Bearer \(appState.accessToken)"]
+            for fileExtension in ["gif", "png", "jpg", "jpeg", "webp", "ico"] {
+                if let url = URL(string: "local/icons/\(urlPathSegment(siteValue)).\(fileExtension)", relativeTo: serverURL)?.absoluteURL {
+                    append(url, headers: headers)
+                }
             }
         }
     }
@@ -2138,8 +2769,9 @@ private func resourceImageCandidates(_ item: [String: Any], site: SiteItem?) -> 
 
 private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
     let value = item.string(
-        "detail_url", "detailUrl", "details_url", "detailsUrl",
-        "torrent_detail_url", "torrentDetailUrl", "url", "link"
+        "detail_url", "detailUrl", "details_url", "detailsUrl", "detail", "details",
+        "torrent_detail_url", "torrentDetailUrl", "torrent_url", "torrentUrl",
+        "page_url", "pageUrl", "url", "link", "href"
     ) ?? ""
     return resourceResolvedURL(value, relativeTo: site, item: item)
 }
@@ -2356,10 +2988,11 @@ struct SearchView: View {
                         }
                     } else {
                         ForEach(model.displayedResourceItems) { item in
-                            let site = model.site(for: item.siteValue)
+                            let site = model.site(for: item.value)
+                            let siteRenderKey = "\(item.id)|\(site?.id ?? -1)|\(site?.siteKey ?? "")|\(site?.url ?? "")|\(site?.cookie.isEmpty == false ? "auth" : "public")"
                             ResourceResultRow(
                                 item: item.value,
-                                siteLabel: model.siteLabel(item.siteValue),
+                                siteLabel: model.siteLabel(item.value),
                                 site: site,
                                 onTap: {
                                     selectedResource = ResourceSelection(value: item.value, site: site)
@@ -2368,6 +3001,7 @@ struct SearchView: View {
                                     openResourceDetail(item.value, site: site)
                                 }
                             )
+                            .id(siteRenderKey)
                             .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
@@ -2418,7 +3052,19 @@ struct SearchView: View {
             }
             .environmentObject(appState)
         }
-        .task { await model.loadSites(appState); consumePendingResourceSearch() }
+        .task {
+            // Do not hold an incoming resource search behind a slow site list
+            // request. Cached sites are hydrated first when available, while
+            // the search can still start with an empty site selection and the
+            // rows will re-resolve their image/authentication candidates when
+            // the site list arrives.
+            let loadTask = Task { await model.loadSites(appState) }
+            consumePendingResourceSearch()
+            await loadTask.value
+        }
+        .onChange(of: appState.sessionGeneration) { _, _ in
+            Task { await model.loadSites(appState) }
+        }
         .onChange(of: appState.pendingResourceSearch) { _, _ in consumePendingResourceSearch() }
         .onChange(of: model.query) { _, value in
             if value.isEmpty { stopSearch(clearResults: true) }
@@ -2996,12 +3642,13 @@ private struct ResourceResultRow: View {
 }
 
 struct ResourceRowItem: View {
+    @EnvironmentObject private var appState: AppState
     let item: [String: Any]
     let siteLabel: String
     let site: SiteItem?
 
     private var imageCandidates: [RemoteImageCandidate] {
-        resourceImageCandidates(item, site: site)
+        resourceImageCandidates(item, site: site, appState: appState)
     }
     private var title: String {
         let value = item.string("title", "name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -3019,7 +3666,11 @@ struct ResourceRowItem: View {
                     image.resizable().scaledToFill()
                 },
                 placeholder: {
-                    resourcePosterPlaceholder(title: title, category: category)
+                    resourcePosterPlaceholder(
+                        title: title,
+                        category: category,
+                        iconCandidates: resourceSiteIconCandidates(item, site: site, appState: appState)
+                    )
                 }
             )
             .frame(width: 62, height: 82)
@@ -3100,14 +3751,14 @@ struct ResourceRowItem: View {
     }
 
     private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
-    private var leechers: Int { item.int("leechers", "leecher", "leech") ?? 0 }
-    private var completers: Int { item.int("completers", "completed", "snatched") ?? 0 }
+    private var leechers: Int { item.int("leechers", "leecher", "leech", "peers", "peer") ?? 0 }
+    private var completers: Int { item.int("completers", "completed", "snatched", "grabs", "grab") ?? 0 }
     private var statusLabels: [String] {
         var values: [String] = []
         let sale = item.string("sale_status", "saleStatus", "promotion") ?? ""
         if !sale.isEmpty, sale != "无优惠" { values.append(sale) }
         if resourceHasHRValue(item) { values.append("HR") }
-        if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty { values.append(published) }
+        if let published = item.string("published", "pubdate", "pubDate", "created_at", "createdAt", "date"), !published.isEmpty { values.append(published) }
         return values
     }
 }
@@ -3127,19 +3778,35 @@ private struct ResourceMetric: View {
     }
 }
 
-private func resourcePosterPlaceholder(title: String, category: String?) -> some View {
+private func resourcePosterPlaceholder(
+    title: String,
+    category: String?,
+    iconCandidates: [RemoteImageCandidate] = []
+) -> some View {
     let initial = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
     return ZStack(alignment: .bottomLeading) {
         Color(uiColor: .tertiarySystemFill)
-        VStack(alignment: .leading, spacing: 4) {
-            Image(systemName: "film.stack")
-                .font(.title3.weight(.medium))
-                .foregroundStyle(HarvestTheme.blue.opacity(0.72))
-            Text(initial.isEmpty ? "?" : initial)
-                .font(.title2.weight(.bold))
-                .foregroundStyle(HarvestTheme.blue.opacity(0.62))
+        if iconCandidates.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                Image(systemName: "film.stack")
+                    .font(.title3.weight(.medium))
+                    .foregroundStyle(HarvestTheme.blue.opacity(0.72))
+                Text(initial.isEmpty ? "?" : initial)
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(HarvestTheme.blue.opacity(0.62))
+            }
+            .padding(8)
+        } else {
+            CachedAnimatedRemoteImageCandidates(
+                candidates: iconCandidates,
+                maximumPixelSize: 160
+            ) {
+                Image(systemName: "film.stack")
+                    .font(.title3.weight(.medium))
+                    .foregroundStyle(HarvestTheme.blue.opacity(0.72))
+            }
+            .padding(8)
         }
-        .padding(8)
         if let category, !category.isEmpty {
             Text(category)
                 .font(.system(size: 8, weight: .semibold))
@@ -3155,6 +3822,7 @@ private func resourcePosterPlaceholder(title: String, category: String?) -> some
 
 private struct ResourceDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
     let item: [String: Any]
     let site: SiteItem?
 
@@ -3164,11 +3832,11 @@ private struct ResourceDetailSheet: View {
         site?.name ?? item.string("site_name", "siteName", "site") ?? "未知站点"
     }
     private var imageCandidates: [RemoteImageCandidate] {
-        resourceImageCandidates(item, site: site)
+        resourceImageCandidates(item, site: site, appState: appState)
     }
     private var detailURL: URL? { resourceDetailURL(item, site: site) }
     private var downloadURL: String {
-        item.string("magnet_url", "magnetUrl", "download_url", "downloadUrl", "torrent_url", "torrentUrl") ?? ""
+        item.string("magnet_url", "magnetUrl", "download_url", "downloadUrl", "torrent_url", "torrentUrl", "enclosure") ?? ""
     }
     private var tags: [String] {
         let values = item.strings("tags")
@@ -3182,12 +3850,12 @@ private struct ResourceDetailSheet: View {
         var values: [(String, String)] = [("站点", siteLabel)]
         values.append(("大小", sizeLabel))
         values.append(("做种", "\(item.int("seeders", "seed", "seeder") ?? 0)"))
-        values.append(("下载", "\(item.int("leechers", "leecher", "leech") ?? 0)"))
-        values.append(("完成", "\(item.int("completers", "completed", "snatched") ?? 0)"))
+        values.append(("下载", "\(item.int("leechers", "leecher", "leech", "peers", "peer") ?? 0)"))
+        values.append(("完成", "\(item.int("completers", "completed", "snatched", "grabs", "grab") ?? 0)"))
         if let category = item.string("category", "category_name", "categoryName"), !category.isEmpty {
             values.append(("分类", category))
         }
-        if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty {
+        if let published = item.string("published", "pubdate", "pubDate", "created_at", "createdAt", "date"), !published.isEmpty {
             values.append(("发布时间", published))
         }
         return values
@@ -3210,7 +3878,11 @@ private struct ResourceDetailSheet: View {
                                 image.resizable().scaledToFill()
                             },
                             placeholder: {
-                                resourcePosterPlaceholder(title: title, category: nil)
+                                resourcePosterPlaceholder(
+                                    title: title,
+                                    category: nil,
+                                    iconCandidates: resourceSiteIconCandidates(item, site: site, appState: appState)
+                                )
                             }
                         )
                         .frame(width: 104, height: 146)

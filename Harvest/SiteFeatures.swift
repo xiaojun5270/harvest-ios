@@ -71,16 +71,26 @@ struct SiteItem: Identifiable {
         let statusMap = json.dict("status") ?? [:]
         let latestStatus = statusMap.keys.sorted().last.flatMap { statusMap[$0] as? [String: Any] }
         let signInfo = json.dict("sign_info", "signInfo") ?? [:]
-        let resolvedSiteKey = json.string("site", "website_name", "name") ?? ""
-        let resolvedName = json.string("nickname") ?? resolvedSiteKey
-        let resolvedURL = json.string("mirror", "url", "base_url") ?? ""
+        // The native app receives both the legacy Harvest site payload and the
+        // newer API shape. Keep the code/name pair separate: using `name` as
+        // the site code breaks cache lookup, image proxy URLs and search-site
+        // matching when a response only contains the newer aliases.
+        let resolvedSiteKey = json.string(
+            "site", "code", "site_code", "siteCode", "website_code", "websiteCode"
+        ) ?? ""
+        let resolvedName = json.string(
+            "nickname", "site_name", "siteName", "name"
+        ) ?? resolvedSiteKey
+        let resolvedURL = json.string(
+            "mirror", "url", "base_url", "baseUrl", "domain", "website_url", "websiteUrl"
+        ) ?? ""
         id = json.int("id", "site_id") ?? stableIdentifier(
             resolvedSiteKey,
             resolvedName,
             resolvedURL,
             json.string("user_id", "userId", "uid") ?? ""
         )
-        sortID = json.int("sort_id", "sortId") ?? 1
+        sortID = json.int("sort_id", "sortId", "priority") ?? 1
         siteKey = resolvedSiteKey
         name = resolvedName
         if name.isEmpty { name = "未命名站点" }
@@ -100,7 +110,9 @@ struct SiteItem: Identifiable {
         proxy = json.string("proxy") ?? ""
         tags = json.strings("tags")
         siteType = json.string("type", "site_type", "siteType") ?? ""
-        iconURL = json.string("icon", "logo", "favicon", "icon_url", "iconUrl") ?? ""
+        iconURL = json.string(
+            "icon", "logo", "favicon", "icon_url", "iconUrl", "logo_url", "logoUrl"
+        ) ?? ""
         uploaded = latestStatus?.double("uploaded", "upload", "uploaded_size") ?? json.double("uploaded", "upload", "uploaded_size") ?? 0
         downloaded = latestStatus?.double("downloaded", "download", "downloaded_size") ?? json.double("downloaded", "download", "downloaded_size") ?? 0
         let calculatedRatio = downloaded > 0 ? uploaded / downloaded : 0
@@ -122,12 +134,19 @@ struct SiteItem: Identifiable {
         notice = json.int("notice") ?? 0
         unread = mail + notice
         if unread == 0 { unread = json.int("unread", "message", "message_count") ?? 0 }
-        enabled = json.bool("available", "enable", "enabled", "is_active") ?? false
+        // Older cache rows may not contain the availability flag. A configured
+        // site URL is still a usable visual snapshot; treating it as enabled
+        // prevents the cached list from disappearing until the next refresh.
+        enabled = json.bool(
+            "available", "enable", "enabled", "is_active", "is_enabled", "isActive"
+        ) ?? !resolvedURL.isEmpty
         signed = signInfo[isoDayKey()] != nil || json.bool("signed", "signin") == true
-        signIn = json.bool("sign_in", "signin") ?? false
+        signIn = json.bool("sign_in", "signIn", "signin", "is_sign_in") ?? false
         getInfo = json.bool("get_info", "getInfo") ?? false
         repeatTorrents = json.bool("repeat_torrents", "repeatTorrents") ?? false
-        searchTorrents = json.bool("search_torrents", "searchTorrents") ?? false
+        searchTorrents = json.bool(
+            "search_torrents", "searchTorrents", "search", "is_search"
+        ) ?? true
         brushFree = json.bool("brush_free", "brushFree") ?? false
         brushRSS = json.bool("brush_rss", "brushRss") ?? false
         packageFile = json.bool("package_file", "packageFile") ?? false
@@ -284,6 +303,11 @@ private struct SiteBrowserTarget: Identifiable {
 
 @MainActor
 final class SitesViewModel: ObservableObject {
+    private static let fastSnapshotKey = "sites.fastSnapshot.v3"
+    private static let legacyFastSnapshotKeys = ["sites.fastSnapshot.v2", "sites.fastSnapshot"]
+    private static let fastSnapshotVersion = 3
+    private static var fastSnapshotMemory: [String: FastSnapshot] = [:]
+
     private(set) var sites: [SiteItem] = [] { didSet { scheduleFilteredSitesRebuild() } }
     @Published private(set) var filtered: [SiteItem] = []
     private var siteConfigs: [String: [String: Any]] = [:] { didSet { scheduleFilteredSitesRebuild() } }
@@ -356,8 +380,10 @@ final class SitesViewModel: ObservableObject {
     }
     private var didRestoreCache = false
     private var loadInProgress = false
+    private var loadAttemptID: UUID?
     private var networkRefreshInProgress = false
     private var backgroundRefreshTask: Task<Void, Never>?
+    private var backgroundRefreshGeneration = 0
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
     private var activeSiteOperations: Set<String> = []
@@ -389,6 +415,14 @@ final class SitesViewModel: ObservableObject {
         ascending = defaults.object(forKey: SiteFilterStorageKey.ascending) == nil
             ? sortField.defaultAscending
             : defaults.bool(forKey: SiteFilterStorageKey.ascending)
+
+        // Restore the launch snapshot before SwiftUI renders the first frame.
+        // Waiting until `.task` runs still produces a visible full-page
+        // "正在同步" flash on slower devices.
+        let storedServer = defaults.string(forKey: "harvest.baseURL") ?? ""
+        if !storedServer.isEmpty {
+            restoreFastSnapshot(for: storedServer)
+        }
     }
 
     private func rebuildFilteredSites() {
@@ -519,6 +553,40 @@ final class SitesViewModel: ObservableObject {
         activeFilterCount > 0
     }
 
+    private var preparedSessionGeneration: Int?
+
+    func prepareForSessionLoad(_ generation: Int, server: String) {
+        guard preparedSessionGeneration != generation else { return }
+        preparedSessionGeneration = generation
+        // Cancel work owned by the previous session before its response can
+        // replace the snapshot restored for the current account.
+        backgroundRefreshTask?.cancel()
+        backgroundRefreshTask = nil
+        backgroundRefreshGeneration &+= 1
+        networkRefreshInProgress = false
+        loadInProgress = false
+        loadAttemptID = nil
+        didRestoreCache = false
+        // Keep an already rendered snapshot visible while the account-scoped
+        // cache is looked up again. Only an empty model should show the full
+        // page loading state.
+        isLoading = sites.isEmpty
+        restoreFastSnapshot(for: server)
+    }
+
+    private func restoreFastSnapshot(for server: String) {
+        guard sites.isEmpty, let snapshot = Self.readFastSnapshot(for: server) else { return }
+        suppressFilteredSitesRebuild = true
+        sites = snapshot.rows.map(SiteItem.init)
+        cachedAt = snapshot.cachedAt
+        usingCachedData = true
+        suppressFilteredSitesRebuild = false
+        rebuildFilteredSites()
+        isLoading = false
+        didRestoreCache = true
+        recordAppLog(.info, "站点页面已恢复本地快照（\(snapshot.rows.count) 个站点）")
+    }
+
     func clearFilters() {
         availability = .alive
         condition = .all
@@ -613,39 +681,116 @@ final class SitesViewModel: ObservableObject {
         // A pull-to-refresh should wait for an existing refresh. The initial view
         // load, however, must return as soon as cached rows are available.
         if networkRefreshInProgress {
-            if !background, let task = backgroundRefreshTask {
-                await task.value
-            }
-            return
+            if background { return }
+            // A user-requested refresh supersedes stale background work.
+            guard let task = backgroundRefreshTask else { return }
+            task.cancel()
+            await task.value
+            backgroundRefreshTask = nil
+            backgroundRefreshGeneration &+= 1
+            networkRefreshInProgress = false
         }
-        guard !loadInProgress else { return }
+        guard loadAttemptID == nil else { return }
 
         let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
+        let attemptID = UUID()
+        loadAttemptID = attemptID
         loadInProgress = true
+        defer {
+            // A cancelled load must never leave the page permanently stuck in
+            // its loading state. Do not clear a newer session's attempt.
+            if loadAttemptID == attemptID {
+                loadAttemptID = nil
+                loadInProgress = false
+            }
+        }
+        let loadGeneration = backgroundRefreshGeneration
         let cacheKey = "site.info.list"
         let configCacheKey = "site.config.list"
 
+        var restoredFastSnapshot = false
         if !didRestoreCache {
             didRestoreCache = true
+            // Restore the small UserDefaults snapshot synchronously so the
+            // first frame can render without waiting for the actor-backed
+            // session cache or token restoration.
+            if sites.isEmpty { restoreFastSnapshot(for: appState.baseURL) }
+            restoredFastSnapshot = !sites.isEmpty && usingCachedData
+            // The fast snapshot is intentionally enough to render the first
+            // frame. Do not wait for the actor-backed disk cache before the
+            // background refresh starts; that wait was the source of the long
+            // initial "正在同步" screen on cold launches.
+            if background && restoredFastSnapshot {
+                loadInProgress = false
+                performanceInterval.end()
+                if appState.isRestoringSession && !appState.isAuthenticated {
+                    // Authentication will invalidate the task id and run the
+                    // same cache-first path again once the token is restored.
+                    return
+                }
+                startBackgroundRefresh(appState, cached: cached)
+                return
+            }
             async let siteCache = appState.readSessionCache(cacheKey)
             async let configCache = appState.readSessionCache(configCacheKey)
-            let (cachedSites, cachedConfigs) = await (siteCache, configCache)
-            suppressFilteredSitesRebuild = true
-            if let cachedSites {
-                sites = jsonRows(cachedSites.value).map(SiteItem.init)
-                cachedAt = cachedSites.cachedAt
-                usingCachedData = true
+            if let cachedSites = await siteCache {
+                guard backgroundRefreshGeneration == loadGeneration, !Task.isCancelled else {
+                    performanceInterval.end()
+                    return
+                }
+                let rows = jsonRows(cachedSites.value)
+                if sites.isEmpty || cachedAt.map({ cachedSites.cachedAt >= $0 }) != false {
+                    suppressFilteredSitesRebuild = true
+                    sites = rows.map(SiteItem.init)
+                    cachedAt = cachedSites.cachedAt
+                    usingCachedData = true
+                    suppressFilteredSitesRebuild = false
+                    rebuildFilteredSites()
+                    isLoading = false
+                    Self.writeFastSnapshot(
+                        rows.map(SiteItem.init).map { self.siteFastSnapshotRow($0) },
+                        for: appState.baseURL,
+                        cachedAt: cachedSites.cachedAt
+                    )
+                    // Give SwiftUI a render opportunity before the larger
+                    // website configuration snapshot is decoded.
+                    await Task.yield()
+                }
             }
-            if let cachedConfigs {
+            if let cachedConfigs = await configCache {
+                guard backgroundRefreshGeneration == loadGeneration, !Task.isCancelled else {
+                    performanceInterval.end()
+                    return
+                }
+                suppressFilteredSitesRebuild = true
                 siteConfigs = Self.indexedConfigs(jsonRows(cachedConfigs.value))
                 lastConfigsLoadedAt = cachedConfigs.cachedAt
+                suppressFilteredSitesRebuild = false
+                rebuildFilteredSites()
             }
-            suppressFilteredSitesRebuild = false
-            rebuildFilteredSites()
         }
 
+        guard backgroundRefreshGeneration == loadGeneration, !Task.isCancelled else {
+            performanceInterval.end()
+            return
+        }
         let hasCachedRows = !sites.isEmpty
         isLoading = !hasCachedRows && !usingCachedData
+
+        // During a cold launch the token is still being validated. Hydrate the
+        // local snapshot now, but defer the network refresh until the session
+        // callback publishes an authenticated generation. This prevents two
+        // overlapping site requests and avoids a cancelled launch task leaving
+        // the page in a permanent "正在同步" state.
+        if background && appState.isRestoringSession && !appState.isAuthenticated {
+            loadInProgress = false
+            // There is no authenticated request to wait for yet. Do not leave
+            // an empty launch screen showing "正在同步" until the session
+            // callback arrives; the next session generation will retry.
+            isLoading = false
+            performanceInterval.end()
+            return
+        }
 
         // Cached rows are immediately usable. Start the network work separately
         // so the first render is not blocked by a slow sites/config request.
@@ -659,35 +804,52 @@ final class SitesViewModel: ObservableObject {
             return
         }
 
+        backgroundRefreshGeneration &+= 1
+        let generation = backgroundRefreshGeneration
         networkRefreshInProgress = true
-        await refreshFromNetwork(appState, cached: cached)
-        networkRefreshInProgress = false
-        loadInProgress = false
-        isLoading = false
+        await refreshFromNetwork(appState, cached: cached, generation: generation)
+        if backgroundRefreshGeneration == generation {
+            networkRefreshInProgress = false
+            loadInProgress = false
+            isLoading = false
+        }
         performanceInterval.end()
     }
 
     private func startBackgroundRefresh(_ appState: AppState, cached: Bool) {
         guard !networkRefreshInProgress else { return }
         networkRefreshInProgress = true
+        backgroundRefreshGeneration &+= 1
+        let generation = backgroundRefreshGeneration
         backgroundRefreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
-                self.networkRefreshInProgress = false
-                self.loadInProgress = false
-                self.isLoading = false
-                self.backgroundRefreshTask = nil
+                if self.backgroundRefreshGeneration == generation {
+                    self.networkRefreshInProgress = false
+                    self.loadInProgress = false
+                    self.isLoading = false
+                    self.backgroundRefreshTask = nil
+                }
             }
             // Let SwiftUI commit the restored cache before fresh rows are
             // applied, especially on a cold launch.
             await Task.yield()
-            await self.refreshFromNetwork(appState, cached: cached)
+            guard self.backgroundRefreshGeneration == generation, !Task.isCancelled else { return }
+            await self.refreshFromNetwork(appState, cached: cached, generation: generation)
         }
     }
 
-    private func refreshFromNetwork(_ appState: AppState, cached: Bool) async {
+    private func refreshFromNetwork(
+        _ appState: AppState,
+        cached: Bool,
+        generation: Int
+    ) async {
         let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
         defer { performanceInterval.end() }
+
+        func refreshIsCurrent() -> Bool {
+            backgroundRefreshGeneration == generation && !Task.isCancelled
+        }
 
         let cacheKey = "site.info.list"
         let configCacheKey = "site.config.list"
@@ -709,10 +871,47 @@ final class SitesViewModel: ObservableObject {
                 query: ["cached": cached],
                 timeoutInterval: 15
             )
-            loadedSites = jsonRows(raw).map(SiteItem.init)
+            guard refreshIsCurrent() else {
+                configTask?.cancel()
+                return
+            }
+            let refreshedSites = jsonRows(raw).map(SiteItem.init)
+            if refreshedSites.isEmpty, !sites.isEmpty, cached {
+                recordAppLog(.warning, "站点接口暂时返回空列表，继续显示本地缓存")
+                loadedSites = nil
+            } else {
+                loadedSites = refreshedSites
+            }
             cachedAt = nil
-            usingCachedData = false
+            if loadedSites != nil { usingCachedData = false }
+            if let loadedSites {
+                // Publish site rows as soon as that endpoint responds. The
+                // configuration list is independent and must not hold the
+                // entire site page behind its slower request.
+                suppressFilteredSitesRebuild = true
+                sites = loadedSites
+                suppressFilteredSitesRebuild = false
+                rebuildFilteredSites()
+                isLoading = false
+                Self.writeFastSnapshot(
+                    loadedSites.map { self.siteFastSnapshotRow($0) },
+                    for: appState.baseURL,
+                    cachedAt: Date()
+                )
+                await appState.writeSessionCache(
+                    loadedSites.map { self.sitePersistentCacheRow($0) },
+                    name: cacheKey
+                )
+                guard refreshIsCurrent() else {
+                    configTask?.cancel()
+                    return
+                }
+            }
         } catch {
+            guard refreshIsCurrent() else {
+                configTask?.cancel()
+                return
+            }
             guard !isRequestCancellation(error) else {
                 configTask?.cancel()
                 return
@@ -724,27 +923,121 @@ final class SitesViewModel: ObservableObject {
         if let configTask {
             switch await configTask.value {
             case let .success(raw):
+                guard refreshIsCurrent() else { return }
                 loadedConfigs = jsonRows(raw)
                 lastConfigsLoadedAt = Date()
             case let .failure(error):
+                guard refreshIsCurrent() else { return }
                 if !isRequestCancellation(error) {
                     recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
                 }
             }
         }
 
+        guard refreshIsCurrent() else { return }
         suppressFilteredSitesRebuild = true
-        if let loadedSites { sites = loadedSites }
         if let loadedConfigs { siteConfigs = Self.indexedConfigs(loadedConfigs) }
         suppressFilteredSitesRebuild = false
         rebuildFilteredSites()
 
-        if let loadedSites {
-            await appState.writeSessionCache(loadedSites.map(sitePersistentCacheRow), name: cacheKey)
-        }
         if let loadedConfigs {
             await appState.writeSessionCache(loadedConfigs, name: configCacheKey)
         }
+    }
+
+    private struct FastSnapshot {
+        let rows: [[String: Any]]
+        let cachedAt: Date
+    }
+
+    static func cachedSitesSnapshot(for server: String) -> [SiteItem] {
+        readFastSnapshot(for: server)?.rows.map(SiteItem.init) ?? []
+    }
+
+    static func clearCachedSitesSnapshot() {
+        fastSnapshotMemory.removeAll(keepingCapacity: false)
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: fastSnapshotKey)
+        legacyFastSnapshotKeys.forEach { defaults.removeObject(forKey: $0) }
+    }
+
+    private static func readFastSnapshot(for server: String) -> FastSnapshot? {
+        let defaults = UserDefaults.standard
+        let keys = [fastSnapshotKey] + legacyFastSnapshotKeys
+        let normalizedServer = normalizedSnapshotServer(server)
+        if let snapshot = fastSnapshotMemory[normalizedServer],
+           Date().timeIntervalSince(snapshot.cachedAt) <= 180 * 24 * 60 * 60 {
+            return snapshot
+        }
+        for key in keys {
+            guard let data = defaults.data(forKey: key),
+                  let decoded = try? JSONSerialization.jsonObject(with: data),
+                  let object = decoded as? [String: Any],
+                  let snapshotServer = object.string("server", "baseURL", "baseUrl"),
+                  normalizedSnapshotServer(snapshotServer) == normalizedServer,
+                  let rowsValue = object["rows"] else { continue }
+
+            // Older snapshots did not always include a version or timestamp.
+            // The rows are still safe to render because they contain only the
+            // reduced site snapshot written by this view model. Treat a missing
+            // timestamp as now and let the network refresh replace it later.
+            let version = object.int("version") ?? 1
+            guard version <= fastSnapshotVersion else { continue }
+            let cachedAtValue = object.double("cachedAt", "cached_at", "timestamp")
+                ?? Date().timeIntervalSince1970
+            guard cachedAtValue.isFinite, cachedAtValue > 0 else { continue }
+            let age = Date().timeIntervalSince1970 - cachedAtValue
+            guard age <= 180 * 24 * 60 * 60 else { continue }
+            let rows = jsonRows(rowsValue)
+            guard !rows.isEmpty else { continue }
+            if key != fastSnapshotKey {
+                recordAppLog(.info, "兼容读取旧站点快照：\(key)，\(rows.count) 个站点")
+            }
+            let snapshot = FastSnapshot(
+                rows: rows,
+                cachedAt: Date(timeIntervalSince1970: cachedAtValue)
+            )
+            fastSnapshotMemory[normalizedServer] = snapshot
+            return snapshot
+        }
+        return nil
+    }
+
+    private static func writeFastSnapshot(
+        _ rows: [[String: Any]],
+        for server: String,
+        cachedAt: Date
+    ) {
+        guard !rows.isEmpty else { return }
+        let object: [String: Any] = [
+            "version": fastSnapshotVersion,
+            "server": normalizedSnapshotServer(server),
+            "cachedAt": cachedAt.timeIntervalSince1970,
+            "rows": rows
+        ]
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+            recordAppLog(.warning, "站点快照写入失败：数据不是有效 JSON（\(rows.count) 行）")
+            return
+        }
+        UserDefaults.standard.set(data, forKey: fastSnapshotKey)
+        fastSnapshotMemory[normalizedSnapshotServer(server)] = FastSnapshot(
+            rows: rows,
+            cachedAt: cachedAt
+        )
+        recordAppLog(.info, "站点快照已写入：\(rows.count) 个站点，\(data.count) 字节")
+    }
+
+    private static func normalizedSnapshotServer(_ value: String) -> String {
+        var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        while normalized.hasSuffix("/") { normalized.removeLast() }
+        if let components = URLComponents(string: normalized),
+           let scheme = components.scheme?.lowercased(),
+           let host = components.host?.lowercased() {
+            let port = components.port.map { ":\($0)" } ?? ""
+            return "\(scheme)://\(host)\(port)\(components.path == "/" ? "" : components.path)"
+        }
+        return normalized.lowercased()
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
@@ -799,7 +1092,7 @@ final class SitesViewModel: ObservableObject {
     }
 
     private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
-        site.raw.filter { key, _ in
+        var row = site.raw.filter { key, _ in
             let normalized = key.lowercased().filter { $0.isLetter || $0.isNumber }
             if normalized.contains("password") || normalized.contains("token") || normalized.contains("secret") {
                 return false
@@ -809,10 +1102,70 @@ final class SitesViewModel: ObservableObject {
                 "authorization", "apikey", "rss", "torrents"
             ].contains(normalized)
         }
+        let canonical = siteFastSnapshotRow(site)
+        for (key, value) in canonical where key != "status" && key != "sign_info" {
+            row[key] = value
+        }
+        if row.dict("status") == nil { row["status"] = canonical["status"] }
+        if row.dict("sign_info", "signInfo") == nil, let signInfo = canonical["sign_info"] {
+            row["sign_info"] = signInfo
+        }
+        return row
     }
 
     func config(for site: SiteItem) -> [String: Any]? {
         siteConfigs[site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
+    }
+
+    private func siteFastSnapshotRow(_ site: SiteItem) -> [String: Any] {
+        let statusDate = site.updatedAt.isEmpty ? isoDayKey() : site.updatedAt
+        let status: [String: Any] = [
+            "uploaded": site.uploaded,
+            "downloaded": site.downloaded,
+            "ratio": site.ratio,
+            "seed": site.seeding,
+            "leech": site.leeching,
+            "publish": site.published,
+            "invitation": site.invitations,
+            "seed_days": site.seedDays,
+            "my_bonus": site.magic,
+            "bonus_hour": site.bonusHour,
+            "my_score": site.score,
+            "seed_volume": site.seedVolume,
+            "my_hr": site.hr,
+            "my_level": site.level,
+            "updated_at": site.updatedAt
+        ]
+        var row: [String: Any] = [
+            "id": site.id,
+            "sort_id": site.sortID,
+            "site": site.siteKey,
+            "nickname": site.name,
+            "mirror": site.url,
+            "tags": site.tags,
+            "type": site.siteType,
+            "icon": site.iconURL,
+            "mail": site.mail,
+            "notice": site.notice,
+            "unread": site.unread,
+            "available": site.enabled,
+            "signed": site.signed,
+            "sign_in": site.signIn,
+            "get_info": site.getInfo,
+            "repeat_torrents": site.repeatTorrents,
+            "search_torrents": site.searchTorrents,
+            "brush_free": site.brushFree,
+            "brush_rss": site.brushRSS,
+            "package_file": site.packageFile,
+            "hr_discern": site.hrDiscern,
+            "show_in_dash": site.showInDashboard,
+            "time_join": site.joinedAt,
+            "latest_active": site.latestActive,
+            "updated_at": site.updatedAt,
+            "status": [statusDate: status]
+        ]
+        if site.signed { row["sign_info"] = [isoDayKey(): ["signed": true]] }
+        return row
     }
 
     private static func indexedConfigs(_ configs: [[String: Any]]) -> [String: [String: Any]] {
@@ -836,6 +1189,13 @@ final class SitesViewModel: ObservableObject {
         var candidates: [RemoteImageCandidate] = []
         var seen = Set<String>()
 
+        if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
+            candidates.append(RemoteImageCandidate(
+                url: url,
+                persistentCacheID: "site-icon|\(url.absoluteString)"
+            ))
+        }
+
         let siteName = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines)
         var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while server.hasSuffix("/") { server.removeLast() }
@@ -843,6 +1203,16 @@ final class SitesViewModel: ObservableObject {
             let headers = appState.accessToken.isEmpty
                 ? [:]
                 : ["Authorization": "Bearer \(appState.accessToken)"]
+            if let url = URL(
+                string: "static/site_favicon/\(urlPathSegment(siteName)).png",
+                relativeTo: serverURL
+            )?.absoluteURL,
+               seen.insert(url.absoluteString).inserted {
+                candidates.append(RemoteImageCandidate(
+                    url: url,
+                    persistentCacheID: "site-icon|\(url.absoluteString)"
+                ))
+            }
             for fileExtension in ["gif", "png", "jpg", "jpeg", "webp", "ico"] {
                 let relative = "local/icons/\(urlPathSegment(siteName)).\(fileExtension)"
                 guard let url = URL(string: relative, relativeTo: serverURL)?.absoluteURL else { continue }
@@ -856,12 +1226,6 @@ final class SitesViewModel: ObservableObject {
             }
         }
 
-        if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
-            candidates.append(RemoteImageCandidate(
-                url: url,
-                persistentCacheID: "site-icon|\(url.absoluteString)"
-            ))
-        }
         return candidates
     }
 
@@ -1030,7 +1394,13 @@ struct SitesView: View {
                 .accessibilityLabel("批量站点操作")
             }
         }
-        .task { if model.isLoading { await model.load(appState, background: true) } }
+        // The shell may be created before the stored session finishes restoring.
+        // Always run the cache-first load for this session so a late session
+        // callback cannot leave the page stuck on the initial synchronizing view.
+        .task(id: appState.sessionGeneration) {
+            model.prepareForSessionLoad(appState.sessionGeneration, server: appState.baseURL)
+            await model.load(appState, background: true)
+        }
         .onChange(of: appState.refreshGeneration) { _, _ in Task { await model.load(appState, background: true) } }
         .onReceive(NotificationCenter.default.publisher(for: .harvestLocalUIReset)) { _ in
             model.query = ""
