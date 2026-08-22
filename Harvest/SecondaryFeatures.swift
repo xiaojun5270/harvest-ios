@@ -3559,7 +3559,8 @@ struct MediaRow: View {
         HStack(spacing: 12) {
             CachedRemoteImage(
                 url: URL(string: item.poster),
-                headers: mediaImageHeaders(source: item.source, raw: item.raw)
+                headers: mediaImageHeaders(source: item.source, raw: item.raw),
+                maximumPixelSize: 320
             ) { image in
                 image.resizable().scaledToFill()
             } placeholder: {
@@ -3642,6 +3643,7 @@ struct ResourceRowItem: View {
         HStack(alignment: .top, spacing: 9) {
             CachedRemoteImageCandidates(
                 candidates: imageCandidates,
+                maximumPixelSize: 360,
                 content: { image in
                     image.resizable().scaledToFill()
                 },
@@ -3934,6 +3936,7 @@ private struct ResourceDetailSheet: View {
                     HStack(alignment: .top, spacing: 14) {
                         CachedRemoteImageCandidates(
                             candidates: imageCandidates,
+                            maximumPixelSize: 720,
                             content: { image in
                                 image.resizable().scaledToFill()
                             },
@@ -4049,7 +4052,8 @@ struct MediaDetailSheet: View {
                     HStack(alignment: .top, spacing: 14) {
                         CachedRemoteImage(
                             url: URL(string: poster),
-                            headers: imageHeaders
+                            headers: imageHeaders,
+                            maximumPixelSize: 520
                         ) { image in
                             image.resizable().scaledToFill()
                         } placeholder: {
@@ -4338,7 +4342,8 @@ private struct MediaVendorRow: View {
     var body: some View {
         HStack(spacing: 12) {
             CachedRemoteImage(
-                url: URL(string: normalizedRemoteImageURL(mediaImageValue(vendor)))
+                url: URL(string: normalizedRemoteImageURL(mediaImageValue(vendor))),
+                maximumPixelSize: 128
             ) { image in
                 image.resizable().scaledToFit()
             } placeholder: {
@@ -5646,7 +5651,8 @@ struct MediaCarousel: View {
                                     ZStack(alignment: .topLeading) {
                                         CachedRemoteImage(
                                             url: URL(string: item.poster),
-                                            headers: mediaImageHeaders(source: item.source, raw: item.raw)
+                                            headers: mediaImageHeaders(source: item.source, raw: item.raw),
+                                            maximumPixelSize: 520
                                         ) { image in
                                             image.resizable().scaledToFill()
                                         } placeholder: {

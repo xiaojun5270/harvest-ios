@@ -176,7 +176,11 @@ actor RemoteImageDataCache {
             let bodyPrefix = String(data: data.prefix(512), encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased() ?? ""
-            if let nestedImageURL = remoteImageURLFromResponse(data, baseURL: normalizedURL),
+            let isJSONResponse = mimeType.contains("json")
+                || bodyPrefix.hasPrefix("{")
+                || bodyPrefix.hasPrefix("[")
+            if isJSONResponse,
+               let nestedImageURL = remoteImageURLFromResponse(data, baseURL: normalizedURL),
                nestedImageURL != normalizedURL {
                 return try await self.data(
                     for: nestedImageURL,
@@ -1065,6 +1069,7 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     let url: URL?
     let headers: [String: String]
     let persistentCacheID: String?
+    let maximumPixelSize: Int
     let prefersLinkedMediaPoster: Bool
     let linkedMediaAPI: RemoteMediaPosterAPI?
     private let onFailure: (() -> Void)?
@@ -1076,6 +1081,7 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
         url: URL?,
         headers: [String: String] = [:],
         persistentCacheID: String? = nil,
+        maximumPixelSize: Int = 1_200,
         prefersLinkedMediaPoster: Bool = false,
         linkedMediaAPI: RemoteMediaPosterAPI? = nil,
         onFailure: (() -> Void)? = nil,
@@ -1085,6 +1091,7 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
         self.url = url
         self.headers = headers
         self.persistentCacheID = persistentCacheID
+        self.maximumPixelSize = max(1, maximumPixelSize)
         self.prefersLinkedMediaPoster = prefersLinkedMediaPoster
         self.linkedMediaAPI = linkedMediaAPI
         self.onFailure = onFailure
@@ -1100,7 +1107,7 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: requestKey) {
+        .task(id: requestKey, priority: .utility) {
             loadedImage = nil
             guard let url,
                   let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else {
@@ -1110,7 +1117,8 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
             let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
             let variant = prefersLinkedMediaPoster ? "linked-media-poster" : ""
             let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
-            if let cached = RemoteDecodedImageCache.shared.image(for: cacheKey) {
+            let decodedCacheKey = "\(cacheKey)|decoded|\(maximumPixelSize)"
+            if let cached = RemoteDecodedImageCache.shared.image(for: decodedCacheKey) {
                 loadedImage = cached
                 return
             }
@@ -1123,8 +1131,9 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                     linkedMediaAPI: linkedMediaAPI
                 )
                 guard !Task.isCancelled else { return }
+                let pixelSize = maximumPixelSize
                 let image = await Task.detached(priority: .utility) { () -> UIImage? in
-                    decodedRemoteDisplayImage(data)
+                    decodedRemoteDisplayImage(data, maximumPixelSize: pixelSize)
                 }.value
                 guard !Task.isCancelled, let image else {
                     if let persistentCacheID {
@@ -1133,7 +1142,7 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                     if !Task.isCancelled { await MainActor.run { onFailure?() } }
                     return
                 }
-                RemoteDecodedImageCache.shared.insert(image, for: cacheKey)
+                RemoteDecodedImageCache.shared.insert(image, for: decodedCacheKey)
                 loadedImage = image
             } catch {
                 guard !Task.isCancelled else { return }
@@ -1145,11 +1154,12 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     private var requestKey: String {
         guard let url,
               let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else { return "" }
-        return remoteImageCacheKey(
+        let cacheKey = remoteImageCacheKey(
             url: normalizedURL,
             headers: remoteImageHeaders(for: normalizedURL, additional: headers),
             variant: prefersLinkedMediaPoster ? "linked-media-poster" : ""
         )
+        return "\(cacheKey)|decoded|\(maximumPixelSize)"
     }
 }
 
@@ -1185,28 +1195,38 @@ struct RemoteImageCandidate: Identifiable {
 
 struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
     let candidates: [RemoteImageCandidate]
+    let maximumPixelSize: Int
     private let content: (Image) -> Content
     private let placeholder: () -> Placeholder
     @State private var candidateIndex = 0
+    @State private var restoredImage: UIImage?
+    @State private var isRestoring = true
 
     init(
         candidates: [RemoteImageCandidate],
+        maximumPixelSize: Int = 1_200,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) {
         self.candidates = candidates
+        self.maximumPixelSize = max(1, maximumPixelSize)
         self.content = content
         self.placeholder = placeholder
     }
 
     var body: some View {
         Group {
-            if candidateIndex < candidates.count {
+            if let restoredImage {
+                content(Image(uiImage: restoredImage))
+            } else if isRestoring {
+                placeholder()
+            } else if candidateIndex < candidates.count {
                 let candidate = candidates[candidateIndex]
                 CachedRemoteImage(
                     url: candidate.url,
                     headers: candidate.headers,
                     persistentCacheID: candidate.persistentCacheID,
+                    maximumPixelSize: maximumPixelSize,
                     prefersLinkedMediaPoster: candidate.prefersLinkedMediaPoster,
                     linkedMediaAPI: candidate.linkedMediaAPI,
                     onFailure: advanceCandidate,
@@ -1217,13 +1237,56 @@ struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: candidateKey) { candidateIndex = 0 }
+        .task(id: restoreKey, priority: .utility) { await restorePersistedCandidate() }
     }
 
     private var candidateKey: String { candidates.map(\.id).joined(separator: "|") }
+    private var restoreKey: String { "\(candidateKey)|decoded|\(maximumPixelSize)" }
 
     private func advanceCandidate() {
         candidateIndex = min(candidateIndex + 1, candidates.count)
+    }
+
+    @MainActor private func restorePersistedCandidate() async {
+        restoredImage = nil
+        candidateIndex = 0
+        isRestoring = true
+        defer { isRestoring = false }
+
+        for (index, candidate) in candidates.enumerated() {
+            guard !Task.isCancelled,
+                  let persistentCacheID = candidate.persistentCacheID,
+                  let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
+                continue
+            }
+            let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
+            let variant = candidate.prefersLinkedMediaPoster ? "linked-media-poster" : ""
+            let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
+            let decodedCacheKey = "\(cacheKey)|decoded|\(maximumPixelSize)"
+            if let cached = RemoteDecodedImageCache.shared.image(for: decodedCacheKey) {
+                candidateIndex = index
+                restoredImage = cached
+                return
+            }
+            guard let data = await RemoteImageDataCache.shared.persistentData(
+                for: persistentCacheID,
+                requestURL: normalizedURL,
+                headers: effectiveHeaders
+            ) else { continue }
+            let pixelSize = maximumPixelSize
+            let image = await Task.detached(priority: .utility) {
+                decodedRemoteDisplayImage(data, maximumPixelSize: pixelSize)
+            }.value
+            guard !Task.isCancelled else { return }
+            guard let image else {
+                await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
+                continue
+            }
+            RemoteDecodedImageCache.shared.insert(image, for: decodedCacheKey)
+            candidateIndex = index
+            restoredImage = image
+            return
+        }
     }
 }
 
@@ -1252,7 +1315,7 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
                 placeholder()
             }
         }
-        .task(id: requestKey) { await loadCurrentCandidate() }
+        .task(id: requestKey, priority: .utility) { await loadCurrentCandidate() }
         .onChange(of: candidateKey) { _, _ in
             candidateIndex = 0
             loadedImage = nil
