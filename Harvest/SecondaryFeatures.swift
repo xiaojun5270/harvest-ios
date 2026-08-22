@@ -1977,7 +1977,8 @@ private func resourceItemBaseURL(_ item: [String: Any], site: SiteItem?) -> URL?
     if let detail = item.string("detail_url", "detailUrl", "details_url", "detailsUrl"),
        let detailURL = resourceResolvedURL(detail, relativeTo: nil) {
         var components = URLComponents(url: detailURL, resolvingAgainstBaseURL: false)
-        components?.path = components?.path.isEmpty == false ? (components?.path ?? "/") : "/"
+        let path = components?.path ?? ""
+        components?.path = path.isEmpty ? "/" : path
         components?.query = nil
         components?.fragment = nil
         return components?.url
