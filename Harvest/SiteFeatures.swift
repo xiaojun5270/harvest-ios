@@ -356,6 +356,8 @@ final class SitesViewModel: ObservableObject {
     }
     private var didRestoreCache = false
     private var loadInProgress = false
+    private var networkRefreshInProgress = false
+    private var backgroundRefreshTask: Task<Void, Never>?
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
     private var activeSiteOperations: Set<String> = []
@@ -607,18 +609,22 @@ final class SitesViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    func load(_ appState: AppState, cached: Bool = true) async {
-        guard !loadInProgress else { return }
-        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
-        defer { performanceInterval.end() }
-        loadInProgress = true
-        defer {
-            loadInProgress = false
-            isLoading = false
+    func load(_ appState: AppState, cached: Bool = true, background: Bool = false) async {
+        // A pull-to-refresh should wait for an existing refresh. The initial view
+        // load, however, must return as soon as cached rows are available.
+        if networkRefreshInProgress {
+            if !background, let task = backgroundRefreshTask {
+                await task.value
+            }
+            return
         }
+        guard !loadInProgress else { return }
 
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
+        loadInProgress = true
         let cacheKey = "site.info.list"
         let configCacheKey = "site.config.list"
+
         if !didRestoreCache {
             didRestoreCache = true
             async let siteCache = appState.readSessionCache(cacheKey)
@@ -637,8 +643,54 @@ final class SitesViewModel: ObservableObject {
             suppressFilteredSitesRebuild = false
             rebuildFilteredSites()
         }
-        isLoading = sites.isEmpty && !usingCachedData
 
+        let hasCachedRows = !sites.isEmpty
+        isLoading = !hasCachedRows && !usingCachedData
+
+        // Cached rows are immediately usable. Start the network work separately
+        // so the first render is not blocked by a slow sites/config request.
+        // When there is no cache, the task still owns the loading state and will
+        // clear it after the first response arrives.
+        if background {
+            if hasCachedRows { isLoading = false }
+            loadInProgress = false
+            performanceInterval.end()
+            startBackgroundRefresh(appState, cached: cached)
+            return
+        }
+
+        networkRefreshInProgress = true
+        await refreshFromNetwork(appState, cached: cached)
+        networkRefreshInProgress = false
+        loadInProgress = false
+        isLoading = false
+        performanceInterval.end()
+    }
+
+    private func startBackgroundRefresh(_ appState: AppState, cached: Bool) {
+        guard !networkRefreshInProgress else { return }
+        networkRefreshInProgress = true
+        backgroundRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.networkRefreshInProgress = false
+                self.loadInProgress = false
+                self.isLoading = false
+                self.backgroundRefreshTask = nil
+            }
+            // Let SwiftUI commit the restored cache before fresh rows are
+            // applied, especially on a cold launch.
+            await Task.yield()
+            await self.refreshFromNetwork(appState, cached: cached)
+        }
+    }
+
+    private func refreshFromNetwork(_ appState: AppState, cached: Bool) async {
+        let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
+        defer { performanceInterval.end() }
+
+        let cacheKey = "site.info.list"
+        let configCacheKey = "site.config.list"
         let shouldRefreshConfigs = siteConfigs.isEmpty
             || (lastConfigsLoadedAt.map { Date().timeIntervalSince($0) > 15 * 60 } ?? true)
         let configTask: Task<Result<Any, Error>, Never>? = shouldRefreshConfigs
@@ -978,8 +1030,8 @@ struct SitesView: View {
                 .accessibilityLabel("批量站点操作")
             }
         }
-        .task { if model.isLoading { await model.load(appState) } }
-        .onChange(of: appState.refreshGeneration) { _, _ in Task { await model.load(appState) } }
+        .task { if model.isLoading { await model.load(appState, background: true) } }
+        .onChange(of: appState.refreshGeneration) { _, _ in Task { await model.load(appState, background: true) } }
         .onReceive(NotificationCenter.default.publisher(for: .harvestLocalUIReset)) { _ in
             model.query = ""
             model.resetFilters()

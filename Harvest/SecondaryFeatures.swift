@@ -1969,9 +1969,19 @@ private func resourceSiteBaseURL(_ site: SiteItem?) -> URL? {
 
 private func resourceItemBaseURL(_ item: [String: Any], site: SiteItem?) -> URL? {
     if let siteURL = resourceSiteBaseURL(site) { return siteURL }
-    for key in ["site_url", "siteUrl", "base_url", "baseUrl", "mirror", "origin"] {
+    let baseKeys = ["site_url", "siteUrl", "base_url", "baseUrl", "mirror", "origin", "url"]
+    for key in baseKeys {
         if let value = item.string(key), let url = resourceResolvedURL(value, relativeTo: nil) {
             return url
+        }
+    }
+    for key in ["site", "source"] {
+        if let nested = item[key] as? [String: Any] {
+            for baseKey in baseKeys {
+                if let value = nested.string(baseKey), let url = resourceResolvedURL(value, relativeTo: nil) {
+                    return url
+                }
+            }
         }
     }
     if let detail = item.string("detail_url", "detailUrl", "details_url", "detailsUrl"),
@@ -2014,27 +2024,116 @@ private func resourceResolvedURL(_ value: String, relativeTo site: SiteItem?, it
     return relative
 }
 
-private func resourceImageValue(_ item: [String: Any]) -> String {
+private func resourceImageStrings(_ value: Any?, depth: Int = 0) -> [String] {
+    guard depth < 5 else { return [] }
+    if let value = value as? String {
+        var normalized = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "\\/", with: "/")
+        if normalized.lowercased().hasPrefix("url("), normalized.hasSuffix(")") {
+            normalized = String(normalized.dropFirst(4).dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if normalized.count >= 2,
+           ((normalized.first == "\"" && normalized.last == "\"")
+            || (normalized.first == "'" && normalized.last == "'")) {
+            normalized = String(normalized.dropFirst().dropLast())
+        }
+        if normalized.contains(","), normalized.range(of: #"\s(?:1|2|3)x(?:\s|,)"#, options: .regularExpression) != nil {
+            return normalized.split(separator: ",").compactMap { part in
+                let candidate = part.split(whereSeparator: { $0 == " " || $0 == "\t" }).first.map(String.init) ?? ""
+                return candidate.isEmpty ? nil : candidate
+            }
+        }
+        return normalized.isEmpty ? [] : [normalized]
+    }
+    if let dictionary = value as? [String: Any] {
+        var values: [String] = []
+        for key in [
+            "url", "src", "href", "large", "normal", "medium", "small", "original",
+            "path", "file", "srcset", "source", "value", "@src"
+        ] {
+            values.append(contentsOf: resourceImageStrings(dictionary[key], depth: depth + 1))
+        }
+        return values
+    }
+    if let values = value as? [Any] {
+        return values.flatMap { resourceImageStrings($0, depth: depth + 1) }
+    }
+    return []
+}
+
+private func resourceImageValues(_ item: [String: Any], depth: Int = 0) -> [String] {
+    guard depth < 5 else { return [] }
     let keys = [
         "poster", "poster_url", "posterUrl", "torrent_poster", "torrentPoster",
         "torrent_poster_url", "torrentPosterUrl", "cover", "cover_url", "coverUrl",
         "cover_image", "coverImage", "thumbnail", "thumbnail_url", "thumbnailUrl",
-        "pic", "image", "image_url", "imageUrl", "img"
+        "pic", "image", "image_url", "imageUrl", "img", "images", "photos",
+        "poster_path", "cover_path", "thumbnail_path"
     ]
-    for key in keys {
-        if let value = mediaStringValue(item[key]), !value.isEmpty { return value }
-    }
-    for key in ["torrent", "detail", "data", "result"] {
-        if let nested = item[key] as? [String: Any] {
-            let value = resourceImageValue(nested)
-            if !value.isEmpty { return value }
+    var values = keys.flatMap { resourceImageStrings(item[$0]) }
+    for (key, value) in item {
+        let normalizedKey = key.lowercased()
+        if normalizedKey.contains("poster") || normalizedKey.contains("cover")
+            || normalizedKey.contains("thumb") || normalizedKey.contains("image")
+            || normalizedKey.contains("photo") || normalizedKey == "pic" {
+            values.append(contentsOf: resourceImageStrings(value))
         }
     }
-    return mediaImageValue(item)
+    for key in ["torrent", "detail", "data", "result", "site", "source"] {
+        if let nested = item[key] as? [String: Any] {
+            values.append(contentsOf: resourceImageValues(nested, depth: depth + 1))
+        }
+    }
+    var seen = Set<String>()
+    return values.filter { seen.insert($0).inserted }
 }
 
-private func resourceCoverURL(_ item: [String: Any], site: SiteItem?) -> URL? {
-    resourceResolvedURL(resourceImageValue(item), relativeTo: site, item: item)
+private func resourceImageCandidates(_ item: [String: Any], site: SiteItem?) -> [RemoteImageCandidate] {
+    var candidates: [RemoteImageCandidate] = []
+    var seen = Set<String>()
+    for value in resourceImageValues(item) {
+        guard let url = resourceResolvedURL(value, relativeTo: site, item: item) else { continue }
+        var urls = [url]
+        if let scheme = url.scheme?.lowercased(), let alternateScheme = scheme == "https" ? "http" : (scheme == "http" ? "https" : nil),
+           var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            components.scheme = alternateScheme
+            if let alternateURL = components.url { urls.append(alternateURL) }
+        }
+        for candidateURL in urls {
+            let useCredentials = candidateURL.scheme?.lowercased() == url.scheme?.lowercased()
+            let authenticatedHeaders = resourceImageHeaders(
+                for: candidateURL,
+                item: item,
+                site: site,
+                includeSiteCredentials: useCredentials,
+                includeItemCredentials: useCredentials
+            )
+            let publicHeaders = resourceImageHeaders(
+                for: candidateURL,
+                item: item,
+                site: site,
+                includeSiteCredentials: false,
+                includeItemCredentials: false
+            )
+            let variants: [([String: String], String?)] = [
+                (authenticatedHeaders, nil),
+                (publicHeaders, "resource-cover|\(candidateURL.absoluteString)")
+            ]
+            for (headers, persistentID) in variants {
+                let key = remoteImageCacheKey(url: candidateURL, headers: headers)
+                guard seen.insert(key).inserted else { continue }
+                candidates.append(RemoteImageCandidate(
+                    url: candidateURL,
+                    headers: headers,
+                    persistentCacheID: persistentID
+                ))
+            }
+        }
+    }
+    return candidates
 }
 
 private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
@@ -2045,22 +2144,42 @@ private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
     return resourceResolvedURL(value, relativeTo: site, item: item)
 }
 
-private func resourceImageHeaders(for url: URL?, item: [String: Any], site: SiteItem?) -> [String: String] {
+private func resourceImageHeaders(
+    for url: URL?,
+    item: [String: Any],
+    site: SiteItem?,
+    includeSiteCredentials: Bool = true,
+    includeItemCredentials: Bool = true
+) -> [String: String] {
     var headers: [String: String] = [:]
-    if let site {
-        let cookie = site.cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        let userAgent = site.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+    let nestedSite = item.dict("site", "source")
+    if includeSiteCredentials {
+        let cookie = (site?.cookie ?? nestedSite?.string("cookie", "cookies") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let userAgent = (site?.userAgent ?? nestedSite?.string("user_agent", "userAgent") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if !cookie.isEmpty { headers["Cookie"] = cookie }
         if !userAgent.isEmpty { headers["User-Agent"] = userAgent }
-        if let referer = resourceSiteBaseURL(site)?.absoluteString {
-            headers["Referer"] = referer
+        let refererURL = item.string("referer", "referrer")
+            .flatMap { resourceResolvedURL($0, relativeTo: site, item: item) }
+            ?? resourceDetailURL(item, site: site)
+            ?? resourceSiteBaseURL(site)
+            ?? resourceItemBaseURL(item, site: nil)
+        if let refererURL {
+            headers["Referer"] = refererURL.absoluteString
         }
     }
-    if let cookie = item.string("cookie", "cookies")?.trimmingCharacters(in: .whitespacesAndNewlines), !cookie.isEmpty {
-        headers["Cookie"] = cookie
-    }
-    if let userAgent = item.string("user_agent", "userAgent")?.trimmingCharacters(in: .whitespacesAndNewlines), !userAgent.isEmpty {
-        headers["User-Agent"] = userAgent
+    if includeItemCredentials {
+        let cookie = (item.string("cookie", "cookies") ?? nestedSite?.string("cookie", "cookies"))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let cookie, !cookie.isEmpty {
+            headers["Cookie"] = cookie
+        }
+        let userAgent = (item.string("user_agent", "userAgent") ?? nestedSite?.string("user_agent", "userAgent"))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let userAgent, !userAgent.isEmpty {
+            headers["User-Agent"] = userAgent
+        }
     }
     return remoteImageHeaders(for: url, additional: headers)
 }
@@ -2249,6 +2368,9 @@ struct SearchView: View {
                                     openResourceDetail(item.value, site: site)
                                 }
                             )
+                            .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
                         }
                     }
                 }
@@ -2878,53 +3000,97 @@ struct ResourceRowItem: View {
     let siteLabel: String
     let site: SiteItem?
 
-    private var coverURL: URL? { resourceCoverURL(item, site: site) }
+    private var imageCandidates: [RemoteImageCandidate] {
+        resourceImageCandidates(item, site: site)
+    }
+    private var title: String {
+        let value = item.string("title", "name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? "未命名资源" : value
+    }
+    private var subtitle: String {
+        item.string("subtitle", "sub_title", "description")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
 
     var body: some View {
-        HStack(spacing: 12) {
-            CachedRemoteImage(
-                url: coverURL,
-                headers: resourceImageHeaders(for: coverURL, item: item, site: site)
-            ) { image in
-                image.resizable().scaledToFill()
-            } placeholder: {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(HarvestTheme.blue.opacity(0.08))
-                    .overlay {
-                        Image(systemName: "doc.richtext")
-                            .foregroundStyle(HarvestTheme.blue.opacity(0.55))
-                    }
+        HStack(alignment: .top, spacing: 11) {
+            CachedRemoteImageCandidates(
+                candidates: imageCandidates,
+                content: { image in
+                    image.resizable().scaledToFill()
+                },
+                placeholder: {
+                    resourcePosterPlaceholder(title: title, category: category)
+                }
+            )
+            .frame(width: 62, height: 82)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
             }
-            .frame(width: 54, height: 76)
-            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            VStack(alignment: .leading, spacing: 7) {
-                Text(item.string("title", "name") ?? "未命名资源")
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(2)
-                if let subtitle = item.string("subtitle", "sub_title"), !subtitle.isEmpty {
-                    Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .multilineTextAlignment(.leading)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                HStack {
-                    Text(sizeLabel).fontWeight(.semibold)
-                    Label("\(seeders)", systemImage: "arrow.up.circle.fill").foregroundStyle(HarvestTheme.green)
-                    Label("\(leechers)", systemImage: "arrow.down.circle.fill").foregroundStyle(HarvestTheme.coral)
-                    Label("\(completers)", systemImage: "checkmark.circle.fill")
-                    Spacer(minLength: 6)
-                    Text(siteLabel.isEmpty ? "未知站点" : siteLabel).lineLimit(1)
+                HStack(spacing: 8) {
+                    ResourceMetric(label: sizeLabel, systemImage: "internaldrive", tint: HarvestTheme.blue)
+                    ResourceMetric(label: "\(seeders)", systemImage: "arrow.up", tint: HarvestTheme.green)
+                    ResourceMetric(label: "\(leechers)", systemImage: "arrow.down", tint: HarvestTheme.coral)
+                    ResourceMetric(label: "\(completers)", systemImage: "checkmark", tint: .secondary)
+                    Spacer(minLength: 0)
                 }
-                .font(.caption)
+                .font(.caption2.weight(.medium))
+                HStack(spacing: 6) {
+                    Text(siteLabel.isEmpty ? "未知站点" : siteLabel)
+                        .lineLimit(1)
+                        .foregroundStyle(HarvestTheme.blue)
+                    if let category, !category.isEmpty {
+                        Text("·").foregroundStyle(.tertiary)
+                        Text(category).lineLimit(1)
+                    }
+                    if hasHR {
+                        Text("HR")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(HarvestTheme.coral)
+                    }
+                }
+                .font(.caption2)
                 .foregroundStyle(.secondary)
-                if !detailLabels.isEmpty {
-                    Text(detailLabels.joined(separator: " · "))
+                if !statusLabels.isEmpty {
+                    Text(statusLabels.joined(separator: " · "))
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
-                        .lineLimit(2)
+                        .lineLimit(1)
                 }
             }
-            Image(systemName: "arrow.down.circle").foregroundStyle(HarvestTheme.green)
+            Spacer(minLength: 0)
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.title3)
+                .foregroundStyle(HarvestTheme.green)
+                .padding(.top, 2)
         }
-        .padding(.vertical, 5)
+        .padding(10)
+        .background(Color(uiColor: .secondarySystemBackground).opacity(0.72), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(Color.primary.opacity(0.055), lineWidth: 0.5)
+        }
     }
+
+    private var category: String? {
+        let value = item.string("category", "category_name", "categoryName")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty || value == "无分类" ? nil : value
+    }
+
+    private var hasHR: Bool { resourceHasHRValue(item) }
 
     private var sizeLabel: String {
         guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
@@ -2936,14 +3102,54 @@ struct ResourceRowItem: View {
     private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
     private var leechers: Int { item.int("leechers", "leecher", "leech") ?? 0 }
     private var completers: Int { item.int("completers", "completed", "snatched") ?? 0 }
-    private var detailLabels: [String] {
+    private var statusLabels: [String] {
         var values: [String] = []
-        if let category = item.string("category", "category_name"), !category.isEmpty, category != "无分类" { values.append(category) }
         let sale = item.string("sale_status", "saleStatus", "promotion") ?? ""
         if !sale.isEmpty, sale != "无优惠" { values.append(sale) }
         if resourceHasHRValue(item) { values.append("HR") }
         if let published = item.string("published", "pubdate", "created_at", "date"), !published.isEmpty { values.append(published) }
         return values
+    }
+}
+
+private struct ResourceMetric: View {
+    let label: String
+    let systemImage: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: systemImage)
+                .font(.caption2.weight(.bold))
+            Text(label).lineLimit(1)
+        }
+        .foregroundStyle(tint)
+    }
+}
+
+private func resourcePosterPlaceholder(title: String, category: String?) -> some View {
+    let initial = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
+    return ZStack(alignment: .bottomLeading) {
+        Color(uiColor: .tertiarySystemFill)
+        VStack(alignment: .leading, spacing: 4) {
+            Image(systemName: "film.stack")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(HarvestTheme.blue.opacity(0.72))
+            Text(initial.isEmpty ? "?" : initial)
+                .font(.title2.weight(.bold))
+                .foregroundStyle(HarvestTheme.blue.opacity(0.62))
+        }
+        .padding(8)
+        if let category, !category.isEmpty {
+            Text(category)
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(.thinMaterial, in: Capsule())
+                .padding(6)
+        }
     }
 }
 
@@ -2957,7 +3163,9 @@ private struct ResourceDetailSheet: View {
     private var siteLabel: String {
         site?.name ?? item.string("site_name", "siteName", "site") ?? "未知站点"
     }
-    private var coverURL: URL? { resourceCoverURL(item, site: site) }
+    private var imageCandidates: [RemoteImageCandidate] {
+        resourceImageCandidates(item, site: site)
+    }
     private var detailURL: URL? { resourceDetailURL(item, site: site) }
     private var downloadURL: String {
         item.string("magnet_url", "magnetUrl", "download_url", "downloadUrl", "torrent_url", "torrentUrl") ?? ""
@@ -2996,16 +3204,15 @@ private struct ResourceDetailSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(alignment: .top, spacing: 14) {
-                        CachedRemoteImage(
-                            url: coverURL,
-                            headers: resourceImageHeaders(for: coverURL, item: item, site: site)
-                        ) { image in
-                            image.resizable().scaledToFill()
-                        } placeholder: {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(HarvestTheme.blue.opacity(0.08))
-                                .overlay(Image(systemName: "doc.richtext").font(.title2).foregroundStyle(.secondary))
-                        }
+                        CachedRemoteImageCandidates(
+                            candidates: imageCandidates,
+                            content: { image in
+                                image.resizable().scaledToFill()
+                            },
+                            placeholder: {
+                                resourcePosterPlaceholder(title: title, category: nil)
+                            }
+                        )
                         .frame(width: 104, height: 146)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 

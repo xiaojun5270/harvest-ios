@@ -578,6 +578,7 @@ func remoteImageCacheKey(url: URL, headers: [String: String]) -> String {
 struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     let url: URL?
     let headers: [String: String]
+    let persistentCacheID: String?
     private let onFailure: (() -> Void)?
     private let content: (Image) -> Content
     private let placeholder: () -> Placeholder
@@ -586,12 +587,14 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     init(
         url: URL?,
         headers: [String: String] = [:],
+        persistentCacheID: String? = nil,
         onFailure: (() -> Void)? = nil,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
     ) {
         self.url = url
         self.headers = headers
+        self.persistentCacheID = persistentCacheID
         self.onFailure = onFailure
         self.content = content
         self.placeholder = placeholder
@@ -608,7 +611,10 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
         .task(id: requestKey) {
             loadedImage = nil
             guard let url,
-                  let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else { return }
+                  let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else {
+                if !Task.isCancelled { await MainActor.run { onFailure?() } }
+                return
+            }
             let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
             let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
             if let cached = RemoteDecodedImageCache.shared.image(for: cacheKey) {
@@ -616,7 +622,11 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 return
             }
             do {
-                let data = try await RemoteImageDataCache.shared.data(for: normalizedURL, headers: effectiveHeaders)
+                let data = try await RemoteImageDataCache.shared.data(
+                    for: normalizedURL,
+                    headers: effectiveHeaders,
+                    persistentCacheID: persistentCacheID
+                )
                 guard !Task.isCancelled else { return }
                 let image = await Task.detached(priority: .utility) { () -> UIImage? in
                     decodedRemoteDisplayImage(data)
@@ -684,6 +694,7 @@ struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
                 CachedRemoteImage(
                     url: candidate.url,
                     headers: candidate.headers,
+                    persistentCacheID: candidate.persistentCacheID,
                     onFailure: advanceCandidate,
                     content: content,
                     placeholder: placeholder
