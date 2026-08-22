@@ -1,4 +1,3 @@
-import Charts
 import Foundation
 import SwiftUI
 import UIKit
@@ -1660,11 +1659,6 @@ final class DownloadsViewModel: ObservableObject {
 
     func repeatTorrents(_ appState: AppState, downloader: DownloaderItem) async {
         _ = await appState.perform("\(APIPath.downloaderRepeat)/\(downloader.id)", method: .get)
-    }
-
-    func refreshCountdownText(at date: Date = Date()) -> String {
-        let remaining = max(0, Int((refreshDeadline?.timeIntervalSince(date) ?? 0).rounded(.up)))
-        return String(format: "%d:%02d", remaining / 60, remaining % 60)
     }
 
     func startWatching(

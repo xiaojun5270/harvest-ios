@@ -333,12 +333,6 @@ actor RemoteImageDataCache {
         return cacheID.hasPrefix("resource-cover|")
     }
 
-    private func isBackendImageProxyURL(_ url: URL) -> Bool {
-        let path = url.path.lowercased()
-        return path.hasPrefix("/api/v1/site/image/")
-            || path.hasPrefix("/api/v1/media/image/")
-            || path.hasPrefix("/api/v1/system/image/")
-    }
 }
 
 private final class RemoteDecodedImageCache: @unchecked Sendable {
@@ -613,22 +607,30 @@ func normalizedRemoteImageURL(_ value: String) -> String {
     return normalized
 }
 
+private func isLikelyPageChromeImageURL(_ url: URL) -> Bool {
+    let value = (url.path + "?" + (url.query ?? "")).lowercased()
+    return [
+        "favicon", "/logo", "logo.", "_logo", "-logo",
+        "avatar", "userpic", "/smil", "/emoji", "/badge",
+        "loading", "spinner", "blank.", "no-image", "no_image",
+        "placeholder", "default-avatar"
+    ].contains { value.contains($0) }
+}
+
 private func remoteImageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
     // Tracker pages are not consistently UTF-8. Lossy decoding still preserves
     // ASCII attribute names and URLs, which are the only parts needed here.
     let html = String(decoding: data, as: UTF8.self)
     guard !html.isEmpty else { return nil }
     let patterns = [
-        #"(?is)<meta[^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"'][^>]+content\s*=\s*[\"']([^\"']+)[\"']"#,
-        #"(?is)<meta[^>]+content\s*=\s*[\"']([^\"']+)[\"'][^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"']"#,
-        #"(?is)<link[^>]+rel\s*=\s*[\"']image_src[\"'][^>]+href\s*=\s*[\"']([^\"']+)[\"']"#,
         #"(?is)<img[^>]+(?:class|id)\s*=\s*[\"'][^\"']*(?:poster|cover|torrentpic|screenshot)[^\"']*[\"'][^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb|srcset)\s*=\s*[\"']([^\"']+)[\"']"#,
         #"(?is)<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb|srcset)\s*=\s*[\"']([^\"']+)[\"'][^>]+(?:class|id)\s*=\s*[\"'][^\"']*(?:poster|cover|torrentpic|screenshot)[^\"']*[\"']"#,
+        #"(?is)<(?:td|div|section|article)[^>]+(?:class|id)\s*=\s*[\"'][^\"']*(?:kdescr|torrent[-_ ]?(?:description|content))[^\"']*[\"'][^>]*>(?:(?!</(?:td|div|section|article)\s*>).)*?<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb|srcset)\s*=\s*[\"']([^\"']+)[\"']"#,
         #"(?is)(?:data-poster|data-cover|data-image|data-preview)\s*=\s*[\"']([^\"']+)[\"']"#,
         #"(?is)[\"'](?:poster|poster_url|cover|cover_url|image|image_url)[\"']\s*:\s*[\"'](https?:\\?/\\?/[^\"']+)[\"']"#,
-        #"(?is)<img[^>]+(?:src|data-src|data-original|data-lazy-src|data-thumb)\s*=\s*[\"']([^\"']+)[\"']"#,
-        #"(?is)background-image\s*:\s*url\(\s*[\"']?([^\"')\s]+)"#,
-        #"(?is)(?:srcset|data-srcset)\s*=\s*[\"']([^\"']+)[\"']"#
+        #"(?is)<meta[^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"'][^>]+content\s*=\s*[\"']([^\"']+)[\"']"#,
+        #"(?is)<meta[^>]+content\s*=\s*[\"']([^\"']+)[\"'][^>]+(?:property|name)\s*=\s*[\"'](?:og:image|twitter:image)[\"']"#,
+        #"(?is)<link[^>]+rel\s*=\s*[\"']image_src[\"'][^>]+href\s*=\s*[\"']([^\"']+)[\"']"#
     ]
     for pattern in patterns {
         guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
@@ -656,11 +658,14 @@ private func remoteImageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
             if value.hasPrefix("//") { value = "https:\(value)" }
             guard !value.isEmpty,
                   !value.lowercased().hasPrefix("data:") else { continue }
-            if let absolute = URL(string: value), ["http", "https"].contains(absolute.scheme?.lowercased() ?? "") {
+            if let absolute = URL(string: value),
+               ["http", "https"].contains(absolute.scheme?.lowercased() ?? ""),
+               !isLikelyPageChromeImageURL(absolute) {
                 return absolute
             }
             if let relative = URL(string: value, relativeTo: baseURL)?.absoluteURL,
-               ["http", "https"].contains(relative.scheme?.lowercased() ?? "") {
+               ["http", "https"].contains(relative.scheme?.lowercased() ?? ""),
+               !isLikelyPageChromeImageURL(relative) {
                 return relative
             }
         }
@@ -708,7 +713,8 @@ private func remoteImageURLFromResponse(_ data: Data, baseURL: URL) -> URL? {
 
     for value in strings(object) {
         guard let url = URL(string: value),
-              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { continue }
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              !isLikelyPageChromeImageURL(url) else { continue }
         return url
     }
     return nil
@@ -2348,36 +2354,6 @@ final class HardwareProgressShimmerView: UIView {
         animation.repeatCount = .infinity
         animation.isRemovedOnCompletion = false
         shimmerLayer.add(animation, forKey: "harvest.progress-shimmer")
-    }
-}
-
-struct MetricCard: View {
-    let label: String
-    let value: String
-    let detail: String
-    let icon: String
-    let color: Color
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                SymbolBadge(icon: icon, color: color, size: 36)
-                Spacer()
-                Text(label).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            }
-            Text(value).font(.title2.weight(.bold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
-            Text(detail).font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            Color(uiColor: .secondarySystemGroupedBackground),
-            in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
-                .stroke(Color.primary.opacity(0.06))
-        )
     }
 }
 

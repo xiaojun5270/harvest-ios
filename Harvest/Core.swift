@@ -7,7 +7,6 @@ import WebKit
 
 enum HarvestTheme {
     static let green = Color(red: 0.18, green: 0.56, blue: 0.36)
-    static let mint = Color(red: 0.46, green: 0.91, blue: 0.67)
     static let coral = Color(red: 0.91, green: 0.36, blue: 0.46)
     static let amber = Color(red: 0.94, green: 0.64, blue: 0.10)
     static let blue = Color(red: 0.20, green: 0.52, blue: 0.87)
@@ -15,8 +14,6 @@ enum HarvestTheme {
     static let purple = Color(red: 0.50, green: 0.38, blue: 0.82)
     static let orange = Color(red: 0.95, green: 0.43, blue: 0.18)
     static let indigo = Color(red: 0.31, green: 0.38, blue: 0.78)
-    static let ink = Color(red: 0.08, green: 0.10, blue: 0.11)
-    static let panel = Color(uiColor: .secondarySystemBackground)
     static let cardCornerRadius: CGFloat = 24
 }
 
@@ -779,15 +776,11 @@ enum APIPath {
     static let siteStatus = "/api/mysite/info/"
     static let siteSign = "/api/mysite/sign/"
     static let siteRepeat = "/api/mysite/repeat/"
-    static let siteImport = "/api/mysite/import"
     static let siteImportTOML = "/api/mysite/import/toml"
     static let siteBulkUpgrade = "/api/mysite/bulk/upgrade"
     static let siteImportPTPP = "/api/mysite/cookie/ptpp"
     static let siteImportPTD = "/api/mysite/cookie/ptd"
     static let siteImportCookieCloud = "/api/mysite/cookie/cloud"
-    static let siteStatusChart = "/api/mysite/status/chart/v2"
-    static let siteSort = "/api/mysite/sort"
-    static let siteStatusToday = "/api/mysite/status/today"
     static let downloaders = "/api/option/downloaders"
     static let downloaderSpeed = "/api/ws/downloader/speed"
     static let downloaderTorrents = "/api/ws/downloader"
@@ -798,9 +791,7 @@ enum APIPath {
     static let downloaderToggleSpeed = "/api/option/downloaders/toggle_speed_limit/"
     static let downloaderTest = "/api/option/downloaders/test/"
     static let downloaderTags = "/api/option/downloaders/tags/"
-    static let downloaderSetTags = "/api/option/downloaders/tags/set/"
     static let downloaderCategories = "/api/option/downloaders/category/"
-    static let downloaderSetCategory = "/api/option/downloaders/category/set/"
     static let downloaderReplaceTrackers = "/api/option/downloaders/trackers/replace/"
     static let downloaderRepeat = "/api/option/repeat"
     static let downloaderPaths = "/api/option/paths"
@@ -836,7 +827,6 @@ enum APIPath {
     static let doubanRank = "/api/option/douban/rank"
     static let doubanTags = "/api/option/douban/tags"
     static let doubanSubject = "/api/option/douban/subject/"
-    static let resourceSearch = "/api/mysite/torrents"
     static let adminUsers = "/api/auth/admin/users"
     static let adminSendToken = "/api/auth/admin/send"
     static let adminResetToken = "/api/auth/admin/reset/token"
@@ -1802,10 +1792,6 @@ final class AppState: ObservableObject {
             await AppLogStore.shared.append(.warning, "读取初始化状态失败：\(error.localizedDescription)")
             return nil
         }
-    }
-
-    func requiresSetup(server: String) async -> Bool? {
-        await fetchSetupStatus(server: server)?.needsSetup
     }
 
     func setupDatabase(server: String, payload: [String: Any]) async throws {

@@ -616,14 +616,6 @@ final class SitesViewModel: ObservableObject {
         defaults.removeObject(forKey: SiteFilterStorageKey.ascending)
     }
 
-    func selectSortField(_ field: SiteSortField) {
-        if sortField == field {
-            ascending.toggle()
-            return
-        }
-        setSortField(field)
-    }
-
     func setSortField(_ field: SiteSortField) {
         sortField = field
         ascending = field.defaultAscending

@@ -2,7 +2,6 @@ import Charts
 import Foundation
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 
 struct TrendPoint: Identifiable {
     let id = UUID()
