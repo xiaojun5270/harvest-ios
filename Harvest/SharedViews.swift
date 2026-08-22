@@ -4,6 +4,11 @@ import ImageIO
 import SwiftUI
 import UIKit
 
+struct RemoteMediaPosterAPI: Sendable {
+    let baseURL: String
+    let accessToken: String
+}
+
 actor RemoteImageDataCache {
     static let shared = RemoteImageDataCache()
 
@@ -16,6 +21,7 @@ actor RemoteImageDataCache {
     private let legacyPersistentImageDirectory: URL?
     private let session: URLSession
     private let privateSession: URLSession
+    private let linkedMediaSession: URLSession
     private var inFlight: [String: Task<Data, Error>] = [:]
 
     private init() {
@@ -45,6 +51,15 @@ actor RemoteImageDataCache {
         privateConfiguration.waitsForConnectivity = false
         privateConfiguration.httpShouldSetCookies = false
         privateConfiguration.httpCookieStorage = nil
+        let linkedMediaConfiguration = URLSessionConfiguration.ephemeral
+        linkedMediaConfiguration.urlCache = nil
+        linkedMediaConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        linkedMediaConfiguration.timeoutIntervalForRequest = 8
+        linkedMediaConfiguration.timeoutIntervalForResource = 15
+        linkedMediaConfiguration.waitsForConnectivity = false
+        linkedMediaConfiguration.httpMaximumConnectionsPerHost = 3
+        linkedMediaConfiguration.httpShouldSetCookies = false
+        linkedMediaConfiguration.httpCookieStorage = nil
         let persistentDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first?
             .appendingPathComponent("Harvest", isDirectory: true)
@@ -70,12 +85,15 @@ actor RemoteImageDataCache {
         legacyPersistentImageDirectory = legacyPersistentDirectory
         session = publicSession
         privateSession = URLSession(configuration: privateConfiguration)
+        linkedMediaSession = URLSession(configuration: linkedMediaConfiguration)
     }
 
     func data(
         for url: URL,
         headers: [String: String] = [:],
-        persistentCacheID: String? = nil
+        persistentCacheID: String? = nil,
+        prefersLinkedMediaPoster: Bool = false,
+        linkedMediaAPI: RemoteMediaPosterAPI? = nil
     ) async throws -> Data {
         guard let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else {
             throw APIError(statusCode: 0, message: "图片地址无效")
@@ -95,7 +113,8 @@ actor RemoteImageDataCache {
         if !persistToDisk, let persistentCacheID {
             removePersistentData(for: persistentCacheID)
         }
-        let key = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+        let variant = prefersLinkedMediaPoster ? "linked-media-poster" : ""
+        let key = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
         let cacheKey = key as NSString
         if let cached = memoryCache.object(forKey: cacheKey) {
             if let persistentID {
@@ -142,7 +161,9 @@ actor RemoteImageDataCache {
         }
 
         let task = Task<Data, Error> {
-            let activeSession = persistToDisk ? session : privateSession
+            let activeSession = prefersLinkedMediaPoster
+                ? linkedMediaSession
+                : (persistToDisk ? session : privateSession)
             let (data, response) = try await activeSession.data(for: request)
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 throw APIError(statusCode: http.statusCode, message: "图片加载失败（\(http.statusCode)）")
@@ -157,18 +178,52 @@ actor RemoteImageDataCache {
                 .lowercased() ?? ""
             if let nestedImageURL = remoteImageURLFromResponse(data, baseURL: normalizedURL),
                nestedImageURL != normalizedURL {
-                var forwardedHeaders = effectiveHeaders
-                if forwardedHeaders.keys.first(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) == nil {
-                    forwardedHeaders["Referer"] = normalizedURL.absoluteString
-                }
                 return try await self.data(
                     for: nestedImageURL,
-                    headers: forwardedHeaders,
-                    persistentCacheID: persistentCacheID
+                    headers: forwardedRemoteImageHeaders(
+                        effectiveHeaders,
+                        from: normalizedURL,
+                        to: nestedImageURL
+                    ),
+                    persistentCacheID: persistentCacheID,
+                    prefersLinkedMediaPoster: prefersLinkedMediaPoster,
+                    linkedMediaAPI: linkedMediaAPI
                 )
             }
             if mimeType.contains("html") || bodyPrefix.hasPrefix("<!doctype html")
                 || bodyPrefix.hasPrefix("<html") || bodyPrefix.hasPrefix("<head") {
+                if prefersLinkedMediaPoster,
+                   let mediaPageURL = remoteMediaPageURLFromHTML(data, baseURL: normalizedURL),
+                   mediaPageURL != normalizedURL {
+                    if let linkedMediaAPI,
+                       let apiPosterURL = await linkedMediaPosterURL(
+                        for: mediaPageURL,
+                        api: linkedMediaAPI
+                       ) {
+                        return try await self.data(
+                            for: apiPosterURL,
+                            headers: forwardedRemoteImageHeaders(
+                                effectiveHeaders,
+                                from: mediaPageURL,
+                                to: apiPosterURL
+                            ),
+                            persistentCacheID: persistentCacheID,
+                            prefersLinkedMediaPoster: true,
+                            linkedMediaAPI: linkedMediaAPI
+                        )
+                    }
+                    return try await self.data(
+                        for: mediaPageURL,
+                        headers: forwardedRemoteImageHeaders(
+                            effectiveHeaders,
+                            from: normalizedURL,
+                            to: mediaPageURL
+                        ),
+                        persistentCacheID: persistentCacheID,
+                        prefersLinkedMediaPoster: true,
+                        linkedMediaAPI: linkedMediaAPI
+                    )
+                }
                 // A number of trackers protect their poster endpoint and return
                 // a small HTML page containing the real image URL. Follow the
                 // common OpenGraph/lazy-image values instead of treating that
@@ -177,14 +232,16 @@ actor RemoteImageDataCache {
                       imageURL != normalizedURL else {
                     throw APIError(statusCode: 0, message: "图片服务返回了网页内容")
                 }
-                var forwardedHeaders = effectiveHeaders
-                if forwardedHeaders.keys.first(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) == nil {
-                    forwardedHeaders["Referer"] = normalizedURL.absoluteString
-                }
                 return try await self.data(
                     for: imageURL,
-                    headers: forwardedHeaders,
-                    persistentCacheID: persistentCacheID
+                    headers: forwardedRemoteImageHeaders(
+                        effectiveHeaders,
+                        from: normalizedURL,
+                        to: imageURL
+                    ),
+                    persistentCacheID: persistentCacheID,
+                    prefersLinkedMediaPoster: prefersLinkedMediaPoster,
+                    linkedMediaAPI: linkedMediaAPI
                 )
             }
             guard !data.isEmpty, data.count <= 20 * 1_024 * 1_024 else {
@@ -208,6 +265,35 @@ actor RemoteImageDataCache {
         } catch {
             inFlight[key] = nil
             throw error
+        }
+    }
+
+    private func linkedMediaPosterURL(
+        for mediaPageURL: URL,
+        api: RemoteMediaPosterAPI
+    ) async -> URL? {
+        guard let reference = linkedMediaReference(from: mediaPageURL) else { return nil }
+        var baseURL = api.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while baseURL.hasSuffix("/") { baseURL.removeLast() }
+        guard !baseURL.isEmpty,
+              let url = URL(string: baseURL + reference.apiPath) else { return nil }
+        var request = URLRequest(
+            url: url,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 8
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Harvest-iOS/1.0", forHTTPHeaderField: "User-Agent")
+        if !api.accessToken.isEmpty {
+            request.setValue("Bearer \(api.accessToken)", forHTTPHeaderField: "Authorization")
+        }
+        do {
+            let (data, response) = try await linkedMediaSession.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return nil }
+            return remotePosterURLFromMediaResponse(data, reference: reference)
+        } catch {
+            return nil
         }
     }
 
@@ -617,6 +703,178 @@ private func isLikelyPageChromeImageURL(_ url: URL) -> Bool {
     ].contains { value.contains($0) }
 }
 
+private enum LinkedMediaReference {
+    case douban(id: String)
+    case tmdb(kind: String, id: String)
+
+    var apiPath: String {
+        switch self {
+        case let .douban(id):
+            return "/api/option/douban/subject/\(id)"
+        case let .tmdb(kind, id):
+            return "/api/tmdb/\(kind)/\(id)"
+        }
+    }
+
+    var isTMDB: Bool {
+        if case .tmdb = self { return true }
+        return false
+    }
+}
+
+private func linkedMediaReference(from url: URL) -> LinkedMediaReference? {
+    let host = url.host?.lowercased() ?? ""
+    let components = url.pathComponents.filter { $0 != "/" }
+    let lowered = components.map { $0.lowercased() }
+    if host.hasSuffix("douban.com"),
+       let index = lowered.lastIndex(of: "subject"),
+       components.indices.contains(index + 1) {
+        let id = components[index + 1]
+        if !id.isEmpty, id.allSatisfy({ $0.isNumber }) { return .douban(id: id) }
+    }
+    if host == "themoviedb.org" || host.hasSuffix(".themoviedb.org") {
+        for kind in ["movie", "tv"] {
+            guard let index = lowered.lastIndex(of: kind),
+                  components.indices.contains(index + 1) else { continue }
+            let id = components[index + 1].split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
+            if !id.isEmpty, id.allSatisfy({ $0.isNumber }) { return .tmdb(kind: kind, id: id) }
+        }
+    }
+    return nil
+}
+
+private func remotePosterURLFromMediaResponse(
+    _ data: Data,
+    reference: LinkedMediaReference
+) -> URL? {
+    guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+        return nil
+    }
+
+    func imageValues(
+        _ value: Any,
+        depth: Int = 0,
+        acceptsGenericURL: Bool = false
+    ) -> [String] {
+        guard depth < 7 else { return [] }
+        if let value = value as? String {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return normalized.isEmpty ? [] : [normalized]
+        }
+        if let values = value as? [Any] {
+            return values.flatMap {
+                imageValues($0, depth: depth + 1, acceptsGenericURL: acceptsGenericURL)
+            }
+        }
+        guard let dictionary = value as? [String: Any] else { return [] }
+        let imageKeys = [
+            "poster_path", "posterPath", "poster_url", "posterUrl", "poster",
+            "cover_url", "coverUrl", "cover", "image_url", "imageUrl", "image",
+            "pic", "large", "normal", "medium", "small"
+        ]
+        var values = imageKeys.flatMap { key in
+            dictionary[key].map {
+                imageValues($0, depth: depth + 1, acceptsGenericURL: true)
+            } ?? []
+        }
+        if acceptsGenericURL {
+            values.append(contentsOf: ["url", "src", "href"].flatMap { key in
+                dictionary[key].map {
+                    imageValues($0, depth: depth + 1, acceptsGenericURL: true)
+                } ?? []
+            })
+        }
+        if !values.isEmpty { return values }
+        for key in ["data", "result", "subject", "target", "movie", "tv", "media", "images"] {
+            if let nested = dictionary[key] {
+                values.append(contentsOf: imageValues(nested, depth: depth + 1))
+            }
+        }
+        return values
+    }
+
+    for rawValue in imageValues(object) {
+        var value = rawValue
+            .replacingOccurrences(of: "\\/", with: "/")
+            .replacingOccurrences(of: "&amp;", with: "&")
+        if reference.isTMDB, value.hasPrefix("/") {
+            value = "https://image.tmdb.org/t/p/w342\(value)"
+        } else if reference.isTMDB, value.lowercased().contains("image.tmdb.org/t/p/") {
+            for size in ["original", "w500", "w780", "w1280"] {
+                value = value.replacingOccurrences(
+                    of: "/t/p/\(size)/",
+                    with: "/t/p/w342/",
+                    options: [.caseInsensitive]
+                )
+            }
+        } else if value.hasPrefix("//") {
+            value = "https:\(value)"
+        }
+        value = normalizedRemoteImageURL(value)
+        guard let url = URL(string: value),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              !isLikelyPageChromeImageURL(url) else { continue }
+        return url
+    }
+    return nil
+}
+
+private func isLinkedMediaPageURL(_ url: URL) -> Bool {
+    let host = url.host?.lowercased() ?? ""
+    let path = url.path.lowercased()
+    let isDoubanSubject = ((host == "movie.douban.com" || host == "www.douban.com")
+        && path.contains("/subject/"))
+        || (host == "m.douban.com" && path.contains("/movie/subject/"))
+    if isDoubanSubject {
+        return true
+    }
+    if (host == "themoviedb.org" || host.hasSuffix(".themoviedb.org")),
+       path.range(
+        of: #"/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?:movie|tv)/\d+"#,
+        options: .regularExpression
+       ) != nil {
+        return true
+    }
+    return false
+}
+
+private func remoteMediaPageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
+    guard !isLinkedMediaPageURL(baseURL) else { return nil }
+    let html = String(decoding: data, as: UTF8.self)
+        .replacingOccurrences(of: "\\/", with: "/")
+        .replacingOccurrences(of: "&amp;", with: "&")
+        .replacingOccurrences(of: "&#x2F;", with: "/")
+        .replacingOccurrences(of: "&#47;", with: "/")
+    guard !html.isEmpty else { return nil }
+    let patterns = [
+        #"(?i)((?:https?:)?//(?:(?:movie|www)\.douban\.com/subject|m\.douban\.com/movie/subject)/\d+/?(?:\?[^\"'<>\s]*)?)"#,
+        #"(?i)((?:https?:)?//(?:www\.)?themoviedb\.org/(?:[a-z]{2}(?:-[a-z]{2})?/)?(?:movie|tv)/\d+(?:-[^\"'<>/?\s]+)?)"#
+    ]
+    var documents = [html]
+    if let decoded = html.removingPercentEncoding, decoded != html {
+        documents.append(decoded)
+    }
+    for document in documents {
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(document.startIndex..<document.endIndex, in: document)
+            for match in expression.matches(in: document, range: range) {
+                guard match.numberOfRanges > 1,
+                      let valueRange = Range(match.range(at: 1), in: document) else { continue }
+                var value = String(document[valueRange])
+                if value.hasPrefix("//") { value = "https:\(value)" }
+                guard let url = URL(string: value), isLinkedMediaPageURL(url) else { continue }
+                var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                components?.scheme = "https"
+                components?.query = nil
+                components?.fragment = nil
+                if let normalizedURL = components?.url { return normalizedURL }
+            }
+        }
+    }
+    return nil
+}
+
 private func remoteImageURLFromHTML(_ data: Data, baseURL: URL) -> URL? {
     // Tracker pages are not consistently UTF-8. Lossy decoding still preserves
     // ASCII attribute names and URLs, which are the only parts needed here.
@@ -754,7 +1012,41 @@ func remoteImageHeaders(for url: URL?, additional: [String: String] = [:]) -> [S
     return headers
 }
 
-func remoteImageCacheKey(url: URL, headers: [String: String]) -> String {
+private func forwardedRemoteImageHeaders(
+    _ headers: [String: String],
+    from sourceURL: URL,
+    to destinationURL: URL
+) -> [String: String] {
+    var forwarded = headers
+    let crossesHost = sourceURL.host?.lowercased() != destinationURL.host?.lowercased()
+    if crossesHost {
+        forwarded.keys.filter {
+            let name = $0.lowercased()
+            return name == "cookie" || name.contains("authorization") || name == "referer"
+                || name.contains("token") || name.contains("api-key")
+                || name.contains("apikey") || name.contains("secret")
+        }.forEach { forwarded.removeValue(forKey: $0) }
+        if var origin = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false) {
+            origin.path = "/"
+            origin.query = nil
+            origin.fragment = nil
+            if let originURL = origin.url {
+                forwarded["Referer"] = originURL.absoluteString
+            }
+        }
+    } else if !forwarded.keys.contains(where: { $0.caseInsensitiveCompare("Referer") == .orderedSame }) {
+        forwarded["Referer"] = sourceURL.absoluteString
+    }
+    if isLinkedMediaPageURL(destinationURL) {
+        forwarded["User-Agent"] = doubanImageUserAgent
+        if isDoubanImageHost(destinationURL.host?.lowercased() ?? "") {
+            forwarded["Referer"] = doubanImageReferer
+        }
+    }
+    return remoteImageHeaders(for: destinationURL, additional: forwarded)
+}
+
+func remoteImageCacheKey(url: URL, headers: [String: String], variant: String = "") -> String {
     let normalizedHeaders: [(name: String, value: String)] = headers.map { entry in
         (name: entry.key.lowercased(), value: entry.value)
     }
@@ -765,13 +1057,16 @@ func remoteImageCacheKey(url: URL, headers: [String: String]) -> String {
     let headerPart = sortedHeaders.map { entry in
         entry.name + "=" + entry.value
     }.joined(separator: "&")
-    return "\(url.absoluteString)|\(headerPart)"
+    let baseKey = "\(url.absoluteString)|\(headerPart)"
+    return variant.isEmpty ? baseKey : "\(baseKey)|variant=\(variant)"
 }
 
 struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     let url: URL?
     let headers: [String: String]
     let persistentCacheID: String?
+    let prefersLinkedMediaPoster: Bool
+    let linkedMediaAPI: RemoteMediaPosterAPI?
     private let onFailure: (() -> Void)?
     private let content: (Image) -> Content
     private let placeholder: () -> Placeholder
@@ -781,6 +1076,8 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
         url: URL?,
         headers: [String: String] = [:],
         persistentCacheID: String? = nil,
+        prefersLinkedMediaPoster: Bool = false,
+        linkedMediaAPI: RemoteMediaPosterAPI? = nil,
         onFailure: (() -> Void)? = nil,
         @ViewBuilder content: @escaping (Image) -> Content,
         @ViewBuilder placeholder: @escaping () -> Placeholder
@@ -788,6 +1085,8 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
         self.url = url
         self.headers = headers
         self.persistentCacheID = persistentCacheID
+        self.prefersLinkedMediaPoster = prefersLinkedMediaPoster
+        self.linkedMediaAPI = linkedMediaAPI
         self.onFailure = onFailure
         self.content = content
         self.placeholder = placeholder
@@ -809,7 +1108,8 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 return
             }
             let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: headers)
-            let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+            let variant = prefersLinkedMediaPoster ? "linked-media-poster" : ""
+            let cacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
             if let cached = RemoteDecodedImageCache.shared.image(for: cacheKey) {
                 loadedImage = cached
                 return
@@ -818,13 +1118,18 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
                 let data = try await RemoteImageDataCache.shared.data(
                     for: normalizedURL,
                     headers: effectiveHeaders,
-                    persistentCacheID: persistentCacheID
+                    persistentCacheID: persistentCacheID,
+                    prefersLinkedMediaPoster: prefersLinkedMediaPoster,
+                    linkedMediaAPI: linkedMediaAPI
                 )
                 guard !Task.isCancelled else { return }
                 let image = await Task.detached(priority: .utility) { () -> UIImage? in
                     decodedRemoteDisplayImage(data)
                 }.value
                 guard !Task.isCancelled, let image else {
+                    if let persistentCacheID {
+                        await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
+                    }
                     if !Task.isCancelled { await MainActor.run { onFailure?() } }
                     return
                 }
@@ -840,7 +1145,11 @@ struct CachedRemoteImage<Content: View, Placeholder: View>: View {
     private var requestKey: String {
         guard let url,
               let normalizedURL = URL(string: normalizedRemoteImageURL(url.absoluteString)) else { return "" }
-        return remoteImageCacheKey(url: normalizedURL, headers: remoteImageHeaders(for: normalizedURL, additional: headers))
+        return remoteImageCacheKey(
+            url: normalizedURL,
+            headers: remoteImageHeaders(for: normalizedURL, additional: headers),
+            variant: prefersLinkedMediaPoster ? "linked-media-poster" : ""
+        )
     }
 }
 
@@ -848,19 +1157,29 @@ struct RemoteImageCandidate: Identifiable {
     let url: URL
     let headers: [String: String]
     let persistentCacheID: String?
+    let prefersLinkedMediaPoster: Bool
+    let linkedMediaAPI: RemoteMediaPosterAPI?
 
     init(
         url: URL,
         headers: [String: String] = [:],
-        persistentCacheID: String? = nil
+        persistentCacheID: String? = nil,
+        prefersLinkedMediaPoster: Bool = false,
+        linkedMediaAPI: RemoteMediaPosterAPI? = nil
     ) {
         self.url = url
         self.headers = headers
         self.persistentCacheID = persistentCacheID
+        self.prefersLinkedMediaPoster = prefersLinkedMediaPoster
+        self.linkedMediaAPI = linkedMediaAPI
     }
 
     var id: String {
-        remoteImageCacheKey(url: url, headers: remoteImageHeaders(for: url, additional: headers))
+        remoteImageCacheKey(
+            url: url,
+            headers: remoteImageHeaders(for: url, additional: headers),
+            variant: prefersLinkedMediaPoster ? "linked-media-poster" : ""
+        )
     }
 }
 
@@ -888,6 +1207,8 @@ struct CachedRemoteImageCandidates<Content: View, Placeholder: View>: View {
                     url: candidate.url,
                     headers: candidate.headers,
                     persistentCacheID: candidate.persistentCacheID,
+                    prefersLinkedMediaPoster: candidate.prefersLinkedMediaPoster,
+                    linkedMediaAPI: candidate.linkedMediaAPI,
                     onFailure: advanceCandidate,
                     content: content,
                     placeholder: placeholder
@@ -959,7 +1280,8 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
             return
         }
         let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
-        let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+        let variant = candidate.prefersLinkedMediaPoster ? "linked-media-poster" : ""
+        let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
         let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
         if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
             loadedImage = cached
@@ -970,7 +1292,9 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
             let data = try await RemoteImageDataCache.shared.data(
                 for: normalizedURL,
                 headers: effectiveHeaders,
-                persistentCacheID: candidate.persistentCacheID
+                persistentCacheID: candidate.persistentCacheID,
+                prefersLinkedMediaPoster: candidate.prefersLinkedMediaPoster,
+                linkedMediaAPI: candidate.linkedMediaAPI
             )
             guard !Task.isCancelled else { return }
             let pixelSize = maximumPixelSize
@@ -978,6 +1302,9 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
                 RemoteAnimatedImage(data: data, cacheKey: decodedCacheKey, maximumPixelSize: pixelSize)
             }.value
             guard !Task.isCancelled, let decoded else {
+                if let persistentCacheID = candidate.persistentCacheID {
+                    await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
+                }
                 if !Task.isCancelled { advanceCandidate() }
                 return
             }
@@ -1005,7 +1332,8 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
                 requestURL: normalizedURL,
                 headers: effectiveHeaders
             ) else { continue }
-            let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders)
+            let variant = candidate.prefersLinkedMediaPoster ? "linked-media-poster" : ""
+            let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
             let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
             if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
                 loadedImage = cached

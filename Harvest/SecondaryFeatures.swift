@@ -2363,9 +2363,10 @@ private func resourceImageValues(_ item: [String: Any], depth: Int = 0) -> [Stri
         "torrent_poster", "torrentPoster",
         "torrent_poster_url", "torrentPosterUrl", "cover", "cover_url", "coverUrl",
         "cover_proxy", "coverProxy", "cover_gif", "coverGif", "cover_gif_proxy", "coverGifProxy",
-        "cover_image", "coverImage", "cover_path", "coverPath", "thumbnail", "thumbnail_url", "thumbnailUrl",
-        "pic", "image", "image_url", "imageUrl", "img", "images", "photos",
-        "thumb", "thumbnail_path", "thumbnailPath"
+        "cover_image", "coverImage", "cover_path", "coverPath", "wiki_image", "wikiImage",
+        "thumbnail", "thumbnail_url", "thumbnailUrl", "thumbnail_path", "thumbnailPath",
+        "pic", "image", "image_url", "imageUrl", "img", "imgs", "images",
+        "image_list", "imageList", "photos", "screenshots", "thumb"
     ]
     var values = keys.flatMap { resourceImageStrings(item[$0]) }
     for (key, value) in item {
@@ -2385,7 +2386,8 @@ private func resourceImageValues(_ item: [String: Any], depth: Int = 0) -> [Stri
     }
     for key in [
         "torrent", "detail", "details", "data", "result",
-        "metadata", "meta", "media", "tmdb", "tmdb_media", "tmdbMedia"
+        "metadata", "meta", "media", "group", "attributes",
+        "tmdb", "tmdb_media", "tmdbMedia"
     ] {
         if let nested = item[key] as? [String: Any] {
             values.append(contentsOf: resourceImageValues(nested, depth: depth + 1))
@@ -2476,13 +2478,21 @@ private func resourceImageCandidates(
         _ url: URL,
         headers: [String: String],
         persistentCacheID: String? = nil,
+        prefersLinkedMediaPoster: Bool = false,
         fallback: Bool = false
     ) {
         guard !isSiteIcon(url) else { return }
         let candidate = RemoteImageCandidate(
             url: url,
             headers: headers,
-            persistentCacheID: persistentCacheID
+            persistentCacheID: persistentCacheID,
+            prefersLinkedMediaPoster: prefersLinkedMediaPoster,
+            linkedMediaAPI: prefersLinkedMediaPoster
+                ? RemoteMediaPosterAPI(
+                    baseURL: appState.baseURL,
+                    accessToken: appState.accessToken
+                )
+                : nil
         )
         guard seen.insert(candidate.id).inserted else { return }
         if fallback { fallbackCandidates.append(candidate) }
@@ -2496,29 +2506,18 @@ private func resourceImageCandidates(
         return "resource-cover|\(siteIdentity)|\(url.absoluteString)"
     }
 
-    // TMDB poster values are commonly path-only (for example /abc.jpg). They
-    // must be resolved against the TMDB image CDN instead of the tracker host.
-    for value in resourceMetadataImageValues(item) {
-        guard let url = URL(string: normalizedRemoteImageURL(value)) else { continue }
-        appendCandidate(
-            url,
-            headers: mediaImageHeaders(source: value.contains("douban") ? "豆瓣" : "TMDB", raw: item),
-            persistentCacheID: "resource-cover|\(url.absoluteString)"
-        )
-    }
-
-    // Use the cover returned by the search response first. A detail page can
-    // take several seconds (or require a tracker login); putting it first made
-    // every visible card look like a placeholder while those HTML requests
-    // occupied the image session. The detail page remains a reliable fallback
-    // for trackers that only expose the poster in their HTML.
+    // Prefer the poster returned directly by the tracker search response. This
+    // is both faster and more reliable than opening every torrent detail page.
     // The legacy `/api/mysite/search` contract calls this field exactly
     // `poster`. Handle it explicitly before the permissive recursive extractor
     // so a relative poster can use the resolved site's URL and Cookie without
     // being hidden behind a failed proxy candidate.
     let explicitPosterValues = [
         "poster", "poster_url", "posterUrl", "poster_gif", "posterGif",
-        "cover", "cover_url", "coverUrl"
+        "torrent_poster", "torrentPoster", "torrent_poster_url", "torrentPosterUrl",
+        "cover", "cover_url", "coverUrl", "cover_image", "coverImage",
+        "wiki_image", "wikiImage", "thumbnail", "thumbnail_url", "thumbnailUrl",
+        "image", "image_url", "imageUrl", "img", "imgs", "images", "image_list", "imageList"
     ].flatMap { resourceImageStrings(item[$0]) }
     for value in explicitPosterValues {
         guard let url = resourceImageResolvedURL(value, relativeTo: site, item: item, appState: appState) else { continue }
@@ -2583,6 +2582,17 @@ private func resourceImageCandidates(
                 }
             }
         }
+    }
+
+    // TMDB poster values are commonly path-only (for example /abc.jpg). They
+    // must be resolved against the TMDB image CDN instead of the tracker host.
+    for value in resourceMetadataImageValues(item) {
+        guard let url = URL(string: normalizedRemoteImageURL(value)) else { continue }
+        appendCandidate(
+            url,
+            headers: mediaImageHeaders(source: value.contains("douban") ? "豆瓣" : "TMDB", raw: item),
+            persistentCacheID: "resource-cover|\(url.absoluteString)"
+        )
     }
 
     for value in resourceImageValues(item) {
@@ -2662,19 +2672,25 @@ private func resourceImageCandidates(
             }
         }
     }
+
+    // Only inspect the authenticated detail document after all cover values
+    // returned by the tracker/API have failed. The loader then follows a
+    // Douban/TMDB link and persists the resolved poster for later offline use.
     if let detailURL = resourceDetailURL(item, site: site) {
-        let headers = resourceImageHeaders(
-            for: detailURL,
-            item: item,
-            site: site,
-            includeSiteCredentials: true,
-            includeItemCredentials: true
+        appendCandidate(
+            detailURL,
+            headers: resourceImageHeaders(
+                for: detailURL,
+                item: item,
+                site: site,
+                includeSiteCredentials: true,
+                includeItemCredentials: true
+            ),
+            persistentCacheID: coverCacheID(detailURL),
+            prefersLinkedMediaPoster: true,
+            fallback: true
         )
-        let candidate = RemoteImageCandidate(url: detailURL, headers: headers)
-        if seen.insert(candidate.id).inserted { fallbackCandidates.append(candidate) }
     }
-    // When a tracker only exposes the poster in its detail document, let the
-    // shared image loader extract og:image/lazy <img> URLs from that document.
     candidates.append(contentsOf: fallbackCandidates)
     return candidates
 }
@@ -2695,6 +2711,44 @@ private func resourceDetailURL(_ item: [String: Any], site: SiteItem?) -> URL? {
     return resourceResolvedURL(value, relativeTo: site, item: item)
 }
 
+private func resourceImageRegistrableDomain(_ host: String) -> String {
+    let labels = host.lowercased()
+        .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        .split(separator: ".")
+        .map(String.init)
+    guard labels.count > 2 else { return labels.joined(separator: ".") }
+    if labels.allSatisfy({ Int($0) != nil }) { return labels.joined(separator: ".") }
+
+    let compoundSuffixes: Set<String> = [
+        "com.cn", "net.cn", "org.cn", "gov.cn",
+        "com.hk", "com.tw", "com.au", "net.au", "org.au",
+        "co.uk", "org.uk", "me.uk", "co.jp", "co.kr", "co.nz"
+    ]
+    let suffix = labels.suffix(2).joined(separator: ".")
+    let labelCount = compoundSuffixes.contains(suffix) ? 3 : 2
+    return labels.suffix(labelCount).joined(separator: ".")
+}
+
+private func resourceImageMayUseSiteCredentials(
+    for url: URL?,
+    item: [String: Any],
+    site: SiteItem?
+) -> Bool {
+    guard let targetHost = url?.host?.lowercased(), !targetHost.isEmpty else { return false }
+    let sourceHosts = [
+        resourceSiteBaseURL(site)?.host,
+        resourceItemBaseURL(item, site: nil)?.host,
+        resourceDetailURL(item, site: site)?.host
+    ].compactMap { $0?.lowercased() }
+    let targetDomain = resourceImageRegistrableDomain(targetHost)
+    return sourceHosts.contains { sourceHost in
+        targetHost == sourceHost
+            || targetHost.hasSuffix(".\(sourceHost)")
+            || sourceHost.hasSuffix(".\(targetHost)")
+            || (!targetDomain.isEmpty && targetDomain == resourceImageRegistrableDomain(sourceHost))
+    }
+}
+
 private func resourceImageHeaders(
     for url: URL?,
     item: [String: Any],
@@ -2704,12 +2758,17 @@ private func resourceImageHeaders(
 ) -> [String: String] {
     var headers: [String: String] = [:]
     let nestedSite = item.dict("site", "source")
+    let mayUseSiteCredentials = resourceImageMayUseSiteCredentials(
+        for: url,
+        item: item,
+        site: site
+    )
     if includeSiteCredentials {
         let cookie = (site?.cookie ?? nestedSite?.string("cookie", "cookies") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let userAgent = (site?.userAgent ?? nestedSite?.string("user_agent", "userAgent") ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cookie.isEmpty { headers["Cookie"] = cookie }
+        if mayUseSiteCredentials, !cookie.isEmpty { headers["Cookie"] = cookie }
         if !userAgent.isEmpty { headers["User-Agent"] = userAgent }
         let refererURL = item.string("referer", "referrer")
             .flatMap { resourceResolvedURL($0, relativeTo: site, item: item) }
@@ -2720,7 +2779,7 @@ private func resourceImageHeaders(
             headers["Referer"] = refererURL.absoluteString
         }
     }
-    if includeItemCredentials {
+    if includeItemCredentials, mayUseSiteCredentials {
         let cookie = (item.string("cookie", "cookies") ?? nestedSite?.string("cookie", "cookies"))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if let cookie, !cookie.isEmpty {
@@ -3578,109 +3637,92 @@ struct ResourceRowItem: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 10) {
-                CachedRemoteImageCandidates(
-                    candidates: imageCandidates,
-                    content: { image in
-                        image.resizable().scaledToFill()
-                    },
-                    placeholder: {
-                        resourcePosterPlaceholder(
-                            title: title,
-                            category: category
-                        )
+        let badges = cardBadges
+
+        HStack(alignment: .top, spacing: 9) {
+            CachedRemoteImageCandidates(
+                candidates: imageCandidates,
+                content: { image in
+                    image.resizable().scaledToFill()
+                },
+                placeholder: {
+                    resourcePosterPlaceholder(title: title, category: nil)
+                }
+            )
+            .frame(width: 70, height: 104)
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                if !badges.isEmpty {
+                    ViewThatFits(in: .horizontal) {
+                        resourceBadgeRow(badges, limit: 6)
+                        resourceBadgeRow(badges, limit: 4)
+                        resourceBadgeRow(badges, limit: 2)
                     }
-                )
-                .frame(width: 68, height: 94)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .stroke(Color.primary.opacity(0.07), lineWidth: 0.5)
+                    .frame(height: 15, alignment: .leading)
                 }
 
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack(alignment: .top, spacing: 7) {
-                        Text(title)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .multilineTextAlignment(.leading)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .layoutPriority(1)
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                        Image(systemName: "arrow.down.circle.fill")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(HarvestTheme.green)
-                            .accessibilityHidden(true)
-                    }
+                if !detailLine.isEmpty {
+                    Text(detailLine)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
-                    if !subtitle.isEmpty {
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                Spacer(minLength: 0)
 
-                    HStack(spacing: 5) {
-                        Text(siteLabel.isEmpty ? "未知站点" : siteLabel)
-                            .foregroundStyle(HarvestTheme.blue)
+                HStack(spacing: 8) {
+                    compactMetric("\(seeders)", icon: "arrow.up", tint: HarvestTheme.green)
+                    compactMetric("\(leechers)", icon: "arrow.down", tint: HarvestTheme.coral)
+                    Text(sizeLabel)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                    if let publishedLabel {
+                        Text(publishedLabel)
+                            .foregroundStyle(HarvestTheme.purple)
                             .lineLimit(1)
-                            .layoutPriority(1)
-                        if let category, !category.isEmpty {
-                            Circle()
-                                .fill(Color.secondary.opacity(0.45))
-                                .frame(width: 3, height: 3)
-                            Text(category)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.8)
-                        }
+                            .minimumScaleFactor(0.75)
                     }
-                    .font(.caption2.weight(.medium))
-
-                    if promotionLabel != nil || hasHR || publishedLabel != nil {
-                        HStack(spacing: 5) {
-                            if let promotionLabel {
-                                resourceStatusBadge(promotionLabel, tint: HarvestTheme.green)
-                            }
-                            if hasHR {
-                                resourceStatusBadge("HR", tint: HarvestTheme.coral)
-                            }
-                            Spacer(minLength: 2)
-                            if let publishedLabel {
-                                Label(publishedLabel, systemImage: "clock")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.75)
-                            }
-                        }
-                        .frame(minHeight: 18)
+                    Spacer(minLength: 2)
+                    if let commentCount {
+                        compactMetric("\(commentCount)", icon: "bubble", tint: .secondary)
                     }
+                    Image(systemName: "arrow.down.to.line")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(HarvestTheme.green)
+                        .accessibilityHidden(true)
                 }
-                .frame(maxWidth: .infinity, minHeight: 94, alignment: .topLeading)
+                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                .frame(minHeight: 14)
             }
-
-            HStack(spacing: 0) {
-                ResourceMetric(label: sizeLabel, systemImage: "internaldrive", tint: HarvestTheme.blue)
-                metricDivider
-                ResourceMetric(label: "\(seeders)", systemImage: "arrow.up", tint: HarvestTheme.green)
-                metricDivider
-                ResourceMetric(label: "\(leechers)", systemImage: "arrow.down", tint: HarvestTheme.coral)
-                metricDivider
-                ResourceMetric(label: "\(completers)", systemImage: "checkmark", tint: .secondary)
-            }
-            .padding(.vertical, 5)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .frame(maxWidth: .infinity, minHeight: 104, alignment: .topLeading)
         }
-        .padding(9)
-        .background(Color(uiColor: .secondarySystemBackground).opacity(0.72), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .padding(7)
+        .background {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(uiColor: .secondarySystemBackground))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(HarvestTheme.purple.opacity(0.045))
+                }
+        }
         .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(Color.primary.opacity(0.055), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(HarvestTheme.purple.opacity(0.14), lineWidth: 0.6)
         }
     }
 
@@ -3691,6 +3733,14 @@ struct ResourceRowItem: View {
 
     private var hasHR: Bool { resourceHasHRValue(item) }
 
+    private var detailLine: String {
+        var values: [String] = []
+        let site = siteLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !site.isEmpty { values.append(site) }
+        if !subtitle.isEmpty { values.append(subtitle) }
+        return values.joined(separator: " | ")
+    }
+
     private var sizeLabel: String {
         guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
             return item.string("size", "length") ?? "未知大小"
@@ -3700,7 +3750,10 @@ struct ResourceRowItem: View {
 
     private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
     private var leechers: Int { item.int("leechers", "leecher", "leech", "peers", "peer") ?? 0 }
-    private var completers: Int { item.int("completers", "completed", "snatched", "grabs", "grab") ?? 0 }
+
+    private var commentCount: Int? {
+        item.int("comments", "comment_count", "commentCount", "comments_count", "commentsCount")
+    }
 
     private var promotionLabel: String? {
         let sale = item.string("sale_status", "saleStatus", "promotion") ?? ""
@@ -3715,41 +3768,86 @@ struct ResourceRowItem: View {
         return date.formatted(.relative(presentation: .numeric, unitsStyle: .narrow))
     }
 
-    private var metricDivider: some View {
-        Divider()
-            .frame(height: 18)
-            .padding(.horizontal, 2)
+    private var promotionBadgeLabel: String? {
+        guard var label = promotionLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !label.isEmpty else { return nil }
+        if label.lowercased().contains("free") || label.contains("免费") { label = "FREE" }
+        guard let expiry = item.string("sale_expire", "saleExpire", "promotion_expire", "promotionExpire"),
+              let expiryDate = parseDate(expiry) else { return label }
+        let seconds = expiryDate.timeIntervalSinceNow
+        guard seconds > 0 else { return label }
+        let hours = max(1, Int(ceil(seconds / 3600)))
+        return hours < 24 ? "\(label) \(hours)h" : "\(label) \(Int(ceil(Double(hours) / 24)))d"
     }
 
-    private func resourceStatusBadge(_ value: String, tint: Color) -> some View {
-        Text(value)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(tint)
-            .lineLimit(1)
-            .minimumScaleFactor(0.75)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(tint.opacity(0.09), in: Capsule())
+    private var cardBadges: [(text: String, tint: Color)] {
+        let sourceLabels = item.strings("tags", "labels").joined(separator: " ")
+        let source = "\(title) \(subtitle) \(sourceLabels)".uppercased()
+        var values: [(String, Color)] = []
+        var seen = Set<String>()
+
+        func append(_ value: String?, tint: Color) {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty,
+                  seen.insert(value.uppercased()).inserted else { return }
+            values.append((value, tint))
+        }
+
+        append(promotionBadgeLabel, tint: HarvestTheme.green)
+        if let category, Int(category) == nil { append(category, tint: HarvestTheme.purple) }
+        if source.contains("2160") || source.range(of: #"\b4K\b"#, options: .regularExpression) != nil {
+            append("4K", tint: HarvestTheme.orange)
+        } else if source.contains("1080") {
+            append("1080P", tint: HarvestTheme.blue)
+        } else if source.contains("720") {
+            append("720P", tint: HarvestTheme.blue)
+        }
+        if ["H265", "H.265", "HEVC", "X265"].contains(where: { source.contains($0) }) {
+            append("H265", tint: HarvestTheme.teal)
+        } else if ["H264", "H.264", "AVC", "X264"].contains(where: { source.contains($0) }) {
+            append("H264", tint: HarvestTheme.teal)
+        }
+        if source.contains("WEB-DL") || source.contains("WEBDL") {
+            append("WEB-DL", tint: HarvestTheme.purple)
+        } else if source.contains("REMUX") {
+            append("REMUX", tint: HarvestTheme.purple)
+        } else if source.contains("BLURAY") || source.contains("BLU-RAY") {
+            append("BluRay", tint: HarvestTheme.purple)
+        } else if source.contains("HDTV") {
+            append("HDTV", tint: HarvestTheme.purple)
+        }
+        if ["中字", "简中", "繁中", "简繁", "CHS", "CHT", "中文字幕"].contains(where: { source.contains($0) }) {
+            append("中字", tint: HarvestTheme.green)
+        }
+        if hasHR { append("HR", tint: HarvestTheme.coral) }
+        return values
     }
-}
 
-private struct ResourceMetric: View {
-    let label: String
-    let systemImage: String
-    let tint: Color
+    private func resourceBadgeRow(_ badges: [(text: String, tint: Color)], limit: Int) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(HarvestTheme.purple)
+            ForEach(Array(badges.prefix(limit).enumerated()), id: \.offset) { _, badge in
+                Text(badge.text)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, 5)
+                    .frame(height: 14)
+                    .background(badge.tint, in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+            }
+        }
+    }
 
-    var body: some View {
+    private func compactMetric(_ value: String, icon: String, tint: Color) -> some View {
         HStack(spacing: 3) {
-            Image(systemName: systemImage)
-                .font(.caption2.weight(.bold))
-            Text(label)
-                .font(.caption2.weight(.semibold).monospacedDigit())
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+            Text(value).lineLimit(1)
         }
         .foregroundStyle(tint)
-        .frame(maxWidth: .infinity, minHeight: 18)
-        .accessibilityElement(children: .combine)
     }
 }
 
