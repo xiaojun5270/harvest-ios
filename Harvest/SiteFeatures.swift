@@ -773,6 +773,62 @@ final class SitesViewModel: ObservableObject {
         config(for: site)?["level"]
     }
 
+    func levelColor(for site: SiteItem) -> Color {
+        let current = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty else { return siteLevelColor(level: current) }
+        let siteConfig = config(for: site)
+        let levels = siteConfig?.dict("level") ?? [:]
+        var canonical = current
+        var levelID: Int?
+        for (key, raw) in levels {
+            guard let level = raw as? [String: Any] else { continue }
+            let displayName = level.string("name", "displayName") ?? ""
+            let code = level.string("level") ?? ""
+            guard key.caseInsensitiveCompare(current) == .orderedSame
+                    || displayName.caseInsensitiveCompare(current) == .orderedSame
+                    || code.caseInsensitiveCompare(current) == .orderedSame else { continue }
+            canonical = code.isEmpty ? key : code
+            levelID = level.int("level_id", "levelId")
+            break
+        }
+
+        // Match the Flutter fallback: when a site-specific level only has a
+        // numeric id, use the canonical code from the NP template.
+        if let levelID, levelID > 0,
+           let npConfig = siteConfigs.first(where: { entry in
+               entry.key == "np模板"
+                   || entry.value.string("name", "site")?.lowercased() == "np模板"
+           }),
+           let npLevels = npConfig.value.dict("level") {
+            if let match = npLevels.values
+                .compactMap({ $0 as? [String: Any] })
+                .first(where: { $0.int("level_id", "levelId") == levelID }),
+               let code = match.string("level"), !code.isEmpty {
+                canonical = code
+            }
+        }
+        return siteLevelColor(level: canonical, levelID: levelID)
+    }
+
+    func standardLevelCodes() -> [Int: String] {
+        guard let npConfig = siteConfigs.first(where: { entry in
+            entry.key == "np模板"
+                || entry.value.string("name", "site")?.lowercased() == "np模板"
+        }), let npLevels = npConfig.value.dict("level") else {
+            return [:]
+        }
+        return npLevels.values.compactMap { raw -> (Int, String)? in
+            guard let level = raw as? [String: Any],
+                  let levelID = level.int("level_id", "levelId"),
+                  levelID > 0,
+                  let code = level.string("level"),
+                  !code.isEmpty else { return nil }
+            return (levelID, code)
+        }.reduce(into: [:]) { result, entry in
+            result[entry.0] = entry.1
+        }
+    }
+
     func browserURL(for site: SiteItem) -> String {
         let directURL = site.url.trimmingCharacters(in: .whitespacesAndNewlines)
         if !directURL.isEmpty { return directURL }
@@ -1660,6 +1716,7 @@ struct SitesView: View {
                                 privacy: appState.privacyMode,
                                 iconCandidates: model.logoCandidates(for: site, appState: appState),
                                 milestone: model.milestone(for: site),
+                                levelColor: model.levelColor(for: site),
                                 isRefreshing: model.isRefreshing(site),
                                 onOpenDetails: { selectedSite = site },
                                 onOpenBrowser: { openBrowser(for: site) },
@@ -1742,7 +1799,12 @@ struct SitesView: View {
         }
         .sheet(item: $levelSite) { site in
             NavigationStack {
-                SiteLevelProgressView(site: site, levels: parseSiteLevels(model.levelRules(for: site)))
+                SiteLevelProgressView(
+                    site: site,
+                    levels: parseSiteLevels(model.levelRules(for: site)),
+                    levelColorOverride: model.levelColor(for: site),
+                    standardLevelCodes: model.standardLevelCodes()
+                )
                     .toolbar {
                         ToolbarItem(placement: .confirmationAction) {
                             Button("完成") { levelSite = nil }
@@ -3425,41 +3487,37 @@ private func safeFileName(_ value: String) -> String {
     return value.components(separatedBy: invalid).joined(separator: "_").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-/// 站点等级的统一配色。优先使用等级名称中的语义，其次按站点配置的等级编号
-/// 递进配色，保证站点卡片和等级详情中的同一等级始终使用相同颜色。
+/// Keep the native colors identical to harvest_flutter's `levelColor` map.
+/// Colors are keyed by the canonical `level` code, not the localized display
+/// name or the numeric level id. A site may use a custom display name while
+/// still exposing one of these stable codes in its config.
 private func siteLevelColor(level: String, levelID: Int? = nil) -> Color {
-    let normalized = level
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-    let semanticColors: [(tokens: [String], color: Color)] = [
-        (["管理员", "总版主", "站长", "staff", "admin", "owner", "moderator"], HarvestTheme.coral),
-        (["vip", "贵宾", "至尊", "皇帝", "王者", "master", "elite", "torrent master"], HarvestTheme.purple),
-        (["毕业", "graduat", "保号", "keep"], HarvestTheme.amber),
-        (["高级", "精英", "expert", "power user"], HarvestTheme.orange),
-        (["新手", "新人", "学徒", "初级", "junior", "rookie"], HarvestTheme.teal)
-    ]
-    if let match = semanticColors.first(where: { entry in
-        entry.tokens.contains { normalized.contains($0) }
-    }) {
-        return match.color
+    _ = levelID
+    let key = level.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    switch key {
+    case "staffleader": return Color(red: 139 / 255, green: 0, blue: 0)
+    case "sysop": return Color(red: 160 / 255, green: 82 / 255, blue: 45 / 255)
+    case "administrator": return Color(red: 75 / 255, green: 0, blue: 130 / 255)
+    case "moderator": return Color(red: 100 / 255, green: 149 / 255, blue: 237 / 255)
+    case "assistant": return Color(red: 128 / 255, green: 109 / 255, blue: 236 / 255)
+    case "editor": return Color(red: 154 / 255, green: 205 / 255, blue: 50 / 255)
+    case "honor": return Color(red: 224 / 255, green: 60 / 255, blue: 138 / 255)
+    case "forummoderator", "retiree": return Color(red: 28 / 255, green: 198 / 255, blue: 213 / 255)
+    case "uploader": return Color(red: 220 / 255, green: 20 / 255, blue: 60 / 255)
+    case "vip", "svip": return Color(red: 0, green: 159 / 255, blue: 0)
+    case "nexusgod", "god": return Color(red: 156 / 255, green: 79 / 255, blue: 150 / 255)
+    case "master": return Color(red: 0, green: 51 / 255, blue: 102 / 255)
+    case "nexusmaster": return Color(red: 56 / 255, green: 172 / 255, blue: 236 / 255)
+    case "ultimateuser": return Color(red: 0, green: 100 / 255, blue: 0)
+    case "extremeuser": return Color(red: 1, green: 140 / 255, blue: 0)
+    case "veteranuser": return Color(red: 72 / 255, green: 61 / 255, blue: 139 / 255)
+    case "insaneuser": return Color(red: 139 / 255, green: 0, blue: 139 / 255)
+    case "crazyuser": return Color(red: 0, green: 191 / 255, blue: 1)
+    case "eliteuser": return Color(red: 0, green: 139 / 255, blue: 139 / 255)
+    case "poweruser": return Color(red: 218 / 255, green: 165 / 255, blue: 32 / 255)
+    case "peasant": return Color(red: 112 / 255, green: 128 / 255, blue: 144 / 255)
+    default: return .gray
     }
-
-    if let levelID, levelID > 0 {
-        switch levelID {
-        case 1: return HarvestTheme.teal
-        case 2: return HarvestTheme.blue
-        case 3: return HarvestTheme.indigo
-        case 4: return HarvestTheme.purple
-        case 5: return HarvestTheme.orange
-        default: return levelID >= 6 ? HarvestTheme.amber : HarvestTheme.blue
-        }
-    }
-
-    // 没有编号时使用名称生成稳定索引，避免同一等级因刷新变色。
-    let checksum = normalized.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) }
-    return [HarvestTheme.teal, HarvestTheme.blue, HarvestTheme.indigo, HarvestTheme.purple, HarvestTheme.orange][
-        abs(checksum) % 5
-    ]
 }
 
 private func siteReportedLevelID(_ site: SiteItem) -> Int? {
@@ -3480,6 +3538,7 @@ struct SiteRow: View {
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
     let milestone: SiteLevelMilestone?
+    let levelColor: Color
     let isRefreshing: Bool
     let onOpenDetails: () -> Void
     let onOpenBrowser: () -> Void
@@ -3492,6 +3551,7 @@ struct SiteRow: View {
         privacy: Bool,
         iconCandidates: [RemoteImageCandidate] = [],
         milestone: SiteLevelMilestone? = nil,
+        levelColor: Color = .gray,
         isRefreshing: Bool = false,
         onOpenDetails: @escaping () -> Void = {},
         onOpenBrowser: @escaping () -> Void = {},
@@ -3503,6 +3563,7 @@ struct SiteRow: View {
         self.privacy = privacy
         self.iconCandidates = iconCandidates
         self.milestone = milestone
+        self.levelColor = levelColor
         self.isRefreshing = isRefreshing
         self.onOpenDetails = onOpenDetails
         self.onOpenBrowser = onOpenBrowser
@@ -3812,12 +3873,11 @@ struct SiteRow: View {
     private var levelStatus: SiteStatusDescriptor? {
         let level = site.level.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !level.isEmpty else { return nil }
-        let levelID = siteReportedLevelID(site)
         return SiteStatusDescriptor(
             id: "level",
             label: level,
             icon: "medal.fill",
-            color: siteLevelColor(level: level, levelID: levelID)
+            color: levelColor
         )
     }
 
@@ -5004,6 +5064,20 @@ private func appendingTOMLField(_ key: String, rawValue: String, to content: Str
 private struct SiteLevelProgressView: View {
     let site: SiteItem
     let levels: [SiteLevelRequirement]
+    let levelColorOverride: Color?
+    let standardLevelCodes: [Int: String]
+
+    init(
+        site: SiteItem,
+        levels: [SiteLevelRequirement],
+        levelColorOverride: Color? = nil,
+        standardLevelCodes: [Int: String] = [:]
+    ) {
+        self.site = site
+        self.levels = levels
+        self.levelColorOverride = levelColorOverride
+        self.standardLevelCodes = standardLevelCodes
+    }
 
     private var reportedLevelID: Int? {
         siteReportedLevelID(site)
@@ -5020,6 +5094,14 @@ private struct SiteLevelProgressView: View {
     private var currentIndex: Int? {
         guard let currentLevel else { return nil }
         return levels.firstIndex { $0.id == currentLevel.id }
+    }
+    private var currentLevelColor: Color {
+        if let levelColorOverride { return levelColorOverride }
+        if let currentLevel {
+            return color(for: currentLevel)
+        }
+        let fallbackCode = reportedLevelID.flatMap { standardLevelCodes[$0] } ?? site.level
+        return siteLevelColor(level: fallbackCode, levelID: reportedLevelID)
     }
     private var nextLevel: SiteLevelRequirement? {
         if let levelID = reportedLevelID ?? currentLevel?.levelID, levelID > 0 {
@@ -5039,6 +5121,14 @@ private struct SiteLevelProgressView: View {
     }
     private var hasResolvedCurrentLevel: Bool { reportedLevelID != nil || currentLevel != nil }
 
+    private func color(for level: SiteLevelRequirement) -> Color {
+        let localCode = level.level.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canonicalCode = level.levelID > 0
+            ? (standardLevelCodes[level.levelID] ?? localCode)
+            : localCode
+        return siteLevelColor(level: canonicalCode.isEmpty ? level.key : canonicalCode)
+    }
+
     var body: some View {
         List {
             Section("当前等级") {
@@ -5046,12 +5136,7 @@ private struct SiteLevelProgressView: View {
                     Text("等级")
                     Spacer()
                     Text(site.level.isEmpty ? "未知" : site.level)
-                        .foregroundStyle(
-                            siteLevelColor(
-                                level: site.level.isEmpty ? "未知" : site.level,
-                                levelID: reportedLevelID
-                            )
-                        )
+                        .foregroundStyle(currentLevelColor)
                         .fontWeight(.semibold)
                 }
                 if reachedLevels.contains(where: { $0.graduation }) {
@@ -5085,17 +5170,17 @@ private struct SiteLevelProgressView: View {
                             HStack {
                                 HStack(spacing: 6) {
                                     Circle()
-                                        .fill(siteLevelColor(level: level.displayName, levelID: level.levelID))
+                                        .fill(color(for: level))
                                         .frame(width: 8, height: 8)
                                     Text(level.displayName)
                                         .font(.subheadline.weight(.semibold))
-                                        .foregroundStyle(siteLevelColor(level: level.displayName, levelID: level.levelID))
+                                        .foregroundStyle(color(for: level))
                                 }
                                 Spacer()
                                 if currentLevel?.id == level.id {
                                     StatusPill(
                                         label: "当前",
-                                        color: siteLevelColor(level: level.displayName, levelID: level.levelID)
+                                        color: color(for: level)
                                     )
                                 }
                             }
@@ -5652,7 +5737,12 @@ struct SiteDetailView: View {
                             detailValue("等级", value: current.level)
                         } else {
                             NavigationLink {
-                                SiteLevelProgressView(site: current, levels: levelRequirements)
+                                SiteLevelProgressView(
+                                    site: current,
+                                    levels: levelRequirements,
+                                    levelColorOverride: model.levelColor(for: current),
+                                    standardLevelCodes: model.standardLevelCodes()
+                                )
                             } label: {
                                 LabeledContent("等级", value: current.level)
                             }
