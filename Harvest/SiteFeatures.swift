@@ -388,6 +388,7 @@ final class SitesViewModel: ObservableObject {
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
     private var activeSiteOperations: Set<String> = []
+    @Published private var refreshingSiteIDs: Set<Int> = []
 
     init() {
         let defaults = UserDefaults.standard
@@ -1113,28 +1114,37 @@ final class SitesViewModel: ObservableObject {
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
         let operationKey = "\(path)#\(site.id)"
         guard activeSiteOperations.insert(operationKey).inserted else { return }
-        defer { activeSiteOperations.remove(operationKey) }
+        appState.presentedError = nil
+        let showsCardLoading = path == APIPath.siteStatus
+        if showsCardLoading { refreshingSiteIDs.insert(site.id) }
+        defer {
+            activeSiteOperations.remove(operationKey)
+            if showsCardLoading { refreshingSiteIDs.remove(site.id) }
+        }
 
         let displayName = privacyMaskedText(site.name, enabled: appState.privacyMode)
-        let title: String
         let successMessage: String
         if path == APIPath.siteSign {
-            title = "正在为\(displayName)签到"
             successMessage = "\(displayName)签到完成"
         } else if path == APIPath.siteRepeat {
-            title = "正在为\(displayName)辅种"
             successMessage = "\(displayName)辅种任务已提交"
         } else {
-            title = "正在刷新\(displayName)"
             successMessage = "\(displayName)数据已更新"
         }
-        _ = await appState.runManualTask(title: title, successMessage: successMessage) {
-            guard await appState.perform(path + "\(site.id)", method: .get, showsFeedback: false) else {
-                return false
-            }
-            await load(appState, cached: false)
-            return appState.presentedError == nil
+        guard await appState.perform(
+            path + "\(site.id)",
+            method: .get,
+            showsFeedback: false
+        ) else { return }
+
+        appState.presentManualTaskResult(successMessage)
+        Task { @MainActor [weak self] in
+            await self?.load(appState, cached: false)
         }
+    }
+
+    func isRefreshing(_ site: SiteItem) -> Bool {
+        refreshingSiteIDs.contains(site.id)
     }
 
     func delete(_ appState: AppState, site: SiteItem) async {
@@ -1413,6 +1423,7 @@ struct SitesView: View {
                                 privacy: appState.privacyMode,
                                 iconCandidates: model.logoCandidates(for: site, appState: appState),
                                 milestone: model.milestone(for: site),
+                                isRefreshing: model.isRefreshing(site),
                                 onOpenDetails: { selectedSite = site },
                                 onOpenBrowser: { openBrowser(for: site) },
                                 onOpenExternalBrowser: { openExternalBrowser(for: site) },
@@ -1592,14 +1603,13 @@ struct SitesView: View {
         defer { isRunningGlobalAction = false }
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
         let signing = path == APIPath.siteSign
-        _ = await appState.runManualTask(
-            title: signing ? "正在为全部站点签到" : "正在刷新全部站点",
-            successMessage: signing ? "全部站点签到完成" : "全部站点数据已更新"
-        ) {
-            guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return false }
-            await model.load(appState, cached: false)
-            return appState.presentedError == nil
-        }
+        appState.presentedError = nil
+        guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return }
+        await model.load(appState, cached: false)
+        guard appState.presentedError == nil else { return }
+        appState.presentManualTaskResult(
+            signing ? "全部站点签到完成" : "全部站点数据已更新"
+        )
     }
 }
 
@@ -3232,6 +3242,7 @@ struct SiteRow: View {
     let privacy: Bool
     let iconCandidates: [RemoteImageCandidate]
     let milestone: SiteLevelMilestone?
+    let isRefreshing: Bool
     let onOpenDetails: () -> Void
     let onOpenBrowser: () -> Void
     let onOpenExternalBrowser: () -> Void
@@ -3243,6 +3254,7 @@ struct SiteRow: View {
         privacy: Bool,
         iconCandidates: [RemoteImageCandidate] = [],
         milestone: SiteLevelMilestone? = nil,
+        isRefreshing: Bool = false,
         onOpenDetails: @escaping () -> Void = {},
         onOpenBrowser: @escaping () -> Void = {},
         onOpenExternalBrowser: @escaping () -> Void = {},
@@ -3253,6 +3265,7 @@ struct SiteRow: View {
         self.privacy = privacy
         self.iconCandidates = iconCandidates
         self.milestone = milestone
+        self.isRefreshing = isRefreshing
         self.onOpenDetails = onOpenDetails
         self.onOpenBrowser = onOpenBrowser
         self.onOpenExternalBrowser = onOpenExternalBrowser
@@ -3280,12 +3293,22 @@ struct SiteRow: View {
             in: RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
-                .stroke(site.enabled ? HarvestTheme.green.opacity(0.22) : HarvestTheme.coral.opacity(0.18))
+            ZStack {
+                RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                    .stroke(site.enabled ? HarvestTheme.green.opacity(0.22) : HarvestTheme.coral.opacity(0.18))
+                if isRefreshing {
+                    RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous)
+                        .fill(Color(uiColor: .systemBackground).opacity(0.72))
+                    ProgressView()
+                        .controlSize(.large)
+                        .tint(HarvestTheme.blue)
+                }
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 1)
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
+        .allowsHitTesting(!isRefreshing)
         .accessibilityElement(children: .contain)
     }
 

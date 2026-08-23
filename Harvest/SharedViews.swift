@@ -2074,6 +2074,7 @@ struct MainShellView: View {
 
 struct ManualTaskFeedbackOverlay: View {
     let feedback: ManualTaskFeedback
+    @State private var isPresented = false
 
     private var color: Color {
         switch feedback.phase {
@@ -2094,47 +2095,50 @@ struct ManualTaskFeedbackOverlay: View {
     }
 
     var body: some View {
-        VStack {
-            HStack(spacing: 7) {
-                ZStack {
-                    Circle()
-                        .fill(color.opacity(0.12))
-                        .frame(width: 24, height: 24)
-                    if feedback.phase == .running {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(color)
-                    } else {
-                        Image(systemName: icon)
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(color)
-                    }
+        ZStack {
+            Color.clear
+            HStack(spacing: 10) {
+                if feedback.phase == .running {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.white)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.white)
                 }
 
                 Text(displayText)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
-                    .frame(maxWidth: 220, alignment: .leading)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.leading, 7)
-            .padding(.trailing, 11)
-            .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 13)
+            .frame(maxWidth: 310)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(color.opacity(0.66), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
-                Capsule()
-                    .stroke(color.opacity(0.22), lineWidth: 0.75)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(.white.opacity(0.28), lineWidth: 0.8)
             }
-            .shadow(color: .black.opacity(0.10), radius: 7, y: 3)
+            .shadow(color: .black.opacity(0.16), radius: 12, y: 5)
+            .scaleEffect(isPresented ? 1 : 0.9)
+            .opacity(isPresented ? 1 : 0)
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(feedback.phase == .running ? .updatesFrequently : [])
-            Spacer(minLength: 0)
         }
-        .safeAreaPadding(.top, 5)
-        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 48)
         .allowsHitTesting(false)
+        .onAppear {
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
+                isPresented = true
+            }
+        }
     }
 
     private var displayText: String {

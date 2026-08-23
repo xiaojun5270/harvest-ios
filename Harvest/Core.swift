@@ -2082,6 +2082,23 @@ final class AppState: ObservableObject {
         finishManualTask(id, phase: .cancelled, message: message)
     }
 
+    func presentManualTaskResult(_ message: String) {
+        let id = UUID()
+        let feedback = ManualTaskFeedback(
+            id: id,
+            title: message,
+            message: nil,
+            phase: .success
+        )
+        manualTasks[id] = feedback
+        manualTaskOrder.append(id)
+        manualTaskFeedback = feedback
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            self?.removeManualTask(id)
+        }
+    }
+
     @discardableResult
     func runManualTask(
         title: String,
