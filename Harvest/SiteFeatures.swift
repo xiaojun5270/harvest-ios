@@ -4,7 +4,7 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-struct SiteItem: Identifiable {
+struct SiteItem: Identifiable, @unchecked Sendable {
     let id: Int
     var sortID: Int
     var siteKey: String
@@ -188,6 +188,10 @@ private struct SiteFastSnapshotWriteRequest: @unchecked Sendable {
     let server: String
     let cachedAt: Date
     let generation: Int
+}
+
+private struct SitePersistentCacheValue: @unchecked Sendable {
+    let rows: [[String: Any]]
 }
 
 /// Serializes and persists the launch snapshot off the main actor. Keeping a
@@ -483,11 +487,13 @@ final class SitesViewModel: ObservableObject {
     private var networkRefreshInProgress = false
     private var backgroundRefreshTask: Task<Void, Never>?
     private var deferredRefreshPublicationTask: Task<Void, Never>?
+    private var pullRefreshSettleTask: Task<Void, Never>?
     private var backgroundRefreshGeneration = 0
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
     private var activeSiteOperations: Set<String> = []
     @Published private var refreshingSiteIDs: Set<Int> = []
+    @Published private(set) var isPullRefreshSettling = false
 
     init() {
         let defaults = UserDefaults.standard
@@ -665,6 +671,9 @@ final class SitesViewModel: ObservableObject {
         backgroundRefreshTask = nil
         deferredRefreshPublicationTask?.cancel()
         deferredRefreshPublicationTask = nil
+        pullRefreshSettleTask?.cancel()
+        pullRefreshSettleTask = nil
+        isPullRefreshSettling = false
         backgroundRefreshGeneration &+= 1
         networkRefreshInProgress = false
         loadInProgress = false
@@ -925,7 +934,23 @@ final class SitesViewModel: ObservableObject {
         // Keep current rows fixed while UIRefreshControl retracts. Replacing
         // the decoded site array during that animation rebuilds every card and
         // causes a visible hitch on release.
+        pullRefreshSettleTask?.cancel()
+        let startedAt = Date()
+        recordAppLog(.info, "站点下拉刷新开始")
         await load(appState, deferVisibleUpdate: true)
+        let elapsed = max(0, Date().timeIntervalSince(startedAt))
+        recordAppLog(.info, String(format: "站点下拉刷新网络阶段完成，耗时 %.2f 秒", elapsed))
+        // Pause only around the short publication/retraction window, not for
+        // the whole network request. Normal card animations remain active
+        // while the refresh is waiting on the server.
+        isPullRefreshSettling = true
+        pullRefreshSettleTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(480)) }
+            catch { return }
+            guard let self else { return }
+            self.isPullRefreshSettling = false
+            self.pullRefreshSettleTask = nil
+        }
     }
 
     private func startBackgroundRefresh(_ appState: AppState, cached: Bool) {
@@ -960,6 +985,12 @@ final class SitesViewModel: ObservableObject {
         let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
         defer { performanceInterval.end() }
 
+        let isManualRefresh = deferVisibleUpdate
+        func refreshLog(_ message: String) {
+            guard isManualRefresh else { return }
+            recordAppLog(.info, "站点下拉刷新：\(message)")
+        }
+
         func refreshIsCurrent() -> Bool {
             backgroundRefreshGeneration == generation && !Task.isCancelled
         }
@@ -978,6 +1009,7 @@ final class SitesViewModel: ObservableObject {
             : nil
 
         var loadedSites: [SiteItem]?
+        refreshLog("请求站点数据")
         do {
             let raw = try await appState.api(
                 APIPath.sites,
@@ -989,6 +1021,7 @@ final class SitesViewModel: ObservableObject {
                 return
             }
             let refreshedSites = jsonRows(raw).map(SiteItem.init)
+            refreshLog("收到站点数据（\(refreshedSites.count) 个）")
             if refreshedSites.isEmpty, !sites.isEmpty, cached {
                 recordAppLog(.warning, "站点接口暂时返回空列表，继续显示本地缓存")
                 loadedSites = nil
@@ -1012,10 +1045,31 @@ final class SitesViewModel: ObservableObject {
                     for: appState.baseURL,
                     cachedAt: Date()
                 )
-                await appState.writeSessionCache(
-                    loadedSites.map { self.sitePersistentCacheRow($0) },
-                    name: cacheKey
-                )
+                if deferVisibleUpdate {
+                    // Do not keep UIRefreshControl active while JSON encoding
+                    // and the account-scoped disk write run. Build the larger
+                    // cache rows on the utility executor too; this used to be
+                    // a noticeable main-thread pause with many sites.
+                    let sitesForCache = loadedSites
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.backgroundRefreshGeneration == generation,
+                              !Task.isCancelled else { return }
+                        let siteCacheRows = await Task.detached(priority: .utility) {
+                            SitePersistentCacheValue(
+                                rows: sitesForCache.map { SitesViewModel.sitePersistentCacheRow($0) }
+                            )
+                        }.value.rows
+                        guard self.backgroundRefreshGeneration == generation,
+                              !Task.isCancelled else { return }
+                        await appState.writeSessionCache(siteCacheRows, name: cacheKey)
+                        recordAppLog(.debug, "站点下拉刷新：站点缓存写入完成")
+                    }
+                    refreshLog("站点缓存已安排后台写入")
+                } else {
+                    let siteCacheRows = loadedSites.map { self.sitePersistentCacheRow($0) }
+                    await appState.writeSessionCache(siteCacheRows, name: cacheKey)
+                }
                 guard refreshIsCurrent() else {
                     configTask?.cancel()
                     return
@@ -1028,20 +1082,25 @@ final class SitesViewModel: ObservableObject {
             }
             guard !isRequestCancellation(error) else {
                 configTask?.cancel()
+                refreshLog("请求已取消")
                 return
             }
+            refreshLog("请求站点失败：\(error.localizedDescription)")
             if !usingCachedData { appState.presentedError = error.localizedDescription }
         }
 
         var loadedConfigs: [[String: Any]]?
+        refreshLog("等待站点配置")
         if let configTask {
             switch await configTask.value {
             case let .success(raw):
                 guard refreshIsCurrent() else { return }
                 loadedConfigs = jsonRows(raw)
+                refreshLog("收到站点配置（\(loadedConfigs?.count ?? 0) 条）")
             case let .failure(error):
                 guard refreshIsCurrent() else { return }
                 if !isRequestCancellation(error) {
+                    refreshLog("请求站点配置失败：\(error.localizedDescription)")
                     recordAppLog(.warning, "加载站点配置列表失败：\(error.localizedDescription)")
                 }
             }
@@ -1059,13 +1118,27 @@ final class SitesViewModel: ObservableObject {
         }
 
         if let loadedConfigs {
-            await appState.writeSessionCache(loadedConfigs, name: configCacheKey)
+            if deferVisibleUpdate {
+                let configCacheRows = loadedConfigs
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.backgroundRefreshGeneration == generation,
+                          !Task.isCancelled else { return }
+                    await appState.writeSessionCache(configCacheRows, name: configCacheKey)
+                    recordAppLog(.debug, "站点下拉刷新：配置缓存写入完成")
+                }
+                refreshLog("配置缓存已安排后台写入")
+            } else {
+                await appState.writeSessionCache(loadedConfigs, name: configCacheKey)
+            }
         }
 
         guard refreshIsCurrent() else { return }
         if deferVisibleUpdate {
-            // Schedule only after persistence completes so the delay starts at
-            // the end of `.refreshable`, not while its spinner is still held.
+            // Schedule before persistence completes so the native refresh
+            // control can retract immediately. The single delayed publication
+            // still prevents card replacement from colliding with the retraction.
+            refreshLog("开始更新页面")
             scheduleDeferredRefreshPublication(
                 sites: loadedSites,
                 configs: indexedConfigs,
@@ -1111,6 +1184,10 @@ final class SitesViewModel: ObservableObject {
                 self.suppressFilteredSitesRebuild = false
                 self.rebuildFilteredSites()
             }
+            recordAppLog(
+                .info,
+                "站点下拉刷新：页面更新完成（\(loadedSites?.count ?? self.sites.count) 个站点）"
+            )
             self.deferredRefreshPublicationTask = nil
         }
     }
@@ -1266,7 +1343,7 @@ final class SitesViewModel: ObservableObject {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
-    private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
+    nonisolated private static func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
         var row = site.raw.filter { key, _ in
             let normalized = key.lowercased().filter { $0.isLetter || $0.isNumber }
             if normalized.contains("password") || normalized.contains("token") || normalized.contains("secret") {
@@ -1288,11 +1365,15 @@ final class SitesViewModel: ObservableObject {
         return row
     }
 
+    private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
+        Self.sitePersistentCacheRow(site)
+    }
+
     func config(for site: SiteItem) -> [String: Any]? {
         siteConfigs[site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
 
-    private func siteFastSnapshotRow(_ site: SiteItem) -> [String: Any] {
+    nonisolated private static func siteFastSnapshotRow(_ site: SiteItem) -> [String: Any] {
         let statusDate = site.updatedAt.isEmpty ? isoDayKey() : site.updatedAt
         let status: [String: Any] = [
             "uploaded": site.uploaded,
@@ -1341,6 +1422,10 @@ final class SitesViewModel: ObservableObject {
         ]
         if site.signed { row["sign_info"] = [isoDayKey(): ["signed": true]] }
         return row
+    }
+
+    private func siteFastSnapshotRow(_ site: SiteItem) -> [String: Any] {
+        Self.siteFastSnapshotRow(site)
     }
 
     private static func indexedConfigs(_ configs: [[String: Any]]) -> [String: [String: Any]] {
@@ -1601,6 +1686,7 @@ struct SitesView: View {
                     .contentMargins(.vertical, 0, for: .scrollContent)
                     .scrollContentBackground(.hidden)
                     .background(Color(uiColor: .systemGroupedBackground))
+                    .environment(\.harvestFlowEffectsPaused, model.isPullRefreshSettling)
                     .refreshable { await model.pullToRefresh(appState) }
                 }
             }
@@ -3829,6 +3915,7 @@ private struct SiteInlineStatus: View {
 
 private struct SiteHeaderCompactMetric: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.harvestFlowEffectsPaused) private var flowEffectsPaused
     let icon: String
     let label: String
     let value: String
@@ -3849,7 +3936,7 @@ private struct SiteHeaderCompactMetric: View {
                 HardwareBreathingSymbolBadge(
                     icon: icon,
                     color: color,
-                    paused: reduceMotion
+                    paused: reduceMotion || flowEffectsPaused
                 )
                 .frame(width: 14, height: 14)
             } else {

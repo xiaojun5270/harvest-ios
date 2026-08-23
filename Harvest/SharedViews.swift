@@ -2314,8 +2314,20 @@ struct SymbolBadge: View {
     }
 }
 
+private struct HarvestFlowEffectsPausedKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var harvestFlowEffectsPaused: Bool {
+        get { self[HarvestFlowEffectsPausedKey.self] }
+        set { self[HarvestFlowEffectsPausedKey.self] = newValue }
+    }
+}
+
 struct FlowingSymbolBadge: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.harvestFlowEffectsPaused) private var flowEffectsPaused
 
     let icon: String
     let color: Color
@@ -2360,7 +2372,7 @@ struct FlowingSymbolBadge: View {
                 cornerRadius: cornerRadius,
                 circular: false,
                 phaseOffset: phaseOffset,
-                paused: reduceMotion
+                paused: reduceMotion || flowEffectsPaused
             )
         }
     }
@@ -2368,6 +2380,7 @@ struct FlowingSymbolBadge: View {
 
 struct FlowingCircleBorder: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.harvestFlowEffectsPaused) private var flowEffectsPaused
 
     let color: Color
     var lineWidth: CGFloat = 1.8
@@ -2379,7 +2392,7 @@ struct FlowingCircleBorder: View {
             cornerRadius: 0,
             circular: true,
             phaseOffset: 0,
-            paused: reduceMotion
+            paused: reduceMotion || flowEffectsPaused
         )
         .allowsHitTesting(false)
     }

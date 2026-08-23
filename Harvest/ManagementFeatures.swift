@@ -4356,6 +4356,7 @@ struct LogView: View {
     @State private var paused = false
     @State private var following = true
     @State private var sharedArchive: SharedLogArchive?
+    @State private var confirmingClearAppLogs = false
 
     private let filterLevels = ["ALL", "VERBOSE", "DEBUG", "INFO", "WARN", "ERROR"]
     private let serverLevels = ["DEBUG", "INFO", "WARN", "ERROR"]
@@ -4486,6 +4487,12 @@ struct LogView: View {
                             .disabled(entries.isEmpty)
                         Button { Task { await clearCurrent() } } label: { Label("清空当前视图", systemImage: "trash") }
                             .disabled(entries.isEmpty)
+                        if source == .app {
+                            Button { confirmingClearAppLogs = true } label: {
+                                Label("清空 APP 日志", systemImage: "trash.slash")
+                            }
+                            .disabled(appAllEntries.isEmpty)
+                        }
                         Button {
                             if source == .server {
                                 streamRestartGeneration &+= 1
@@ -4514,6 +4521,18 @@ struct LogView: View {
         }
         .searchable(text: $query, prompt: "筛选日志")
         .sheet(item: $sharedArchive) { archive in ActivityShareSheet(items: [archive.url]) }
+        .confirmationDialog(
+            "确定清空全部 APP 日志？",
+            isPresented: $confirmingClearAppLogs,
+            titleVisibility: .visible
+        ) {
+            Button("清空 APP 日志", role: .destructive) {
+                Task { await clearAppLogs() }
+            }
+            Button("取消", role: .cancel) { }
+        } message: {
+            Text("将删除本地持久化日志文件，服务端日志不会受到影响。")
+        }
         .navigationTitle("日志中心")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: "\(source.rawValue)-\(serverLevel)-\(streamRestartGeneration)") {
@@ -4731,6 +4750,15 @@ struct LogView: View {
             serverLoadedCount = 0
         }
         entries = []
+    }
+
+    @MainActor
+    private func clearAppLogs() async {
+        await AppLogStore.shared.clear()
+        appAllEntries = []
+        appVisibleStart = 0
+        entries = []
+        following = true
     }
 
     @MainActor private func shareAppLogs() async {
