@@ -183,6 +183,102 @@ struct SiteItem: Identifiable {
     }
 }
 
+private struct SiteFastSnapshotWriteRequest: @unchecked Sendable {
+    let rows: [[String: Any]]
+    let server: String
+    let cachedAt: Date
+    let generation: Int
+}
+
+/// Serializes and persists the launch snapshot off the main actor. Keeping a
+/// single pending request also prevents several refresh completions from
+/// queueing redundant UserDefaults writes back-to-back.
+private actor SiteFastSnapshotWriter {
+    private var pending: SiteFastSnapshotWriteRequest?
+    private var isDraining = false
+    private var minimumValidGeneration = 0
+    private var lastPersistedGeneration = -1
+    private var lastPersistedServer = ""
+    private var lastRowsPayload: Data?
+
+    func enqueue(_ request: SiteFastSnapshotWriteRequest) {
+        guard request.generation >= minimumValidGeneration else { return }
+        pending = request
+        guard !isDraining else { return }
+        isDraining = true
+        Task { await drain() }
+    }
+
+    func invalidate(generation: Int) {
+        minimumValidGeneration = max(minimumValidGeneration, generation)
+        if let pending, pending.generation < minimumValidGeneration {
+            self.pending = nil
+        }
+        lastPersistedServer = ""
+        lastRowsPayload = nil
+        let defaults = UserDefaults.standard
+        // If a fresh snapshot reached this actor before the invalidation
+        // message, preserve it. Otherwise the delayed invalidation would erase
+        // a valid post-clear write due solely to task scheduling order.
+        if lastPersistedGeneration < generation {
+            defaults.removeObject(forKey: "sites.fastSnapshot.v3")
+        }
+        defaults.removeObject(forKey: "sites.fastSnapshot.v2")
+        defaults.removeObject(forKey: "sites.fastSnapshot")
+    }
+
+    private func drain() async {
+        defer { isDraining = false }
+        while pending != nil {
+            // Coalesce refreshes arriving in the same run-loop window. The
+            // newest rows supersede older rows before any disk work starts.
+            try? await Task.sleep(for: .milliseconds(120))
+            guard let request = pending else { continue }
+            pending = nil
+            guard request.generation >= minimumValidGeneration,
+                  JSONSerialization.isValidJSONObject(request.rows),
+                  let rowsPayload = try? JSONSerialization.data(
+                    withJSONObject: request.rows,
+                    options: [.sortedKeys]
+                  ) else { continue }
+
+            let server = normalizedSiteSnapshotServer(request.server)
+            if lastPersistedServer == server, lastRowsPayload == rowsPayload { continue }
+            let object: [String: Any] = [
+                "version": 3,
+                "server": server,
+                "cachedAt": request.cachedAt.timeIntervalSince1970,
+                "rows": request.rows
+            ]
+            guard JSONSerialization.isValidJSONObject(object),
+                  let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
+                recordAppLog(.warning, "站点快照写入失败：数据不是有效 JSON（\(request.rows.count) 行）")
+                continue
+            }
+            guard request.generation >= minimumValidGeneration else { continue }
+            UserDefaults.standard.set(data, forKey: "sites.fastSnapshot.v3")
+            lastPersistedGeneration = request.generation
+            lastPersistedServer = server
+            lastRowsPayload = rowsPayload
+            recordAppLog(.info, "站点快照已写入：\(request.rows.count) 个站点，\(data.count) 字节")
+        }
+    }
+}
+
+private let siteFastSnapshotWriter = SiteFastSnapshotWriter()
+
+private func normalizedSiteSnapshotServer(_ value: String) -> String {
+    var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    while normalized.hasSuffix("/") { normalized.removeLast() }
+    if let components = URLComponents(string: normalized),
+       let scheme = components.scheme?.lowercased(),
+       let host = components.host?.lowercased() {
+        let port = components.port.map { ":\($0)" } ?? ""
+        return "\(scheme)://\(host)\(port)\(components.path == "/" ? "" : components.path)"
+    }
+    return normalized.lowercased()
+}
+
 private func isoDayKey(_ date: Date = Date()) -> String {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -307,6 +403,9 @@ final class SitesViewModel: ObservableObject {
     private static let legacyFastSnapshotKeys = ["sites.fastSnapshot.v2", "sites.fastSnapshot"]
     private static let fastSnapshotVersion = 3
     private static var fastSnapshotMemory: [String: FastSnapshot] = [:]
+    // Invalidating the cache advances this generation so an in-flight
+    // background write cannot restore data that the user just cleared.
+    private static var fastSnapshotWriteGeneration = 0
 
     private(set) var sites: [SiteItem] = [] { didSet { scheduleFilteredSitesRebuild() } }
     @Published private(set) var filtered: [SiteItem] = []
@@ -1026,10 +1125,15 @@ final class SitesViewModel: ObservableObject {
     }
 
     static func clearCachedSitesSnapshot() {
+        fastSnapshotWriteGeneration &+= 1
+        let generation = fastSnapshotWriteGeneration
         fastSnapshotMemory.removeAll(keepingCapacity: false)
         let defaults = UserDefaults.standard
         defaults.removeObject(forKey: fastSnapshotKey)
         legacyFastSnapshotKeys.forEach { defaults.removeObject(forKey: $0) }
+        Task {
+            await siteFastSnapshotWriter.invalidate(generation: generation)
+        }
     }
 
     private static func readFastSnapshot(for server: String) -> FastSnapshot? {
@@ -1080,35 +1184,26 @@ final class SitesViewModel: ObservableObject {
         cachedAt: Date
     ) {
         guard !rows.isEmpty else { return }
-        let object: [String: Any] = [
-            "version": fastSnapshotVersion,
-            "server": normalizedSnapshotServer(server),
-            "cachedAt": cachedAt.timeIntervalSince1970,
-            "rows": rows
-        ]
-        guard JSONSerialization.isValidJSONObject(object),
-              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
-            recordAppLog(.warning, "站点快照写入失败：数据不是有效 JSON（\(rows.count) 行）")
-            return
-        }
-        UserDefaults.standard.set(data, forKey: fastSnapshotKey)
-        fastSnapshotMemory[normalizedSnapshotServer(server)] = FastSnapshot(
+        let normalizedServer = normalizedSnapshotServer(server)
+        // Keep the in-process cache synchronous so a refresh never has to wait
+        // for persistence before the current screen can render.
+        fastSnapshotMemory[normalizedServer] = FastSnapshot(
             rows: rows,
             cachedAt: cachedAt
         )
-        recordAppLog(.info, "站点快照已写入：\(rows.count) 个站点，\(data.count) 字节")
+        let request = SiteFastSnapshotWriteRequest(
+            rows: rows,
+            server: normalizedServer,
+            cachedAt: cachedAt,
+            generation: fastSnapshotWriteGeneration
+        )
+        Task {
+            await siteFastSnapshotWriter.enqueue(request)
+        }
     }
 
     private static func normalizedSnapshotServer(_ value: String) -> String {
-        var normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        while normalized.hasSuffix("/") { normalized.removeLast() }
-        if let components = URLComponents(string: normalized),
-           let scheme = components.scheme?.lowercased(),
-           let host = components.host?.lowercased() {
-            let port = components.port.map { ":\($0)" } ?? ""
-            return "\(scheme)://\(host)\(port)\(components.path == "/" ? "" : components.path)"
-        }
-        return normalized.lowercased()
+        normalizedSiteSnapshotServer(value)
     }
 
     func operate(_ appState: AppState, site: SiteItem, path: String) async {
@@ -1269,20 +1364,61 @@ final class SitesViewModel: ObservableObject {
         var candidates: [RemoteImageCandidate] = []
         var seen = Set<String>()
 
-        if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
-            candidates.append(RemoteImageCandidate(
-                url: url,
-                persistentCacheID: "site-icon|\(url.absoluteString)"
-            ))
-        }
-
-        let siteName = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let siteKey = site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let siteName = siteKey.isEmpty
+            ? site.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            : siteKey
+        let siteConfig = config(for: site)
         var server = appState.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while server.hasSuffix("/") { server.removeLast() }
         if !siteName.isEmpty, let serverURL = URL(string: server + "/") {
             let headers = appState.accessToken.isEmpty
                 ? [:]
                 : ["Authorization": "Bearer \(appState.accessToken)"]
+            let configuredIconValues = [
+                site.iconURL,
+                siteConfig?.string("logo", "icon", "favicon") ?? ""
+            ]
+            // A response may already contain the exact /icons/xxx.png path.
+            // Resolve that path against the Harvest server, not the tracker
+            // domain, and preserve it ahead of all generated fallbacks.
+            for rawValue in configuredIconValues {
+                let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !value.isEmpty else { continue }
+                let explicitURL = URL(string: value).flatMap { url -> URL? in
+                    guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                          url.path.lowercased().hasPrefix("/icons/") else { return nil }
+                    return url
+                }
+                let normalizedPath = value.hasPrefix("/") ? value : "/\(value)"
+                let relativeURL = normalizedPath.lowercased().hasPrefix("/icons/")
+                    ? URL(string: normalizedPath, relativeTo: serverURL)?.absoluteURL
+                    : nil
+                guard let url = explicitURL ?? relativeURL else { continue }
+                let candidateHeaders = url.host?.caseInsensitiveCompare(serverURL.host ?? "") == .orderedSame
+                    ? headers
+                    : [:]
+                if seen.insert(url.absoluteString).inserted {
+                    candidates.append(RemoteImageCandidate(
+                        url: url,
+                        headers: candidateHeaders,
+                        persistentCacheID: "site-icon|\(url.absoluteString)"
+                    ))
+                }
+            }
+            // Fall back to the conventional /icons/<site>.png filename when
+            // the API row does not provide an explicit icon path.
+            if let url = URL(
+                string: "/icons/\(urlPathSegment(siteName)).png",
+                relativeTo: serverURL
+            )?.absoluteURL,
+               seen.insert(url.absoluteString).inserted {
+                candidates.append(RemoteImageCandidate(
+                    url: url,
+                    headers: headers,
+                    persistentCacheID: "site-icon|\(url.absoluteString)"
+                ))
+            }
             if let url = URL(
                 string: "static/site_favicon/\(urlPathSegment(siteName)).png",
                 relativeTo: serverURL
@@ -1306,6 +1442,15 @@ final class SitesViewModel: ObservableObject {
             }
         }
 
+        // Keep custom site-provided logos as a final fallback when the backend
+        // icon endpoint is unavailable.
+        if let url = logoURL(for: site), seen.insert(url.absoluteString).inserted {
+            candidates.append(RemoteImageCandidate(
+                url: url,
+                persistentCacheID: "site-icon|\(url.absoluteString)"
+            ))
+        }
+
         return candidates
     }
 
@@ -1320,6 +1465,13 @@ final class SitesViewModel: ObservableObject {
         for rawValue in candidates {
             let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !value.isEmpty else { continue }
+            let relativePath = value.hasPrefix("/") ? value : "/\(value)"
+            if URL(string: value)?.scheme == nil,
+               relativePath.lowercased().hasPrefix("/icons/") {
+                // Backend-relative icons were already resolved against the
+                // Harvest server and must not be retried on the tracker host.
+                continue
+            }
             if value.hasPrefix("//") {
                 let scheme = baseValues.compactMap { URL(string: $0)?.scheme }.first ?? "https"
                 if let url = URL(string: "\(scheme):\(value)") { return url }

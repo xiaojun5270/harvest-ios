@@ -2463,6 +2463,7 @@ private func resourceImageCandidates(
         let normalized = url.absoluteString.lowercased()
         let path = url.path.lowercased()
         if knownSiteIconURLs.contains(normalized)
+            || path.hasPrefix("/icons/")
             || path.contains("/local/icons/")
             || path.contains("/static/site_favicon/")
             || path.contains("favicon") {

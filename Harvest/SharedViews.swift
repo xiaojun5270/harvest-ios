@@ -1384,38 +1384,41 @@ struct CachedAnimatedRemoteImageCandidates<Placeholder: View>: View {
     }
 
     @MainActor private func loadFirstPersistedCandidate() async -> Bool {
-        for candidate in candidates {
-            guard let persistentCacheID = candidate.persistentCacheID,
-                  let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
-                continue
-            }
-            let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
-            guard let data = await RemoteImageDataCache.shared.persistentData(
-                for: persistentCacheID,
-                requestURL: normalizedURL,
-                headers: effectiveHeaders
-            ) else { continue }
-            let variant = candidate.prefersLinkedMediaPoster ? "linked-media-poster" : ""
-            let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
-            let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
-            if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
-                loadedImage = cached
-                return true
-            }
-            let pixelSize = maximumPixelSize
-            let decoded = await Task.detached(priority: .utility) {
-                RemoteAnimatedImage(data: data, cacheKey: decodedCacheKey, maximumPixelSize: pixelSize)
-            }.value
-            guard !Task.isCancelled else { return false }
-            guard let decoded else {
-                await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
-                continue
-            }
-            RemoteAnimatedImageCache.shared.insert(decoded, for: decodedCacheKey)
-            loadedImage = decoded
+        // Candidate order is authoritative. Restoring a cached lower-priority
+        // image here prevented a newly preferred /icons/ resource from ever
+        // being requested, so only restore the first candidate at this stage.
+        // Later candidates still use their persistent cache after an actual
+        // failure advances the index.
+        guard let candidate = candidates.first,
+              let persistentCacheID = candidate.persistentCacheID,
+              let normalizedURL = URL(string: normalizedRemoteImageURL(candidate.url.absoluteString)) else {
+            return false
+        }
+        let effectiveHeaders = remoteImageHeaders(for: normalizedURL, additional: candidate.headers)
+        guard let data = await RemoteImageDataCache.shared.persistentData(
+            for: persistentCacheID,
+            requestURL: normalizedURL,
+            headers: effectiveHeaders
+        ) else { return false }
+        let variant = candidate.prefersLinkedMediaPoster ? "linked-media-poster" : ""
+        let dataCacheKey = remoteImageCacheKey(url: normalizedURL, headers: effectiveHeaders, variant: variant)
+        let decodedCacheKey = "\(dataCacheKey)|animated|\(max(1, clampedInt(maximumPixelSize.rounded(.up))))"
+        if let cached = RemoteAnimatedImageCache.shared.image(for: decodedCacheKey) {
+            loadedImage = cached
             return true
         }
-        return false
+        let pixelSize = maximumPixelSize
+        let decoded = await Task.detached(priority: .utility) {
+            RemoteAnimatedImage(data: data, cacheKey: decodedCacheKey, maximumPixelSize: pixelSize)
+        }.value
+        guard !Task.isCancelled else { return false }
+        guard let decoded else {
+            await RemoteImageDataCache.shared.removePersistentData(for: persistentCacheID)
+            return false
+        }
+        RemoteAnimatedImageCache.shared.insert(decoded, for: decodedCacheKey)
+        loadedImage = decoded
+        return true
     }
 }
 
