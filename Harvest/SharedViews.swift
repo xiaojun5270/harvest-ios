@@ -2095,53 +2095,55 @@ struct ManualTaskFeedbackOverlay: View {
 
     var body: some View {
         VStack {
-            HStack(spacing: 10) {
+            HStack(spacing: 7) {
                 ZStack {
                     Circle()
-                        .fill(color.opacity(0.13))
-                        .frame(width: 30, height: 30)
+                        .fill(color.opacity(0.12))
+                        .frame(width: 24, height: 24)
                     if feedback.phase == .running {
                         ProgressView()
-                            .controlSize(.small)
+                            .controlSize(.mini)
                             .tint(color)
                     } else {
                         Image(systemName: icon)
-                            .font(.system(size: 13, weight: .bold))
+                            .font(.system(size: 11, weight: .bold))
                             .foregroundStyle(color)
                     }
                 }
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(feedback.title)
-                        .font(.subheadline.weight(.semibold))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.78)
-                    if let message = feedback.message, !message.isEmpty {
-                        Text(message)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(displayText)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .frame(maxWidth: 220, alignment: .leading)
             }
-            .frame(maxWidth: 360)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.leading, 7)
+            .padding(.trailing, 11)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
             .overlay {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(color.opacity(0.18), lineWidth: 0.8)
+                Capsule()
+                    .stroke(color.opacity(0.22), lineWidth: 0.75)
             }
-            .shadow(color: .black.opacity(0.14), radius: 12, y: 5)
+            .shadow(color: .black.opacity(0.10), radius: 7, y: 3)
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(feedback.phase == .running ? .updatesFrequently : [])
             Spacer(minLength: 0)
         }
-        .safeAreaPadding(.top, 8)
-        .padding(.horizontal, 16)
+        .safeAreaPadding(.top, 5)
+        .padding(.horizontal, 12)
         .allowsHitTesting(false)
+    }
+
+    private var displayText: String {
+        if feedback.phase != .running,
+           let message = feedback.message?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !message.isEmpty {
+            return message
+        }
+        return feedback.title
     }
 }
 
