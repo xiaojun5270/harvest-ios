@@ -383,6 +383,7 @@ final class SitesViewModel: ObservableObject {
     private var loadAttemptID: UUID?
     private var networkRefreshInProgress = false
     private var backgroundRefreshTask: Task<Void, Never>?
+    private var deferredRefreshPublicationTask: Task<Void, Never>?
     private var backgroundRefreshGeneration = 0
     private var suppressFilteredSitesRebuild = false
     private var lastConfigsLoadedAt: Date?
@@ -562,6 +563,8 @@ final class SitesViewModel: ObservableObject {
         // replace the snapshot restored for the current account.
         backgroundRefreshTask?.cancel()
         backgroundRefreshTask = nil
+        deferredRefreshPublicationTask?.cancel()
+        deferredRefreshPublicationTask = nil
         backgroundRefreshGeneration &+= 1
         networkRefreshInProgress = false
         loadInProgress = false
@@ -669,7 +672,12 @@ final class SitesViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    func load(_ appState: AppState, cached: Bool = true, background: Bool = false) async {
+    func load(
+        _ appState: AppState,
+        cached: Bool = true,
+        background: Bool = false,
+        deferVisibleUpdate: Bool = false
+    ) async {
         // A pull-to-refresh should wait for an existing refresh. The initial view
         // load, however, must return as soon as cached rows are available.
         if networkRefreshInProgress {
@@ -799,13 +807,25 @@ final class SitesViewModel: ObservableObject {
         backgroundRefreshGeneration &+= 1
         let generation = backgroundRefreshGeneration
         networkRefreshInProgress = true
-        await refreshFromNetwork(appState, cached: cached, generation: generation)
+        await refreshFromNetwork(
+            appState,
+            cached: cached,
+            generation: generation,
+            deferVisibleUpdate: deferVisibleUpdate
+        )
         if backgroundRefreshGeneration == generation {
             networkRefreshInProgress = false
             loadInProgress = false
             isLoading = false
         }
         performanceInterval.end()
+    }
+
+    func pullToRefresh(_ appState: AppState) async {
+        // Keep current rows fixed while UIRefreshControl retracts. Replacing
+        // the decoded site array during that animation rebuilds every card and
+        // causes a visible hitch on release.
+        await load(appState, deferVisibleUpdate: true)
     }
 
     private func startBackgroundRefresh(_ appState: AppState, cached: Bool) {
@@ -834,7 +854,8 @@ final class SitesViewModel: ObservableObject {
     private func refreshFromNetwork(
         _ appState: AppState,
         cached: Bool,
-        generation: Int
+        generation: Int,
+        deferVisibleUpdate: Bool = false
     ) async {
         let performanceInterval = HarvestPerformanceMonitor.shared.begin(.sitesLoad)
         defer { performanceInterval.end() }
@@ -874,17 +895,18 @@ final class SitesViewModel: ObservableObject {
             } else {
                 loadedSites = refreshedSites
             }
-            cachedAt = nil
-            if loadedSites != nil { usingCachedData = false }
             if let loadedSites {
-                // Publish site rows as soon as that endpoint responds. The
-                // configuration list is independent and must not hold the
-                // entire site page behind its slower request.
-                suppressFilteredSitesRebuild = true
-                sites = loadedSites
-                suppressFilteredSitesRebuild = false
-                rebuildFilteredSites()
-                isLoading = false
+                if !deferVisibleUpdate {
+                    // Background and explicit non-pull loads still publish the
+                    // site endpoint immediately; only pull-to-refresh delays it.
+                    suppressFilteredSitesRebuild = true
+                    sites = loadedSites
+                    cachedAt = nil
+                    usingCachedData = false
+                    suppressFilteredSitesRebuild = false
+                    rebuildFilteredSites()
+                    isLoading = false
+                }
                 Self.writeFastSnapshot(
                     loadedSites.map { self.siteFastSnapshotRow($0) },
                     for: appState.baseURL,
@@ -917,7 +939,6 @@ final class SitesViewModel: ObservableObject {
             case let .success(raw):
                 guard refreshIsCurrent() else { return }
                 loadedConfigs = jsonRows(raw)
-                lastConfigsLoadedAt = Date()
             case let .failure(error):
                 guard refreshIsCurrent() else { return }
                 if !isRequestCancellation(error) {
@@ -927,13 +948,70 @@ final class SitesViewModel: ObservableObject {
         }
 
         guard refreshIsCurrent() else { return }
-        suppressFilteredSitesRebuild = true
-        if let loadedConfigs { siteConfigs = Self.indexedConfigs(loadedConfigs) }
-        suppressFilteredSitesRebuild = false
-        rebuildFilteredSites()
+        let indexedConfigs = loadedConfigs.map(Self.indexedConfigs)
+        let configsLoadedAt = loadedConfigs == nil ? nil : Date()
+        if !deferVisibleUpdate, let indexedConfigs {
+            suppressFilteredSitesRebuild = true
+            siteConfigs = indexedConfigs
+            lastConfigsLoadedAt = configsLoadedAt
+            suppressFilteredSitesRebuild = false
+            rebuildFilteredSites()
+        }
 
         if let loadedConfigs {
             await appState.writeSessionCache(loadedConfigs, name: configCacheKey)
+        }
+
+        guard refreshIsCurrent() else { return }
+        if deferVisibleUpdate {
+            // Schedule only after persistence completes so the delay starts at
+            // the end of `.refreshable`, not while its spinner is still held.
+            scheduleDeferredRefreshPublication(
+                sites: loadedSites,
+                configs: indexedConfigs,
+                configsLoadedAt: configsLoadedAt,
+                generation: generation
+            )
+        }
+    }
+
+    private func scheduleDeferredRefreshPublication(
+        sites loadedSites: [SiteItem]?,
+        configs loadedConfigs: [String: [String: Any]]?,
+        configsLoadedAt: Date?,
+        generation: Int
+    ) {
+        guard loadedSites != nil || loadedConfigs != nil else { return }
+        deferredRefreshPublicationTask?.cancel()
+        deferredRefreshPublicationTask = Task { @MainActor [weak self] in
+            do {
+                // Let the native refresh control finish retracting before the
+                // GIF/flow-light cards receive their single data update.
+                try await Task.sleep(for: .milliseconds(240))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.backgroundRefreshGeneration == generation,
+                  !Task.isCancelled else { return }
+
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                self.suppressFilteredSitesRebuild = true
+                if let loadedSites {
+                    self.sites = loadedSites
+                    self.cachedAt = nil
+                    self.usingCachedData = false
+                }
+                if let loadedConfigs {
+                    self.siteConfigs = loadedConfigs
+                    self.lastConfigsLoadedAt = configsLoadedAt
+                }
+                self.suppressFilteredSitesRebuild = false
+                self.rebuildFilteredSites()
+            }
+            self.deferredRefreshPublicationTask = nil
         }
     }
 
@@ -1360,7 +1438,7 @@ struct SitesView: View {
                     .contentMargins(.vertical, 0, for: .scrollContent)
                     .scrollContentBackground(.hidden)
                     .background(Color(uiColor: .systemGroupedBackground))
-                    .refreshable { await model.load(appState) }
+                    .refreshable { await model.pullToRefresh(appState) }
                 }
             }
         }
