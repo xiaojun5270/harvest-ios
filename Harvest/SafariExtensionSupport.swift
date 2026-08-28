@@ -69,10 +69,12 @@ struct SafariExtensionSettingsView: View {
                 }
             }
 
-            Section("扩展权限") {
+            Section {
                 Label("读取和修改访问站点的网页内容", systemImage: "doc.text.magnifyingglass")
                 Label("读取与写入站点 Cookie，用于同步登录信息", systemImage: "key.horizontal.fill")
                 Label("调用 Harvest 的站点同步、搜索和下载器功能", systemImage: "arrow.triangle.2.circlepath")
+            } header: {
+                Text("扩展权限")
             } footer: {
                 Text("扩展默认不会自动启用。安装 App 后仍需由你在系统设置中授权；服务器地址和令牌在扩展弹窗内单独配置。")
             }

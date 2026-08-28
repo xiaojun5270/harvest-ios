@@ -4852,8 +4852,10 @@ final class BrowserSessionModel: ObservableObject {
     func attach(_ webView: WKWebView) {
         if self.webView !== webView {
             progressObservation?.invalidate()
-            progressObservation = webView.observe(\.estimatedProgress, options: [.initial, .new]) { [weak self] view, _ in
-                self?.refreshProgress(view)
+            progressObservation = webView.observe(\.estimatedProgress, options: [.initial, .new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshProgress()
+                }
             }
         }
         self.webView = webView
@@ -4869,7 +4871,8 @@ final class BrowserSessionModel: ObservableObject {
         refreshProgress(view)
     }
 
-    private func refreshProgress(_ webView: WKWebView) {
+    private func refreshProgress(_ webView: WKWebView? = nil) {
+        guard let webView = webView ?? self.webView else { return }
         let progress = min(max(webView.estimatedProgress, 0), 1)
         loadProgress = webView.isLoading ? min(max(progress, 0.02), 0.995) : 1
     }
