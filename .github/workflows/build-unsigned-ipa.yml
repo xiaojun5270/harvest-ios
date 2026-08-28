@@ -56,6 +56,16 @@ jobs:
           APP_PATH="$DERIVED_DATA/Build/Products/Release-iphoneos/Harvest.app"
           test -d "$APP_PATH"
 
+          EXTENSION_PATH="$APP_PATH/PlugIns/HarvestSafariExtension.appex"
+          test -d "$EXTENSION_PATH"
+          test -f "$EXTENSION_PATH/manifest.json"
+          test -f "$EXTENSION_PATH/background.js"
+          test -f "$EXTENSION_PATH/content-scripts/content.js"
+          if grep -q "BEGIN PRIVATE KEY" "$EXTENSION_PATH/manifest.json"; then
+            echo "Safari extension manifest unexpectedly contains a private key."
+            exit 1
+          fi
+
           mkdir -p output/Payload
           /usr/bin/ditto "$APP_PATH" output/Payload/Harvest.app
           (

@@ -920,6 +920,9 @@ struct SettingsView: View {
                         NavigationLink { AdminView().environmentObject(appState) } label: { Label("授权管理", systemImage: "person.badge.key") }
                     }
                     NavigationLink { LogView().environmentObject(appState) } label: { Label("日志中心", systemImage: "doc.text.magnifyingglass") }
+                    NavigationLink { SafariExtensionSettingsView() } label: {
+                        Label("Safari 扩展", systemImage: "safari.fill")
+                    }
                     NavigationLink {
                         NativeBrowserView(urlString: appState.baseURL, title: "服务页面")
                             .navigationTitle("服务页面")

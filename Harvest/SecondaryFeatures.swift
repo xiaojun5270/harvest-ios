@@ -1145,6 +1145,13 @@ private func resourceHasHRValue(_ item: [String: Any]) -> Bool {
     return !["false", "no", "none", "null", "nil", "无", "否", "-", "--"].contains(value)
 }
 
+private func formattedResourceSize(_ item: [String: Any]) -> String {
+    guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
+        return item.string("size", "length") ?? "未知大小"
+    }
+    return formatBytes(bytes)
+}
+
 @MainActor
 final class SearchViewModel: ObservableObject {
     private struct MediaSearchResult: @unchecked Sendable {
@@ -3690,7 +3697,7 @@ struct ResourceRowItem: View {
                 HStack(spacing: 8) {
                     compactMetric("\(seeders)", icon: "arrow.up", tint: HarvestTheme.green)
                     compactMetric("\(leechers)", icon: "arrow.down", tint: HarvestTheme.coral)
-                    Text(sizeLabel)
+                    Text(formattedResourceSize(item))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
@@ -3742,13 +3749,6 @@ struct ResourceRowItem: View {
         if !site.isEmpty { values.append(site) }
         if !subtitle.isEmpty { values.append(subtitle) }
         return values.joined(separator: " | ")
-    }
-
-    private var sizeLabel: String {
-        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
-            return item.string("size", "length") ?? "未知大小"
-        }
-        return formatBytes(bytes)
     }
 
     private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
@@ -3911,7 +3911,7 @@ private struct ResourceDetailSheet: View {
     }
     private var metadata: [(String, String)] {
         var values: [(String, String)] = [("站点", siteLabel)]
-        values.append(("大小", sizeLabel))
+        values.append(("大小", formattedResourceSize(item)))
         values.append(("做种", "\(item.int("seeders", "seed", "seeder") ?? 0)"))
         values.append(("下载", "\(item.int("leechers", "leecher", "leech", "peers", "peer") ?? 0)"))
         values.append(("完成", "\(item.int("completers", "completed", "snatched", "grabs", "grab") ?? 0)"))
@@ -3923,13 +3923,6 @@ private struct ResourceDetailSheet: View {
         }
         return values
     }
-    private var sizeLabel: String {
-        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
-            return item.string("size", "length") ?? "未知大小"
-        }
-        return formatBytes(bytes)
-    }
-
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -4778,7 +4771,7 @@ struct ResourcePushSheet: View {
                 }
             }
             HStack(spacing: 6) {
-                resourceMetric("大小", value: resourceSize, icon: "externaldrive", color: HarvestTheme.blue)
+                resourceMetric("大小", value: formattedResourceSize(item), icon: "externaldrive", color: HarvestTheme.blue)
                 resourceMetric("做种", value: "\(seeders)", icon: "arrow.up", color: HarvestTheme.green)
                 resourceMetric("下载", value: "\(leechers)", icon: "arrow.down", color: HarvestTheme.coral)
                 resourceMetric("完成", value: "\(completers)", icon: "checkmark", color: .secondary)
@@ -4833,12 +4826,6 @@ struct ResourcePushSheet: View {
     private var seeders: Int { item.int("seeders", "seed", "seeder") ?? 0 }
     private var leechers: Int { item.int("leechers", "leecher", "leech") ?? 0 }
     private var completers: Int { item.int("completers", "completed", "snatched") ?? 0 }
-    private var resourceSize: String {
-        guard let bytes = item.double("size", "length", "size_bytes", "sizeBytes"), bytes > 0 else {
-            return item.string("size", "length") ?? "未知大小"
-        }
-        return formatBytes(bytes)
-    }
     private var summaryLabels: [String] {
         var values: [String] = []
         if let value = item.string("category", "category_name"), !value.isEmpty, value != "无分类" { values.append(value) }
@@ -4851,14 +4838,7 @@ struct ResourcePushSheet: View {
     }
 
     private var mustGenerateTorrentURL: Bool {
-        if isMTeamSiteIdentifier(siteIdentifier) { return true }
-        let raw = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let site = sites.first(where: {
-            String($0.id) == raw
-                || $0.siteKey.caseInsensitiveCompare(raw) == .orderedSame
-                || $0.name.caseInsensitiveCompare(raw) == .orderedSame
-        }) else { return false }
-        return isMTeamSiteIdentifier(site.siteKey) || isMTeamSiteIdentifier(site.name)
+        siteRequiresGeneratedTorrentURL(siteIdentifier, sites: sites)
     }
 
     private var effectiveGenerateTorrentURL: Bool {
@@ -4880,10 +4860,6 @@ struct ResourcePushSheet: View {
         )
     }
 
-    private func isMTeamSiteIdentifier(_ value: String) -> Bool {
-        value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
-    }
-
     private func toggleTag(_ tag: String) {
         var values = selectedTagValues
         if values.contains(tag) { values.remove(tag) }
@@ -4895,23 +4871,27 @@ struct ResourcePushSheet: View {
 
     @MainActor private func load() async {
         defer { isLoading = false }
-        async let sitesValue = optionalValue(
-            APIPath.sites,
+        async let sitesValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.sites,
             label: "站点列表",
             timeoutInterval: 10
         )
-        async let tagsValue = optionalValue(
-            APIPath.downloaderTags + "\(downloaderID)",
+        async let tagsValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.downloaderTags + "\(downloaderID)",
             label: "下载器标签",
             timeoutInterval: 8
         )
-        async let categoriesValue = optionalValue(
-            APIPath.downloaderCategories + "\(downloaderID)",
+        async let categoriesValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.downloaderCategories + "\(downloaderID)",
             label: "下载器分类",
             timeoutInterval: 8
         )
-        async let preferencesValue = optionalValue(
-            APIPath.downloaderPreferences + "\(downloaderID)",
+        async let preferencesValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.downloaderPreferences + "\(downloaderID)",
             label: "下载器默认路径",
             timeoutInterval: 8
         )
@@ -4922,7 +4902,7 @@ struct ResourcePushSheet: View {
         availableCategories = values.2.map { normalizedResourcePushCategories($0) } ?? []
         isLoading = false
         let preferences = await preferencesValue
-        defaultSavePath = preferences.map(resourcePushDefaultSavePath) ?? ""
+        defaultSavePath = preferences.map { downloaderDefaultSavePath(from: $0) } ?? ""
 
         if !sites.isEmpty {
             let rawSite = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4936,19 +4916,6 @@ struct ResourcePushSheet: View {
                     cookie = site.cookie
                 }
             }
-        }
-    }
-
-    @MainActor private func optionalValue(
-        _ path: String,
-        label: String,
-        timeoutInterval: TimeInterval? = nil
-    ) async -> Any? {
-        do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
-        catch {
-            guard !Task.isCancelled, !isRequestCancellation(error) else { return nil }
-            recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
-            return nil
         }
     }
 
@@ -5010,23 +4977,6 @@ struct ResourcePushSheet: View {
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             .prefix(200)
             .map { ResourcePushCategory(name: $0, savePath: "") }
-    }
-
-    private func resourcePushDefaultSavePath(_ raw: Any) -> String {
-        guard let dictionary = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return "" }
-        for key in ["save_path", "savePath", "download-dir", "download_dir", "downloadDir"] {
-            if let value = dictionary[key] as? String {
-                let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty { return path }
-            }
-        }
-        for key in ["preferences", "prefs", "data"] {
-            if let nested = dictionary[key] {
-                let path = resourcePushDefaultSavePath(nested)
-                if !path.isEmpty { return path }
-            }
-        }
-        return ""
     }
 
     private func push() async {

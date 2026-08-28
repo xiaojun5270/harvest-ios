@@ -1,7 +1,36 @@
 import Foundation
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
+
+@MainActor
+func optionalAddTorrentAPIValue(
+    _ appState: AppState,
+    path: String,
+    label: String,
+    timeoutInterval: TimeInterval? = nil
+) async -> Any? {
+    do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
+    catch {
+        guard !Task.isCancelled, !isRequestCancellation(error) else { return nil }
+        recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
+        return nil
+    }
+}
+
+func downloaderDefaultSavePath(from raw: Any) -> String {
+    guard let dictionary = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return "" }
+    for key in ["save_path", "savePath", "download-dir", "download_dir", "downloadDir"] {
+        guard let value = dictionary[key] as? String else { continue }
+        let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty { return path }
+    }
+    for key in ["preferences", "prefs", "data"] {
+        guard let nested = dictionary[key] else { continue }
+        let path = downloaderDefaultSavePath(from: nested)
+        if !path.isEmpty { return path }
+    }
+    return ""
+}
 
 struct DownloaderItem: Identifiable {
     let id: Int
@@ -4267,37 +4296,26 @@ struct AddTorrentSheet: View {
         suggestedPaths = []
         category = ""
         savePath = ""
-        async let categoriesValue = optionalAddTorrentValue(
-            APIPath.downloaderCategories + "\(requestedDownloaderID)",
+        async let categoriesValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.downloaderCategories + "\(requestedDownloaderID)",
             label: "下载器分类"
         )
-        async let preferencesValue = optionalAddTorrentValue(
-            APIPath.downloaderPreferences + "\(requestedDownloaderID)",
+        async let preferencesValue = optionalAddTorrentAPIValue(
+            appState,
+            path: APIPath.downloaderPreferences + "\(requestedDownloaderID)",
             label: "下载器默认目录",
             timeoutInterval: 8
         )
-        async let pathsValue = optionalAddTorrentValue(APIPath.downloaderPaths, label: "常用路径")
+        async let pathsValue = optionalAddTorrentAPIValue(appState, path: APIPath.downloaderPaths, label: "常用路径")
         let values = await (categoriesValue, preferencesValue, pathsValue)
         guard !Task.isCancelled, downloaderID == requestedDownloaderID else { return }
         availableCategories = values.0.map(normalizedAddTorrentCategories) ?? []
-        defaultSavePath = values.1.map(addTorrentDefaultSavePath) ?? ""
+        defaultSavePath = values.1.map { downloaderDefaultSavePath(from: $0) } ?? ""
         suggestedPaths = values.2.map(jsonPathStrings) ?? []
         if !category.isEmpty,
            !availableCategories.contains(where: { $0.name.caseInsensitiveCompare(category) == .orderedSame }) {
             category = ""
-        }
-    }
-
-    @MainActor private func optionalAddTorrentValue(
-        _ path: String,
-        label: String,
-        timeoutInterval: TimeInterval? = nil
-    ) async -> Any? {
-        do { return try await appState.api(path, timeoutInterval: timeoutInterval) }
-        catch {
-            guard !Task.isCancelled, !isRequestCancellation(error) else { return nil }
-            recordAppLog(.warning, "添加种子时读取\(label)失败：\(error.localizedDescription)")
-            return nil
         }
     }
 
@@ -4344,23 +4362,6 @@ struct AddTorrentSheet: View {
         return String(name.prefix(128))
     }
 
-    private func addTorrentDefaultSavePath(_ raw: Any) -> String {
-        guard let dictionary = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return "" }
-        for key in ["save_path", "savePath", "download-dir", "download_dir", "downloadDir"] {
-            if let value = dictionary[key] as? String {
-                let path = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !path.isEmpty { return path }
-            }
-        }
-        for key in ["preferences", "prefs", "data"] {
-            if let nested = dictionary[key] {
-                let path = addTorrentDefaultSavePath(nested)
-                if !path.isEmpty { return path }
-            }
-        }
-        return ""
-    }
-
     private var isQBittorrent: Bool {
         guard let selectedDownloader else { return false }
         let value = selectedDownloader.category.lowercased()
@@ -4368,22 +4369,11 @@ struct AddTorrentSheet: View {
     }
 
     private var mustGenerateTorrentURL: Bool {
-        if isMTeamSiteIdentifier(siteIdentifier) { return true }
-        let raw = siteIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let site = sites.first(where: {
-            String($0.id) == raw
-                || $0.siteKey.caseInsensitiveCompare(raw) == .orderedSame
-                || $0.name.caseInsensitiveCompare(raw) == .orderedSame
-        }) else { return false }
-        return isMTeamSiteIdentifier(site.siteKey) || isMTeamSiteIdentifier(site.name)
+        siteRequiresGeneratedTorrentURL(siteIdentifier, sites: sites)
     }
 
     private var effectiveGenerateTorrentURL: Bool {
         generateTorrentURL || mustGenerateTorrentURL
-    }
-
-    private func isMTeamSiteIdentifier(_ value: String) -> Bool {
-        value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
     }
 
     @MainActor private func push() async {

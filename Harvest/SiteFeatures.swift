@@ -183,6 +183,27 @@ struct SiteItem: Identifiable, @unchecked Sendable {
     }
 }
 
+func siteRequiresGeneratedTorrentURL(_ identifier: String, sites: [SiteItem]) -> Bool {
+    func isMTeam(_ value: String) -> Bool {
+        value.lowercased().filter { $0.isLetter || $0.isNumber } == "mteam"
+    }
+
+    if isMTeam(identifier) { return true }
+    let normalized = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let site = sites.first(where: {
+        String($0.id) == normalized
+            || $0.siteKey.caseInsensitiveCompare(normalized) == .orderedSame
+            || $0.name.caseInsensitiveCompare(normalized) == .orderedSame
+    }) else { return false }
+    return isMTeam(site.siteKey) || isMTeam(site.name)
+}
+
+private func siteSignHistoryText(_ row: [String: Any]) -> String {
+    let text = row.string("info", "message", "content") ?? prettyJSON(row)
+    guard let range = text.range(of: "签到返回信息：") else { return text }
+    return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private struct SiteFastSnapshotWriteRequest: @unchecked Sendable {
     let rows: [[String: Any]]
     let server: String
@@ -807,7 +828,7 @@ final class SitesViewModel: ObservableObject {
                 canonical = code
             }
         }
-        return siteLevelColor(level: canonical, levelID: levelID)
+        return siteLevelColor(level: canonical)
     }
 
     func standardLevelCodes() -> [Int: String] {
@@ -913,7 +934,7 @@ final class SitesViewModel: ObservableObject {
                     rebuildFilteredSites()
                     isLoading = false
                     Self.writeFastSnapshot(
-                        rows.map(SiteItem.init).map { self.siteFastSnapshotRow($0) },
+                        rows.map(SiteItem.init).map { Self.siteFastSnapshotRow($0) },
                         for: appState.baseURL,
                         cachedAt: cachedSites.cachedAt
                     )
@@ -1097,7 +1118,7 @@ final class SitesViewModel: ObservableObject {
                     isLoading = false
                 }
                 Self.writeFastSnapshot(
-                    loadedSites.map { self.siteFastSnapshotRow($0) },
+                    loadedSites.map { Self.siteFastSnapshotRow($0) },
                     for: appState.baseURL,
                     cachedAt: Date()
                 )
@@ -1123,7 +1144,7 @@ final class SitesViewModel: ObservableObject {
                     }
                     refreshLog("站点缓存已安排后台写入")
                 } else {
-                    let siteCacheRows = loadedSites.map { self.sitePersistentCacheRow($0) }
+                    let siteCacheRows = loadedSites.map { Self.sitePersistentCacheRow($0) }
                     await appState.writeSessionCache(siteCacheRows, name: cacheKey)
                 }
                 guard refreshIsCurrent() else {
@@ -1421,10 +1442,6 @@ final class SitesViewModel: ObservableObject {
         return row
     }
 
-    private func sitePersistentCacheRow(_ site: SiteItem) -> [String: Any] {
-        Self.sitePersistentCacheRow(site)
-    }
-
     func config(for site: SiteItem) -> [String: Any]? {
         siteConfigs[site.siteKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()]
     }
@@ -1478,10 +1495,6 @@ final class SitesViewModel: ObservableObject {
         ]
         if site.signed { row["sign_info"] = [isoDayKey(): ["signed": true]] }
         return row
-    }
-
-    private func siteFastSnapshotRow(_ site: SiteItem) -> [String: Any] {
-        Self.siteFastSnapshotRow(site)
     }
 
     private static func indexedConfigs(_ configs: [[String: Any]]) -> [String: [String: Any]] {
@@ -3491,8 +3504,7 @@ private func safeFileName(_ value: String) -> String {
 /// Colors are keyed by the canonical `level` code, not the localized display
 /// name or the numeric level id. A site may use a custom display name while
 /// still exposing one of these stable codes in its config.
-private func siteLevelColor(level: String, levelID: Int? = nil) -> Color {
-    _ = levelID
+private func siteLevelColor(level: String) -> Color {
     let key = level.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     switch key {
     case "staffleader": return Color(red: 139 / 255, green: 0, blue: 0)
@@ -5101,7 +5113,7 @@ private struct SiteLevelProgressView: View {
             return color(for: currentLevel)
         }
         let fallbackCode = reportedLevelID.flatMap { standardLevelCodes[$0] } ?? site.level
-        return siteLevelColor(level: fallbackCode, levelID: reportedLevelID)
+        return siteLevelColor(level: fallbackCode)
     }
     private var nextLevel: SiteLevelRequirement? {
         if let levelID = reportedLevelID ?? currentLevel?.levelID, levelID > 0 {
@@ -5407,8 +5419,12 @@ private struct SiteSignInDetailView: View {
                 informationRow("昵称", value: privacyMaskedText(current.name, enabled: appState.privacyMode))
                 informationRow("排序 ID", value: "\(current.sortID)")
                 if !current.siteType.isEmpty { informationRow("站点类型", value: current.siteType) }
-                if !current.username.isEmpty { informationRow("用户名", value: privateText(current.username)) }
-                if !current.email.isEmpty { informationRow("邮箱", value: privateText(current.email)) }
+                if !current.username.isEmpty {
+                    informationRow("用户名", value: privacyMaskedText(current.username, enabled: appState.privacyMode))
+                }
+                if !current.email.isEmpty {
+                    informationRow("邮箱", value: privacyMaskedText(current.email, enabled: appState.privacyMode))
+                }
                 if !current.userID.isEmpty { informationRow("用户 ID", value: current.userID) }
                 informationRow("注册时间", value: registeredDetail)
                 if !current.latestActive.isEmpty { informationRow("最后活动", value: current.latestActive) }
@@ -5475,7 +5491,7 @@ private struct SiteSignInDetailView: View {
                                         .foregroundStyle(.tertiary)
                                 }
                             }
-                            Text(signHistoryText(row))
+                            Text(siteSignHistoryText(row))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .textSelection(.enabled)
@@ -5510,7 +5526,7 @@ private struct SiteSignInDetailView: View {
     private var accountSubtitle: String {
         let values = [current.username, current.email]
             .filter { !$0.isEmpty }
-            .map { privateText($0) }
+            .map { privacyMaskedText($0, enabled: appState.privacyMode) }
         let fallback = current.siteKey.isEmpty
             ? "站点账号"
             : privacyMaskedText(current.siteKey, enabled: appState.privacyMode)
@@ -5548,7 +5564,7 @@ private struct SiteSignInDetailView: View {
         guard let row = current.signHistory.first else {
             return current.signed ? "签到已完成，暂无返回详情" : "暂无今日签到记录"
         }
-        return signHistoryText(row)
+        return siteSignHistoryText(row)
     }
 
     private func sectionTitle(_ title: String, icon: String) -> some View {
@@ -5583,18 +5599,6 @@ private struct SiteSignInDetailView: View {
             .padding(.vertical, 10)
             if drawsDivider { Divider() }
         }
-    }
-
-    private func signHistoryText(_ row: [String: Any]) -> String {
-        let text = row.string("info", "message", "content") ?? prettyJSON(row)
-        if let range = text.range(of: "签到返回信息：") {
-            return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return text
-    }
-
-    private func privateText(_ value: String) -> String {
-        privacyMaskedText(value, enabled: appState.privacyMode)
     }
 
     @MainActor private func loadDetail() async {
@@ -5806,7 +5810,7 @@ struct SiteDetailView: View {
                         ForEach(Array(current.signHistory.enumerated()), id: \.offset) { _, row in
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(row.string("date") ?? "未知日期").font(.subheadline.weight(.semibold))
-                                Text(signHistoryText(row)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                Text(siteSignHistoryText(row)).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                                 if let time = row.string("updated_at"), !time.isEmpty {
                                     Text(time).font(.caption2).foregroundStyle(.tertiary)
                                 }
@@ -5898,17 +5902,12 @@ struct SiteDetailView: View {
     }
 
     @ViewBuilder private func detailValue(_ label: String, value: String, privateValue: Bool = false) -> some View {
-        if !value.isEmpty { LabeledContent(label, value: privateValue ? privateText(value) : value) }
-    }
-
-    private func privateText(_ value: String) -> String {
-        privacyMaskedText(value, enabled: appState.privacyMode)
-    }
-
-    private func signHistoryText(_ row: [String: Any]) -> String {
-        let text = row.string("info", "message", "content") ?? prettyJSON(row)
-        if let range = text.range(of: "签到返回信息：") { return String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines) }
-        return text
+        if !value.isEmpty {
+            LabeledContent(
+                label,
+                value: privateValue ? privacyMaskedText(value, enabled: appState.privacyMode) : value
+            )
+        }
     }
 
     private func resolvedPageURL(_ path: String) -> String {
@@ -6068,7 +6067,6 @@ private struct BrowserBonusItem: Identifiable {
     let action: String
     let method: String
     let hiddenInputs: [String: String]
-    let disabled: Bool
     var id: String { method + "#" + action + "#" + option }
 }
 
@@ -6081,7 +6079,8 @@ private struct BrowserBonusPage: Identifiable {
 @MainActor
 private final class BrowserBonusExchangeState: ObservableObject {
     @Published private(set) var isRunning = false
-    @Published private(set) var isCancelled = false
+    private(set) var isCancelled = false
+    @Published private(set) var itemName = ""
     @Published private(set) var completed = 0
     @Published private(set) var total = 0
     @Published private(set) var remaining = 0.0
@@ -6090,10 +6089,11 @@ private final class BrowserBonusExchangeState: ObservableObject {
 
     var progress: Double { total > 0 ? Double(completed) / Double(total) : 0 }
 
-    func begin(quantity: Int, balance: Double) {
+    func begin(itemName: String, quantity: Int, balance: Double) {
         isRunning = true
         isCancelled = false
         isPaused = false
+        self.itemName = itemName
         completed = 0
         total = max(0, quantity)
         remaining = max(0, balance)
@@ -6407,80 +6407,150 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
         const match = clean(value).replace(/,/g, '').match(/[0-9]+(?:\\.[0-9]+)?/);
         return match ? Number(match[0]) : 0;
       };
-      let balance = 0;
+      const numericCapture = (match) => match ? number(match.slice(1).find((value) => /[0-9]/.test(value || '')) || '') : 0;
+      let currentBonus = 0;
       if (bonusRule) {
         try {
           const result = document.evaluate(bonusRule, document, null, XPathResult.STRING_TYPE, null);
-          balance = number(result.stringValue);
+          currentBonus = number(result.stringValue);
         } catch (_) {
           try {
             const result = document.evaluate(bonusRule, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-            balance = number(result.singleNodeValue?.textContent);
+            currentBonus = number(result.singleNodeValue?.textContent);
           } catch (_) {}
         }
       }
-      const bodyText = clean(document.body?.innerText);
-      if (!balance) {
-        const match = bodyText.match(/(?:魔力|bonus|karma|积分|爆米花|幸运星|猫粮|啤酒瓶|电力值|电力|余额)[：:\\s]*([0-9,.]+)/i)
-          || bodyText.match(/([0-9,.]+)\\s*(?:魔力|bonus|karma|积分|爆米花|幸运星|猫粮|啤酒瓶|电力值|电力)/i);
-        if (match) balance = number(match[1]);
+      const bodyText = document.body ? document.body.innerText : '';
+      const balanceNode = document.querySelector('#self_bonus, .bonus-shop__balance-value, [class*="balance-value"], [class*="balance"] [class*="value"]');
+      if (currentBonus <= 0 && balanceNode) currentBonus = number(balanceNode.innerText || balanceNode.textContent);
+      if (currentBonus <= 0) {
+        const match = bodyText.match(/([\\d,]+\\.?\\d*)\\s*(魔力|bonus|karma|积分|爆米花|幸运星|猫粮|啤酒瓶|电力值|电力)/i)
+          || bodyText.match(/(魔力|bonus|karma|积分|爆米花|幸运星|猫粮|啤酒瓶|电力值|电力)[：:\\s]*([\\d,]+\\.?\\d*)/i)
+          || bodyText.match(/(当前|可用|余额|Your)[：:\\s]*([\\d,]+\\.?\\d*)/i);
+        currentBonus = numericCapture(match);
       }
+      if (currentBonus <= 0) {
+        const values = bodyText.match(/[\\d,]+\\.\\d+/g) || [];
+        for (const raw of values) {
+          const value = number(raw);
+          if (value > 0 && value < 10000000) { currentBonus = value; break; }
+        }
+      }
+
       const seen = new Set();
       const items = [];
-      const exchangeWords = ['exchange', '兑换', '购买', 'buy', '交换'];
-      const forms = Array.from(document.querySelectorAll('form'));
-      for (const form of forms) {
-        const optionInput = form.querySelector('input[name="option"]');
-        let option = optionInput?.value || '';
-        const container = form.closest('tr, [class*="bonus"], [class*="exchange"], article, li') || form;
-        const submit = form.querySelector('button[type="submit"], input[type="submit"]');
-        const text = clean(container.innerText || container.textContent);
-        const actionText = clean(form.getAttribute('action')).toLowerCase();
-        const submitText = clean(submit?.value || submit?.innerText).toLowerCase();
-        const hasConfiguredAction = Boolean(configuredAction.action || configuredAction.url);
-        const isExchangeForm = actionText.includes('exchange') || actionText.includes('buy') || actionText.includes('bonus')
-          || exchangeWords.some((word) => submitText.includes(word)) || (Boolean(option) && hasConfiguredAction);
-        if (!option && isExchangeForm) {
-          const rowID = clean(container.querySelector('td')?.innerText || '');
-          if (/^\\d+$/.test(rowID)) option = rowID;
+      const buttonWords = ['exchange', '兑换', '购买', 'buy', '赠送', '捐赠', '慈善捐赠', '交换'];
+      const hasConfiguredAction = Object.keys(configuredAction).length > 0;
+      const isExchangeForm = (form) => {
+        const action = clean(form.getAttribute('action')).toLowerCase();
+        const method = clean(form.getAttribute('method')).toLowerCase();
+        if (method && method !== 'post' && !hasConfiguredAction) return false;
+        if (action.includes('exchange') || action.includes('buy') || action.includes('bonus')) return true;
+        const submit = form.querySelector('input[type="submit"], button[type="submit"]');
+        const title = clean(submit?.value || submit?.innerText || submit?.textContent).toLowerCase();
+        if (buttonWords.some((word) => title.includes(word))) return true;
+        return Boolean(form.querySelector('input[name="option"]')) && hasConfiguredAction;
+      };
+      const findOptionInRow = (row) => {
+        const input = row?.querySelector('input[name="option"]');
+        if (input && input.value !== '') return input.value;
+        const firstCell = row?.querySelector('td');
+        const value = clean(firstCell?.innerText || firstCell?.textContent);
+        return /^\\d+$/.test(value) ? value : '';
+      };
+      const extractName = (container) => {
+        for (const selector of ['h1, h2, h3', '.font-bold, [class*="title"], [class*="name"]', 'dt', 'b, strong']) {
+          const node = container?.querySelector(selector);
+          const value = clean(node?.innerText || node?.textContent);
+          if (value.length > 1 && value.length <= 80 && !value.includes('注意')) return value;
         }
-        if (!option || seen.has(option) || !isExchangeForm) continue;
-        if (!text) continue;
-        const titleNode = container.querySelector('h1, h2, h3, [class*="title"], [class*="name"], td');
-        let name = clean(titleNode?.innerText || titleNode?.textContent || text.split(/\\s{2,}|\\n/)[0]);
-        if (name.length > 80) name = name.slice(0, 80);
-        let cost = 0;
-        for (const node of Array.from(container.querySelectorAll('[class*="price"], [class*="cost"], [class*="points"], .red, strong'))) {
+        return '';
+      };
+      const extractCost = (container) => {
+        const pointNode = container?.querySelector('.mybonus-exchange-card__points span, .mybonus-exchange-card__points strong');
+        const direct = number(pointNode?.innerText || pointNode?.textContent);
+        if (direct > 0) return direct;
+        for (const node of Array.from(container?.querySelectorAll('span.red, span[class*="price"], span[class*="cost"], span.bonus-card__price, .break-all, [class*="points"]') || [])) {
           const value = number(node.innerText || node.textContent);
-          if (value > 0) { cost = value; break; }
+          if (value > 0 && value < 100000000) return value;
         }
-        if (!cost) {
-          const match = text.match(/([0-9,.]+)\\s*(?:Points?|魔力|bonus|karma|积分|爆米花|幸运星|猫粮|啤酒瓶|电力值|电力)/i);
-          if (match) cost = number(match[1]);
+        let lastCellValue = 0;
+        const cells = Array.from(container?.querySelectorAll('td') || []);
+        for (let index = 1; index < cells.length; index += 1) {
+          const cell = cells[index];
+          if (cell.querySelector('input[name="option"]')) continue;
+          const text = clean(cell.innerText || cell.textContent);
+          const value = number(text);
+          if (value > 0 && value < 100000000) {
+            lastCellValue = value;
+            if (/^[\\d,.\\s]+$/.test(text) && /[\\d]/.test(text) && !/[a-zA-Z\\u4e00-\\u9fff]/.test(text)) return value;
+          }
         }
-        if (!cost) {
-          const values = (text.match(/[0-9][0-9,.]*/g) || []).map(number).filter((value) => value >= 10 && value !== Number(option));
-          if (values.length) cost = values.at(-1);
+        if (lastCellValue > 0) return lastCellValue;
+        const text = clean(container?.innerText || container?.textContent);
+        const match = text.match(/([\\d,]+\\.?\\d*)\\s*(Points?|魔力|bonus|karma|爆米花|积分|憨豆|啤酒瓶|电力值|电力)/i)
+          || text.match(/(魔力|bonus|karma|积分|爆米花|憨豆|啤酒瓶|电力值|电力)[：:\\s]*([\\d,]+\\.?\\d*)/i);
+        const labelled = numericCapture(match);
+        if (labelled > 0) return labelled;
+        const values = text.match(/\\d[\\d,]+/g) || [];
+        for (const raw of values) {
+          const value = number(raw);
+          if (value >= 25 && value < 100000000) return value;
         }
-        if (!cost) continue;
+        return 0;
+      };
+      const extractItem = (form, option, container) => {
+        if (!option || seen.has(option)) return;
+        const context = container || form;
+        const submit = form.querySelector('input[type="submit"], button[type="submit"]')
+          || context.querySelector('input[type="submit"], button[type="submit"]');
+        const name = extractName(context) || `Option ${option}`;
+        const lowerName = name.toLowerCase();
+        if (['赠送', '慈善', '消除', '头衔', '免费', '置顶'].some((word) => name.includes(word)) || lowerName.includes('h&r')) return;
+        const cost = extractCost(context);
+        if (cost <= 0) return;
         const hiddenInputs = {};
         for (const input of Array.from(form.querySelectorAll('input[type="hidden"]'))) {
           if (input.name) hiddenInputs[input.name] = input.value || '';
         }
-        if (!hiddenInputs.option) hiddenInputs.option = option;
+        if (!hiddenInputs.option) hiddenInputs.option = String(option);
         for (const [key, value] of Object.entries(configuredAction || {})) {
           if (!(key in hiddenInputs) && !['action', 'url', 'method'].includes(key)) hiddenInputs[key] = String(value);
         }
         seen.add(option);
         items.push({
-          name: name || `Option ${option}`,
+          name,
           cost, option,
           action: form.getAttribute('action') || configuredAction.action || configuredAction.url || window.location.href,
           method: form.getAttribute('method') || configuredAction.method || 'POST',
-          hiddenInputs, disabled: Boolean(submit?.disabled)
+          hiddenInputs,
+          disabled: Boolean(submit?.disabled)
         });
+      };
+
+      for (const form of Array.from(document.querySelectorAll('form.mybonus-exchange-card, form[class*="mybonus-exchange-card"], form.bonus-card'))) {
+        const option = form.querySelector('input[name="option"]')?.value || '';
+        extractItem(form, option, form);
       }
-      return JSON.stringify({ balance, items });
+      for (const form of Array.from(document.querySelectorAll('form'))) {
+        if (!isExchangeForm(form) || form.closest('tr')) continue;
+        const option = form.querySelector('input[name="option"]')?.value || '';
+        extractItem(form, option, form);
+      }
+      const rows = Array.from(document.querySelectorAll('tr'));
+      for (const row of rows) {
+        const form = row.querySelector('form');
+        if (!form || !isExchangeForm(form)) continue;
+        extractItem(form, findOptionInRow(row), row);
+      }
+      if (items.length === 0) {
+        for (const row of rows) {
+          const form = row.querySelector('form');
+          if (!form) continue;
+          extractItem(form, findOptionInRow(row), row);
+        }
+      }
+      return JSON.stringify({ balance: currentBonus, items });
     })();
     """
 }
@@ -6488,22 +6558,23 @@ private func browserBonusExtractionScript(config: [String: Any]) -> String {
 private func parsedBrowserBonusPage(_ raw: Any?) -> BrowserBonusPage? {
     guard let parsed = parsedBrowserJavaScriptValue(raw), let dictionary = jsonDictionary(parsed) else { return nil }
     let items = dictionary.rows("items").compactMap { row -> BrowserBonusItem? in
-        guard let option = row.string("option", "optionValue"), !option.isEmpty else { return nil }
-        let hidden = (row.dict("hiddenInputs", "hidden_inputs") ?? [:]).reduce(into: [String: String]()) { result, entry in
+        guard row.bool("disabled") != true,
+              let option = row.string("option"),
+              !option.isEmpty else { return nil }
+        let hidden = (row.dict("hiddenInputs") ?? [:]).reduce(into: [String: String]()) { result, entry in
             result[entry.key] = String(describing: entry.value)
         }
         return BrowserBonusItem(
             name: row.string("name") ?? "兑换项目",
             cost: row.double("cost") ?? 0,
             option: option,
-            action: row.string("action", "formAction") ?? "",
+            action: row.string("action") ?? "",
             method: row.string("method") ?? "POST",
-            hiddenInputs: hidden,
-            disabled: row.bool("disabled") ?? false
+            hiddenInputs: hidden
         )
-    }.filter { $0.cost > 0 && !$0.disabled }
+    }.filter { $0.cost > 0 }
     guard !items.isEmpty else { return nil }
-    return BrowserBonusPage(balance: dictionary.double("balance", "currentBonus") ?? 0, items: items)
+    return BrowserBonusPage(balance: dictionary.double("balance") ?? 0, items: items)
 }
 
 private func browserBonusSubmitScript(_ item: BrowserBonusItem) -> String {
@@ -6517,7 +6588,7 @@ private func browserBonusSubmitScript(_ item: BrowserBonusItem) -> String {
         const inputs = \(browserJavaScriptLiteral(inputs));
         const optionValue = String(inputs.option || '');
         const matchingInputs = (form) => Object.entries(inputs).every(([key, value]) => {
-          const input = form.querySelector(`[name="${CSS.escape(key)}"]`);
+          const input = Array.from(form.querySelectorAll('[name]')).find((node) => node.getAttribute('name') === key);
           return input && String(input.value ?? '') === String(value ?? '');
         });
         const submitFrom = (context, mechanism) => {
@@ -6546,6 +6617,12 @@ private func browserBonusSubmitScript(_ item: BrowserBonusItem) -> String {
           if (!option || String(option.value) !== optionValue) continue;
           const mechanism = submitFrom(form, 'form_option');
           if (mechanism) return JSON.stringify({ ok: true, mechanism });
+        }
+        for (const container of Array.from(document.querySelectorAll('tr, [class*="mybonus-exchange-card"], [class*="bonus-card"], [class*="exchange"]'))) {
+          if (matchingInputs(container)) {
+            const mechanism = submitFrom(container, 'container_exact');
+            if (mechanism) return JSON.stringify({ ok: true, mechanism });
+          }
         }
         for (const container of Array.from(document.querySelectorAll('tr, [class*="mybonus-exchange-card"], [class*="bonus-card"], [class*="exchange"]'))) {
           const option = container.querySelector('input[name="option"]');
@@ -6679,6 +6756,32 @@ struct SiteBrowserScreen: View {
         }
         .overlay {
             GeometryReader { proxy in
+                if bonusExchangeState.isRunning {
+                    BrowserBonusProgressOverlay(exchangeState: bonusExchangeState)
+                        .position(
+                            x: max(112, proxy.size.width - 116),
+                            y: max(112, proxy.size.height / 2)
+                        )
+                        .zIndex(3)
+                } else if showsBonusAction {
+                    Button {
+                        Task { await extractBonusPage() }
+                    } label: {
+                        Image(systemName: "diamond.fill")
+                            .font(.system(size: 21, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 48, height: 48)
+                            .background(HarvestTheme.amber, in: Circle())
+                            .shadow(color: HarvestTheme.amber.opacity(0.40), radius: 8, y: 3)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("魔力值兑换")
+                    .position(
+                        x: max(32, proxy.size.width - 40),
+                        y: max(56, proxy.size.height / 2)
+                    )
+                    .zIndex(2)
+                }
                 if hasTorrentListRules {
                     Button {
                         Task { await extractTorrentList() }
@@ -6801,6 +6904,7 @@ struct SiteBrowserScreen: View {
                         Button { Task { await extractBonusPage() } } label: {
                             Label("魔力值兑换", systemImage: "wand.and.stars")
                         }
+                        .disabled(isWorking || bonusExchangeState.isRunning)
                     }
                     Button { Task { await clearBrowserData() } } label: {
                         Label("清理当前站点数据", systemImage: "trash")
@@ -6816,6 +6920,7 @@ struct SiteBrowserScreen: View {
                 }
                 .accessibilityLabel("网页工具")
                 Button { session.reload() } label: { Image(systemName: "arrow.clockwise") }
+                    .disabled(bonusExchangeState.isRunning)
                     .accessibilityLabel("刷新网页")
             }
         }
@@ -6869,8 +6974,11 @@ struct SiteBrowserScreen: View {
             ) { await saveProfile() }
         }
         .sheet(item: $bonusPage) { page in
-            BrowserBonusSheet(page: page, exchangeState: bonusExchangeState) { item, quantity, delay in
-                await exchangeBonus(item: item, quantity: quantity, delaySeconds: delay, balance: page.balance)
+            BrowserBonusSheet(page: page) { item, quantity, delay in
+                bonusPage = nil
+                Task {
+                    await exchangeBonus(item: item, quantity: quantity, delaySeconds: delay, balance: page.balance)
+                }
             }
         }
         .sheet(isPresented: $showScreenshotShare) {
@@ -7159,6 +7267,69 @@ struct SiteBrowserScreen: View {
             || siteConfig["buy_action"] != nil
     }
 
+    private var showsBonusAction: Bool {
+        guard !bonusExchangeState.isRunning,
+              !isWorking,
+              session.loadError == nil,
+              !session.isLoading || session.loadProgress >= 0.5 else { return false }
+        return currentPageIsBonusPage
+    }
+
+    private var currentPageIsBonusPage: Bool {
+        guard hasBonusRules,
+              let currentURL = session.currentURL ?? URL(string: urlString) else { return false }
+        if currentURL.path.lowercased().hasSuffix("/bonusshop.php") { return true }
+        return ["page_mybonus", "buy_page"].contains { key in
+            guard let rule = nonEmptyConfigString(siteConfig[key]) else { return false }
+            return browserPage(currentURL, matches: rule)
+        }
+    }
+
+    private func browserPage(_ currentURL: URL, matches rawRule: String) -> Bool {
+        let rule = rawRule.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rule.isEmpty,
+              var origin = URLComponents(url: currentURL, resolvingAgainstBaseURL: false) else { return false }
+        origin.path = "/"
+        origin.query = nil
+        origin.fragment = nil
+        guard let originURL = origin.url else { return false }
+
+        let marker = "__HARVEST_PAGE_MARKER__"
+        let targetValue = rule.replacingOccurrences(of: "{}", with: marker)
+        guard let target = URL(string: targetValue, relativeTo: originURL)?.absoluteURL else { return false }
+        let normalizedCurrentPath = normalizedBrowserPagePath(currentURL.path)
+        let normalizedTargetPath = normalizedBrowserPagePath(target.path)
+
+        if rule.contains("{}") {
+            let targetComponents = URLComponents(url: target, resolvingAgainstBaseURL: false)
+            let currentComponents = URLComponents(url: currentURL, resolvingAgainstBaseURL: false)
+            if let placeholder = targetComponents?.queryItems?.first(where: { $0.value == marker }) {
+                guard currentURL.scheme?.lowercased() == target.scheme?.lowercased(),
+                      currentURL.host?.lowercased() == target.host?.lowercased(),
+                      currentURL.port == target.port,
+                      normalizedCurrentPath == normalizedTargetPath else { return false }
+                return currentComponents?.queryItems?.contains(where: {
+                    $0.name == placeholder.name && !($0.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }) == true
+            }
+            let pieces = target.absoluteString.components(separatedBy: marker)
+            guard pieces.count == 2 else { return false }
+            return currentURL.absoluteString.hasPrefix(pieces[0])
+                && currentURL.absoluteString.dropFirst(pieces[0].count).contains(pieces[1])
+        }
+
+        return !normalizedTargetPath.isEmpty
+            && (normalizedCurrentPath == normalizedTargetPath
+                || normalizedCurrentPath.hasPrefix(normalizedTargetPath + "/"))
+    }
+
+    private func normalizedBrowserPagePath(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "/" }
+        if trimmed.count > 1, trimmed.hasSuffix("/") { return String(trimmed.dropLast()) }
+        return trimmed
+    }
+
     private var effectiveSiteID: Int { site.id > 0 ? site.id : createdSiteID ?? 0 }
 
     private func browserConfigHasInterfaces(_ config: [String: Any]) -> Bool {
@@ -7412,13 +7583,14 @@ struct SiteBrowserScreen: View {
         quantity: Int,
         delaySeconds: Int,
         balance: Double
-    ) async -> Bool {
-        guard quantity > 0 else { return false }
+    ) async {
+        guard quantity > 0 else { return }
         isWorking = true
-        bonusExchangeState.begin(quantity: quantity, balance: balance)
+        bonusExchangeState.begin(itemName: item.name, quantity: quantity, balance: balance)
         defer {
             isWorking = false
             bonusExchangeState.finish()
+            session.reload()
         }
         do {
             for index in 0..<quantity {
@@ -7435,19 +7607,24 @@ struct SiteBrowserScreen: View {
                 }
                 bonusExchangeState.recordCompletion(cost: item.cost)
                 if bonusExchangeState.remaining < item.cost { break }
+                try await Task.sleep(for: .seconds(1))
+                try await bonusExchangeState.waitUntilResumed()
                 if index < quantity - 1 {
                     try await bonusExchangeState.waitBetweenSubmissions(seconds: min(120, max(12, delaySeconds)))
                 }
             }
-            session.reload()
-            return !bonusExchangeState.isCancelled && bonusExchangeState.completed == quantity
+            guard !bonusExchangeState.isCancelled else { return }
+            if bonusExchangeState.completed == quantity {
+                appState.presentManualTaskResult("已完成 \(quantity) 次魔力值兑换")
+                return
+            }
+            if bonusExchangeState.remaining < item.cost {
+                appState.presentManualTaskResult("魔力值不足，已完成 \(bonusExchangeState.completed) 次兑换")
+            }
         } catch is CancellationError {
-            session.reload()
-            return false
+            return
         } catch {
             appState.presentedError = error.localizedDescription
-            session.reload()
-            return false
         }
     }
 
@@ -7902,25 +8079,96 @@ private struct BrowserProfileSheet: View {
     }
 }
 
+private struct BrowserBonusProgressOverlay: View {
+    @ObservedObject var exchangeState: BrowserBonusExchangeState
+
+    private var currentPosition: Int {
+        guard exchangeState.total > 0 else { return 0 }
+        return min(exchangeState.total, max(1, exchangeState.completed + (exchangeState.completed < exchangeState.total ? 1 : 0)))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: exchangeState.isPaused ? "pause.fill" : "play.fill")
+                    .foregroundStyle(exchangeState.isPaused ? HarvestTheme.coral : HarvestTheme.green)
+                Text(exchangeState.itemName)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(currentPosition)/\(exchangeState.total)")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(HarvestTheme.green)
+            }
+            ProgressView(value: exchangeState.progress)
+                .tint(HarvestTheme.amber)
+            HStack {
+                Text("剩余魔力 \(formatCompactNumber(exchangeState.remaining))")
+                    .foregroundStyle(HarvestTheme.green)
+                Spacer()
+                if exchangeState.countdown > 0 {
+                    Label("\(exchangeState.countdown)s", systemImage: "clock")
+                        .foregroundStyle(HarvestTheme.amber)
+                }
+            }
+            .font(.caption2.monospacedDigit())
+            HStack(spacing: 7) {
+                Button {
+                    exchangeState.togglePause()
+                } label: {
+                    Label(
+                        exchangeState.isPaused ? "继续" : "暂停",
+                        systemImage: exchangeState.isPaused ? "play.fill" : "pause.fill"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 7)
+                    .background(exchangeState.isPaused ? HarvestTheme.green : HarvestTheme.amber, in: RoundedRectangle(cornerRadius: 7))
+                }
+                Button(role: .destructive) {
+                    exchangeState.stop()
+                } label: {
+                    Label("停止", systemImage: "stop.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(HarvestTheme.coral, in: RoundedRectangle(cornerRadius: 7))
+                }
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(11)
+        .frame(width: 216)
+        .background(Color.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.10))
+        }
+        .shadow(color: Color.black.opacity(0.30), radius: 12, y: 5)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("魔力值兑换进度")
+    }
+}
+
 private struct BrowserBonusSheet: View {
     @Environment(\.dismiss) private var dismiss
     let page: BrowserBonusPage
-    @ObservedObject var exchangeState: BrowserBonusExchangeState
-    let onExchange: (BrowserBonusItem, Int, Int) async -> Bool
+    let onExchange: (BrowserBonusItem, Int, Int) -> Void
     @State private var selectedID: String
     @State private var quantity = 1
     @State private var delaySeconds = 12
-    @State private var isStarting = false
 
     init(
         page: BrowserBonusPage,
-        exchangeState: BrowserBonusExchangeState,
-        onExchange: @escaping (BrowserBonusItem, Int, Int) async -> Bool
+        onExchange: @escaping (BrowserBonusItem, Int, Int) -> Void
     ) {
         self.page = page
-        self.exchangeState = exchangeState
         self.onExchange = onExchange
-        _selectedID = State(initialValue: page.items.first?.id ?? "")
+        let preferred = page.items.first(where: { $0.name.contains("100") && $0.name.contains("上传") })
+        _selectedID = State(initialValue: (preferred ?? page.items.first)?.id ?? "")
     }
 
     private var selectedItem: BrowserBonusItem? {
@@ -7928,7 +8176,12 @@ private struct BrowserBonusSheet: View {
     }
 
     private var maximumQuantity: Int {
-        guard let item = selectedItem, item.cost > 0, page.balance > 0 else { return 0 }
+        guard let item = selectedItem else { return 0 }
+        return maximumQuantity(for: item)
+    }
+
+    private func maximumQuantity(for item: BrowserBonusItem) -> Int {
+        guard item.cost > 0, page.balance > 0 else { return 0 }
         return max(0, clampedInt(page.balance / item.cost))
     }
 
@@ -7939,66 +8192,82 @@ private struct BrowserBonusSheet: View {
                     LabeledContent("当前魔力值", value: formatCompactNumber(page.balance))
                     if let item = selectedItem {
                         LabeledContent("单次消耗", value: formatCompactNumber(item.cost))
+                        LabeledContent("最多可兑换", value: "\(maximumQuantity) 次")
                         LabeledContent("兑换后剩余", value: formatCompactNumber(max(0, page.balance - item.cost * Double(quantity))))
                     }
                 }
-                Section("兑换设置") {
-                    Picker("项目", selection: $selectedID) {
-                        ForEach(page.items) { item in
-                            Text("\(item.name) · \(formatCompactNumber(item.cost))").tag(item.id)
+                Section("兑换项目") {
+                    ForEach(page.items) { item in
+                        Button {
+                            selectedID = item.id
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: item.id == selectedID ? "checkmark.circle.fill" : "circle")
+                                    .foregroundStyle(item.id == selectedID ? HarvestTheme.amber : Color.secondary)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.name)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                    Text("魔力 \(formatCompactNumber(item.cost)) / 次")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(maximumQuantity(for: item) > 0 ? "×\(maximumQuantity(for: item))" : "不足")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(maximumQuantity(for: item) > 0 ? HarvestTheme.green : Color.secondary)
+                            }
                         }
+                        .buttonStyle(.plain)
                     }
-                    Stepper("数量：\(quantity)", value: $quantity, in: 1...max(1, maximumQuantity))
-                    Stepper("提交间隔：\(delaySeconds) 秒", value: $delaySeconds, in: 12...120)
                 }
-                .disabled(exchangeState.isRunning || isStarting)
-
-                if exchangeState.isRunning {
-                    Section("兑换进度") {
-                        ProgressView(value: exchangeState.progress)
-                        LabeledContent("已完成", value: "\(exchangeState.completed) / \(exchangeState.total)")
-                        LabeledContent("剩余魔力", value: formatCompactNumber(exchangeState.remaining))
-                        if exchangeState.countdown > 0 {
-                            LabeledContent("下次提交", value: "\(exchangeState.countdown) 秒")
+                Section("兑换设置") {
+                    HStack(spacing: 8) {
+                        Text("数量")
+                        Spacer()
+                        Button { quantity = max(1, quantity - 1) } label: {
+                            Image(systemName: "minus")
+                                .frame(width: 28, height: 28)
+                                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
                         }
-                        HStack {
-                            Button {
-                                exchangeState.togglePause()
-                            } label: {
-                                Label(exchangeState.isPaused ? "继续" : "暂停", systemImage: exchangeState.isPaused ? "play.fill" : "pause.fill")
-                            }
-                            Spacer()
-                            Button(role: .destructive) {
-                                exchangeState.stop()
-                            } label: {
-                                Label("停止", systemImage: "stop.fill")
-                            }
+                        TextField("数量", value: $quantity, format: .number)
+                            .keyboardType(.numberPad)
+                            .multilineTextAlignment(.center)
+                            .frame(width: 48)
+                            .textFieldStyle(.roundedBorder)
+                        Button { quantity = min(max(1, maximumQuantity), quantity + 1) } label: {
+                            Image(systemName: "plus")
+                                .frame(width: 28, height: 28)
+                                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
                         }
+                        Button("MAX") { quantity = max(1, maximumQuantity) }
+                            .font(.caption.weight(.semibold))
+                            .disabled(maximumQuantity == 0)
                     }
+                    .buttonStyle(.borderless)
+                    Stepper("提交间隔：\(delaySeconds) 秒", value: $delaySeconds, in: 12...120)
                 }
             }
             .navigationTitle("魔力值兑换")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { dismiss() }.disabled(exchangeState.isRunning || isStarting)
+                    Button("取消") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(exchangeState.isRunning || isStarting ? "兑换中" : "兑换") {
+                    Button("兑换") {
                         guard let item = selectedItem else { return }
-                        Task {
-                            isStarting = true
-                            let succeeded = await onExchange(item, quantity, delaySeconds)
-                            isStarting = false
-                            if succeeded || exchangeState.isCancelled { dismiss() }
-                        }
+                        onExchange(item, quantity, delaySeconds)
+                        dismiss()
                     }
-                    .disabled(selectedItem == nil || exchangeState.isRunning || isStarting || maximumQuantity == 0 || quantity > maximumQuantity)
+                    .disabled(selectedItem == nil || maximumQuantity == 0 || quantity > maximumQuantity)
                 }
             }
             .onChange(of: selectedID) { _, _ in quantity = min(quantity, max(1, maximumQuantity)) }
+            .onChange(of: quantity) { _, value in
+                quantity = min(max(1, value), max(1, maximumQuantity))
+            }
         }
-        .interactiveDismissDisabled(exchangeState.isRunning || isStarting)
         .presentationDetents([.large])
     }
 }
