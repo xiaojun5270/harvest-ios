@@ -1,4 +1,27 @@
 (() => {
+  const documentRef = globalThis.document;
+  const labelSidebarTrigger = () => {
+    if (!documentRef) return;
+    const trigger = documentRef.querySelector(".app-sider .ant-layout-sider-zero-width-trigger");
+    if (!trigger) return;
+    trigger.setAttribute("aria-label", "展开侧栏");
+    trigger.setAttribute("title", "展开侧栏");
+    trigger.setAttribute("role", "button");
+  };
+  if (documentRef?.readyState === "loading") {
+    documentRef.addEventListener("DOMContentLoaded", labelSidebarTrigger, { once: true });
+  } else {
+    labelSidebarTrigger();
+  }
+  if (documentRef?.documentElement) {
+    const sidebarObserver = new MutationObserver(labelSidebarTrigger);
+    sidebarObserver.observe(documentRef.documentElement, {
+      childList: true,
+      subtree: true
+    });
+    globalThis.addEventListener("pagehide", () => sidebarObserver.disconnect(), { once: true });
+  }
+
   const api = globalThis.browser || globalThis.chrome;
   const storage = api?.storage;
   if (!storage || storage.session || !storage.local) return;
