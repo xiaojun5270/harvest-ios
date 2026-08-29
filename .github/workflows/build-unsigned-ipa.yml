@@ -60,6 +60,7 @@ jobs:
           test -d "$EXTENSION_PATH"
           test -f "$EXTENSION_PATH/manifest.json"
           test -f "$EXTENSION_PATH/background.js"
+          test -f "$EXTENSION_PATH/assets/safari-operate-compat.css"
           test -f "$EXTENSION_PATH/chunks/safari-compat.js"
           test -f "$EXTENSION_PATH/content-scripts/auth-bridge.js"
           test -f "$EXTENSION_PATH/content-scripts/content.js"
@@ -77,6 +78,7 @@ jobs:
           test -f "$COOKIECLOUD_EXTENSION_PATH/manifest.json"
           test -f "$COOKIECLOUD_EXTENSION_PATH/safari-background.js"
           test -f "$COOKIECLOUD_EXTENSION_PATH/background.js"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/chunks/safari-popup-compat.js"
           test -f "$COOKIECLOUD_EXTENSION_PATH/content-scripts/content.js"
           test -f "$COOKIECLOUD_EXTENSION_PATH/_locales/zh_CN/messages.json"
           if grep -q 'edge.microsoft.com' "$COOKIECLOUD_EXTENSION_PATH/manifest.json"; then
