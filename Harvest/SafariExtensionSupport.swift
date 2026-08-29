@@ -1,15 +1,43 @@
 import SwiftUI
 import UIKit
 
-enum HarvestSafariExtension {
-    static let bundledVersion = "0.2.6"
+private struct BundledSafariExtension: Identifiable {
+    let productName: String
+    let title: String
+    let version: String
+    let icon: String
+    let color: Color
+    let detail: String
 
-    static var isBundled: Bool {
+    var id: String { productName }
+
+    var isBundled: Bool {
         guard let plugInsURL = Bundle.main.builtInPlugInsURL else { return false }
         return FileManager.default.fileExists(
-            atPath: plugInsURL.appendingPathComponent("HarvestSafariExtension.appex").path
+            atPath: plugInsURL.appendingPathComponent("\(productName).appex").path
         )
     }
+}
+
+private enum HarvestSafariExtensions {
+    static let all = [
+        BundledSafariExtension(
+            productName: "HarvestSafariExtension",
+            title: "收割机助手",
+            version: "0.3.6",
+            icon: "safari.fill",
+            color: HarvestTheme.blue,
+            detail: "在支持的 PT 站点中提供同步、搜索和下载器操作"
+        ),
+        BundledSafariExtension(
+            productName: "CookieCloudSafariExtension",
+            title: "CookieCloud",
+            version: "1.0.3",
+            icon: "icloud.fill",
+            color: HarvestTheme.purple,
+            detail: "端到端加密同步 Safari Cookie 与 Local Storage"
+        )
+    ]
 
     @MainActor
     static func openSettings() async -> Bool {
@@ -26,31 +54,38 @@ struct SafariExtensionSettingsView: View {
 
     var body: some View {
         List {
-            Section {
-                HStack(spacing: 14) {
-                    Image(systemName: "safari.fill")
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 46, height: 46)
-                        .background(HarvestTheme.blue.gradient, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("收割机助手")
-                            .font(.headline)
-                        Text("Safari Web Extension · v\(HarvestSafariExtension.bundledVersion)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+            Section("内置扩展") {
+                ForEach(HarvestSafariExtensions.all) { item in
+                    HStack(spacing: 14) {
+                        Image(systemName: item.icon)
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 46, height: 46)
+                            .background(item.color.gradient, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 6) {
+                                Text(item.title).font(.headline)
+                                Text("v\(item.version)")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(item.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: 4)
+                        Image(systemName: item.isBundled ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(item.isBundled ? HarvestTheme.green : HarvestTheme.amber)
                     }
-                    Spacer()
-                    Image(systemName: HarvestSafariExtension.isBundled ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(HarvestSafariExtension.isBundled ? HarvestTheme.green : HarvestTheme.amber)
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
             }
 
             Section("启用扩展") {
                 Button {
                     Task {
-                        let opened = await HarvestSafariExtension.openSettings()
+                        let opened = await HarvestSafariExtensions.openSettings()
                         statusMessage = opened ? "已打开系统设置" : "无法打开设置，请手动进入 Safari 扩展设置"
                     }
                 } label: {
@@ -58,8 +93,8 @@ struct SafariExtensionSettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 7) {
                     setupStep(1, "打开“设置”并进入 Safari 浏览器")
-                    setupStep(2, "进入“扩展”，开启“收割机助手”")
-                    setupStep(3, "将网站访问权限设置为“允许”")
+                    setupStep(2, "进入“扩展”，开启需要使用的扩展")
+                    setupStep(3, "将对应网站访问权限设置为“允许”")
                 }
                 .padding(.vertical, 3)
                 if !statusMessage.isEmpty {
@@ -70,13 +105,13 @@ struct SafariExtensionSettingsView: View {
             }
 
             Section {
-                Label("读取和修改访问站点的网页内容", systemImage: "doc.text.magnifyingglass")
-                Label("读取与写入站点 Cookie，用于同步登录信息", systemImage: "key.horizontal.fill")
-                Label("调用 Harvest 的站点同步、搜索和下载器功能", systemImage: "arrow.triangle.2.circlepath")
+                Label("收割机助手读取站点信息并调用 Harvest 功能", systemImage: "arrow.triangle.2.circlepath")
+                Label("CookieCloud 读取与写入 Cookie、Local Storage", systemImage: "key.horizontal.fill")
+                Label("CookieCloud 使用端到端加密连接自建同步服务", systemImage: "lock.shield.fill")
             } header: {
                 Text("扩展权限")
             } footer: {
-                Text("扩展默认不会自动启用。安装 App 后仍需由你在系统设置中授权；服务器地址和令牌在扩展弹窗内单独配置。")
+                Text("扩展安装后不会自动启用，必须由你在系统设置中授权。CookieCloud 的服务器地址、UUID、密码和同步模式在 Safari 工具栏的 CookieCloud 弹窗中配置。")
             }
         }
         .navigationTitle("Safari 扩展")

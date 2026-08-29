@@ -1,1 +1,0 @@
-import{P as e,S as t,a as n,t as r}from"./browser-LxpdsvE9.js";n(t({__name:`App`,setup(t){return e(()=>{r.tabs.create({url:r.runtime.getURL(`/operate.html`)}),window.close()}),(e,t)=>null}})).mount(`#app`);

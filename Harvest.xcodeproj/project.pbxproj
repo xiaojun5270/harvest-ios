@@ -29,6 +29,17 @@
 		B00000000000000000000008 /* content-scripts in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* content-scripts */; };
 		B00000000000000000000009 /* icon in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* icon */; };
 		B0000000000000000000000A /* HarvestSafariExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000B /* HarvestSafariExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		D00000000000000000000001 /* SafariWebExtensionHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000002 /* SafariWebExtensionHandler.swift */; };
+		D00000000000000000000002 /* manifest.json in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000003 /* manifest.json */; };
+		D00000000000000000000003 /* background.js in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000004 /* background.js */; };
+		D00000000000000000000004 /* popup.html in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000005 /* popup.html */; };
+		D00000000000000000000005 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000006 /* assets */; };
+		D00000000000000000000006 /* chunks in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000007 /* chunks */; };
+		D00000000000000000000007 /* content-scripts in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000008 /* content-scripts */; };
+		D00000000000000000000008 /* icon in Resources */ = {isa = PBXBuildFile; fileRef = D20000000000000000000009 /* icon */; };
+		D00000000000000000000009 /* _locales in Resources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000000A /* _locales */; };
+		D0000000000000000000000A /* CookieCloudSafariExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = D2000000000000000000000B /* CookieCloudSafariExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		D0000000000000000000000B /* safari-background.js in Resources */ = {isa = PBXBuildFile; fileRef = D2000000000000000000000C /* safari-background.js */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -38,6 +49,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = B50000000000000000000001;
 			remoteInfo = HarvestSafariExtension;
+		};
+		D10000000000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 600000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D50000000000000000000001;
+			remoteInfo = CookieCloudSafariExtension;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -49,6 +67,7 @@
 			dstSubfolderSpec = 13;
 			files = (
 				B0000000000000000000000A /* HarvestSafariExtension.appex in Embed App Extensions */,
+				D0000000000000000000000A /* CookieCloudSafariExtension.appex in Embed App Extensions */,
 			);
 			name = "Embed App Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -82,6 +101,18 @@
 		B10000000000000000000009 /* content-scripts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "content-scripts"; sourceTree = "<group>"; };
 		B1000000000000000000000A /* icon */ = {isa = PBXFileReference; lastKnownFileType = folder; path = icon; sourceTree = "<group>"; };
 		B1000000000000000000000B /* HarvestSafariExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HarvestSafariExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		D20000000000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		D20000000000000000000002 /* SafariWebExtensionHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafariWebExtensionHandler.swift; sourceTree = "<group>"; };
+		D20000000000000000000003 /* manifest.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = manifest.json; sourceTree = "<group>"; };
+		D20000000000000000000004 /* background.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = background.js; sourceTree = "<group>"; };
+		D20000000000000000000005 /* popup.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = popup.html; sourceTree = "<group>"; };
+		D20000000000000000000006 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = "<group>"; };
+		D20000000000000000000007 /* chunks */ = {isa = PBXFileReference; lastKnownFileType = folder; path = chunks; sourceTree = "<group>"; };
+		D20000000000000000000008 /* content-scripts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "content-scripts"; sourceTree = "<group>"; };
+		D20000000000000000000009 /* icon */ = {isa = PBXFileReference; lastKnownFileType = folder; path = icon; sourceTree = "<group>"; };
+		D2000000000000000000000A /* _locales */ = {isa = PBXFileReference; lastKnownFileType = folder; path = _locales; sourceTree = "<group>"; };
+		D2000000000000000000000B /* CookieCloudSafariExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CookieCloudSafariExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		D2000000000000000000000C /* safari-background.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "safari-background.js"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -99,6 +130,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D30000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -107,6 +145,7 @@
 			children = (
 				400000000000000000000002 /* Harvest */,
 				B20000000000000000000001 /* HarvestSafariExtension */,
+				D40000000000000000000001 /* CookieCloudSafariExtension */,
 				400000000000000000000003 /* Products */,
 				20000000000000000000000A /* README.md */,
 			);
@@ -137,6 +176,7 @@
 			children = (
 				200000000000000000000009 /* Harvest.app */,
 				B1000000000000000000000B /* HarvestSafariExtension.appex */,
+				D2000000000000000000000B /* CookieCloudSafariExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -166,6 +206,32 @@
 			path = Resources;
 			sourceTree = "<group>";
 		};
+		D40000000000000000000001 /* CookieCloudSafariExtension */ = {
+			isa = PBXGroup;
+			children = (
+				D20000000000000000000002 /* SafariWebExtensionHandler.swift */,
+				D20000000000000000000001 /* Info.plist */,
+				D40000000000000000000002 /* Resources */,
+			);
+			path = CookieCloudSafariExtension;
+			sourceTree = "<group>";
+		};
+		D40000000000000000000002 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				D20000000000000000000003 /* manifest.json */,
+				D2000000000000000000000C /* safari-background.js */,
+				D20000000000000000000004 /* background.js */,
+				D20000000000000000000005 /* popup.html */,
+				D20000000000000000000006 /* assets */,
+				D20000000000000000000007 /* chunks */,
+				D20000000000000000000008 /* content-scripts */,
+				D20000000000000000000009 /* icon */,
+				D2000000000000000000000A /* _locales */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -182,6 +248,7 @@
 			);
 			dependencies = (
 				C10000000000000000000001 /* PBXTargetDependency */,
+				D80000000000000000000001 /* PBXTargetDependency */,
 			);
 			name = Harvest;
 			productName = Harvest;
@@ -205,6 +272,23 @@
 			productReference = B1000000000000000000000B /* HarvestSafariExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
+		D50000000000000000000001 /* CookieCloudSafariExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DA0000000000000000000001 /* Build configuration list for PBXNativeTarget "CookieCloudSafariExtension" */;
+			buildPhases = (
+				D70000000000000000000001 /* Sources */,
+				D30000000000000000000001 /* Frameworks */,
+				D60000000000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CookieCloudSafariExtension;
+			productName = CookieCloudSafariExtension;
+			productReference = D2000000000000000000000B /* CookieCloudSafariExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -219,6 +303,9 @@
 						CreatedOnToolsVersion = 16.0;
 					};
 					B50000000000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					D50000000000000000000001 = {
 						CreatedOnToolsVersion = 16.0;
 					};
 				};
@@ -239,6 +326,7 @@
 			targets = (
 				500000000000000000000001 /* Harvest */,
 				B50000000000000000000001 /* HarvestSafariExtension */,
+				D50000000000000000000001 /* CookieCloudSafariExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -265,6 +353,22 @@
 				B00000000000000000000007 /* chunks in Resources */,
 				B00000000000000000000008 /* content-scripts in Resources */,
 				B00000000000000000000009 /* icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		D60000000000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D00000000000000000000002 /* manifest.json in Resources */,
+				D0000000000000000000000B /* safari-background.js in Resources */,
+				D00000000000000000000003 /* background.js in Resources */,
+				D00000000000000000000004 /* popup.html in Resources */,
+				D00000000000000000000005 /* assets in Resources */,
+				D00000000000000000000006 /* chunks in Resources */,
+				D00000000000000000000007 /* content-scripts in Resources */,
+				D00000000000000000000008 /* icon in Resources */,
+				D00000000000000000000009 /* _locales in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -296,6 +400,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D70000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D00000000000000000000001 /* SafariWebExtensionHandler.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -303,6 +415,11 @@
 			isa = PBXTargetDependency;
 			target = B50000000000000000000001 /* HarvestSafariExtension */;
 			targetProxy = C00000000000000000000001 /* PBXContainerItemProxy */;
+		};
+		D80000000000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D50000000000000000000001 /* CookieCloudSafariExtension */;
+			targetProxy = D10000000000000000000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -456,6 +573,54 @@
 			};
 			name = Release;
 		};
+		D90000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 291;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CookieCloudSafariExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../../Frameworks");
+				MARKETING_VERSION = 2026.0731.01;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ptools.harvest.CookieCloudSafariExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		D90000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 291;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = CookieCloudSafariExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/../../Frameworks");
+				MARKETING_VERSION = 2026.0731.01;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ptools.harvest.CookieCloudSafariExtension;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -482,6 +647,15 @@
 			buildConfigurations = (
 				C20000000000000000000001 /* Debug */,
 				C20000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		DA0000000000000000000001 /* Build configuration list for PBXNativeTarget "CookieCloudSafariExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D90000000000000000000001 /* Debug */,
+				D90000000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

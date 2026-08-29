@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "__MSG_appTitle__",
+  "description": "__MSG_appDesc__",
+  "version": "1.0.3",
+  "default_locale": "zh_CN",
+  "icons": {
+    "16": "icon/16.png",
+    "32": "icon/32.png",
+    "48": "icon/48.png",
+    "96": "icon/96.png",
+    "128": "icon/128.png"
+  },
+  "permissions": [
+    "cookies",
+    "tabs",
+    "storage",
+    "alarms",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "safari-background.js"
+  },
+  "action": {
+    "default_title": "CookieCloud",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-scripts/content.js"
+      ]
+    }
+  ]
+}

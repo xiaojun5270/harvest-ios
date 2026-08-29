@@ -60,9 +60,26 @@ jobs:
           test -d "$EXTENSION_PATH"
           test -f "$EXTENSION_PATH/manifest.json"
           test -f "$EXTENSION_PATH/background.js"
+          test -f "$EXTENSION_PATH/content-scripts/auth-bridge.js"
           test -f "$EXTENSION_PATH/content-scripts/content.js"
           if grep -q "BEGIN PRIVATE KEY" "$EXTENSION_PATH/manifest.json"; then
             echo "Safari extension manifest unexpectedly contains a private key."
+            exit 1
+          fi
+          if grep -q 'edge.microsoft.com' "$EXTENSION_PATH/manifest.json"; then
+            echo "Harvest Safari extension unexpectedly contains the Edge update URL."
+            exit 1
+          fi
+
+          COOKIECLOUD_EXTENSION_PATH="$APP_PATH/PlugIns/CookieCloudSafariExtension.appex"
+          test -d "$COOKIECLOUD_EXTENSION_PATH"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/manifest.json"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/safari-background.js"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/background.js"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/content-scripts/content.js"
+          test -f "$COOKIECLOUD_EXTENSION_PATH/_locales/zh_CN/messages.json"
+          if grep -q 'edge.microsoft.com' "$COOKIECLOUD_EXTENSION_PATH/manifest.json"; then
+            echo "CookieCloud Safari extension unexpectedly contains the Edge update URL."
             exit 1
           fi
 
