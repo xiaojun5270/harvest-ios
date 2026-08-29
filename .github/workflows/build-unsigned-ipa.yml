@@ -60,6 +60,7 @@ jobs:
           test -d "$EXTENSION_PATH"
           test -f "$EXTENSION_PATH/manifest.json"
           test -f "$EXTENSION_PATH/background.js"
+          test -f "$EXTENSION_PATH/chunks/safari-compat.js"
           test -f "$EXTENSION_PATH/content-scripts/auth-bridge.js"
           test -f "$EXTENSION_PATH/content-scripts/content.js"
           if grep -q "BEGIN PRIVATE KEY" "$EXTENSION_PATH/manifest.json"; then
