@@ -5,23 +5,31 @@
     operation: "",
     active: false,
     read: 0,
+    readRecorded: false,
     readErrors: 0,
+    uploadSelected: null,
+    uploadCompleted: false,
     writeSuccess: 0,
     writeFailure: 0,
+    writeAttempts: 0,
     uploadSuccess: 0,
-    uploadFailure: 0
+    uploadFailure: 0,
+    uploadSkipped: 0
   };
+  let sampleAccessibleCookies = async () => {};
   let logPanel;
   let logBody;
   let logSummary;
 
   const countSummary = () => {
-    if (syncStats.writeSuccess + syncStats.writeFailure > 0) {
+    if (syncStats.writeAttempts > 0 || syncStats.writeSuccess + syncStats.writeFailure > 0) {
       return `写入成功 ${syncStats.writeSuccess} · 失败 ${syncStats.writeFailure}`;
     }
-    if (syncStats.uploadSuccess + syncStats.uploadFailure > 0) {
-      return `上传成功 ${syncStats.uploadSuccess} · 失败 ${syncStats.uploadFailure}`;
+    if (syncStats.uploadCompleted) {
+      const skipped = syncStats.uploadSkipped > 0 ? ` · 跳过 ${syncStats.uploadSkipped}` : "";
+      return `上传成功 ${syncStats.uploadSuccess} · 失败 ${syncStats.uploadFailure}${skipped}`;
     }
+    if (syncStats.uploadSelected !== null) return `待上传 ${syncStats.uploadSelected} 条 Cookie`;
     if (syncStats.readErrors > 0) return `Cookie 读取失败 ${syncStats.readErrors} 次`;
     return `已读取 ${syncStats.read} 条 Cookie`;
   };
@@ -117,15 +125,66 @@
       operation,
       active: true,
       read: 0,
+      readRecorded: false,
       readErrors: 0,
+      uploadSelected: null,
+      uploadCompleted: false,
       writeSuccess: 0,
       writeFailure: 0,
+      writeAttempts: 0,
       uploadSuccess: 0,
-      uploadFailure: 0
+      uploadFailure: 0,
+      uploadSkipped: 0
     });
     ensureLogPanel();
     logBody.replaceChildren();
     appendLog(`${operation}开始`);
+  };
+
+  const recordCookieRead = (cookies) => {
+    if (!syncStats.active) return;
+    const count = Array.isArray(cookies) ? cookies.length : 0;
+    syncStats.read = count;
+    if (!syncStats.readRecorded) {
+      syncStats.readRecorded = true;
+      appendLog(`浏览器可读取 ${count} 条 Cookie`, "success");
+    } else {
+      updateLogSummary();
+    }
+  };
+
+  const originalStringify = JSON.stringify.bind(JSON);
+  JSON.stringify = (value, ...rest) => {
+    if (syncStats.active && value && typeof value === "object" && value.cookie_data) {
+      const selected = Object.values(value.cookie_data).reduce((total, cookies) => {
+        return total + (Array.isArray(cookies) ? cookies.length : 0);
+      }, 0);
+      if (syncStats.uploadSelected !== selected) {
+        syncStats.uploadSelected = selected;
+        appendLog(`筛选后待上传 ${selected} 条 Cookie`);
+      }
+    }
+    return originalStringify(value, ...rest);
+  };
+
+  const originalConsoleLog = console.log.bind(console);
+  console.log = (...args) => {
+    const label = String(args[0] ?? "").trim().toLowerCase();
+    if (syncStats.active && label === "new cookie") {
+      syncStats.writeAttempts += 1;
+      updateLogSummary();
+    } else if (syncStats.active && label === "set cookie") {
+      if (syncStats.writeSuccess + syncStats.writeFailure < syncStats.writeAttempts) {
+        syncStats.writeSuccess += 1;
+        updateLogSummary();
+      }
+    } else if (syncStats.active && label === "set cookie error") {
+      if (syncStats.writeSuccess + syncStats.writeFailure < syncStats.writeAttempts) {
+        syncStats.writeFailure += 1;
+        appendLog(`第 ${syncStats.writeAttempts} 条 Cookie 写入失败：${safeErrorText(args[1])}`, "error");
+      }
+    }
+    originalConsoleLog(...args);
   };
 
   const compatibleCookieDetails = (details = {}) => {
@@ -138,11 +197,19 @@
     const originalCookies = api.cookies;
     const originalGetAll = originalCookies.getAll.bind(originalCookies);
     const originalSet = typeof originalCookies.set === "function" ? originalCookies.set.bind(originalCookies) : null;
+    sampleAccessibleCookies = async () => {
+      try {
+        recordCookieRead(await originalGetAll({}));
+      } catch (error) {
+        if (!syncStats.active || syncStats.readErrors > 0) return;
+        syncStats.readErrors += 1;
+        appendLog(`Cookie 读取失败：${safeErrorText(error)}`, "error");
+      }
+    };
     const compatibleGetAll = async (details, ...rest) => {
       try {
         const cookies = await originalGetAll(compatibleCookieDetails(details), ...rest);
-        syncStats.read = Array.isArray(cookies) ? cookies.length : 0;
-        appendLog(`已读取 ${syncStats.read} 条 Cookie`, "success");
+        recordCookieRead(cookies);
         return cookies;
       } catch (error) {
         syncStats.readErrors += 1;
@@ -151,6 +218,9 @@
       }
     };
     const compatibleSet = originalSet ? async (details, ...rest) => {
+      if (syncStats.active && syncStats.writeAttempts <= syncStats.writeSuccess + syncStats.writeFailure) {
+        syncStats.writeAttempts += 1;
+      }
       try {
         const cookie = await originalSet(details, ...rest);
         syncStats.writeSuccess += 1;
@@ -220,13 +290,21 @@
 
   const completeOperation = (message, tone) => {
     if (!syncStats.active) return "";
-    if (syncStats.writeSuccess + syncStats.writeFailure === 0 && syncStats.read > 0) {
-      if (tone === "success") syncStats.uploadSuccess = syncStats.read;
-      if (tone === "error") syncStats.uploadFailure = syncStats.read;
+    const unresolvedWrites = Math.max(
+      0,
+      syncStats.writeAttempts - syncStats.writeSuccess - syncStats.writeFailure
+    );
+    if (unresolvedWrites > 0) syncStats.writeFailure += unresolvedWrites;
+    if (syncStats.writeAttempts === 0 && syncStats.uploadSelected !== null) {
+      if (tone === "success") syncStats.uploadSuccess = syncStats.uploadSelected;
+      if (tone === "error") syncStats.uploadFailure = syncStats.uploadSelected;
+      if (tone === "info") syncStats.uploadSkipped = syncStats.uploadSelected;
+      syncStats.uploadCompleted = true;
     }
     const hasCookieStats = syncStats.read > 0
       || syncStats.readErrors > 0
-      || syncStats.writeSuccess + syncStats.writeFailure > 0;
+      || syncStats.uploadSelected !== null
+      || syncStats.writeAttempts > 0;
     appendLog(`${syncStats.operation}结果：${message}`, tone);
     const summary = hasCookieStats ? countSummary() : "";
     if (summary) {
@@ -310,9 +388,11 @@
     const label = String(button.textContent || "").replace(/\s+/g, " ").trim();
     if (/(手动同步|manual sync)/i.test(label)) {
       beginOperation("手动同步");
+      void sampleAccessibleCookies();
       showFeedback("正在手动同步，请稍候…", false);
     } else if (/(^|\s)(测试|test)(\s|$)/i.test(label)) {
       beginOperation("服务器测试");
+      void sampleAccessibleCookies();
       showFeedback("正在测试服务器连接…", false);
     } else if (/(^|\s)(保存|save)(\s|$)/i.test(label)) {
       beginOperation("保存设置");
