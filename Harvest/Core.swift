@@ -2149,26 +2149,51 @@ final class AppState: ObservableObject {
         feedbackTitle: String? = nil,
         successMessage: String? = nil
     ) async -> Bool {
+        await performReturningMessage(
+            path,
+            method: method,
+            query: query,
+            body: body,
+            showsFeedback: showsFeedback,
+            feedbackTitle: feedbackTitle,
+            fallbackMessage: successMessage
+        ) != nil
+    }
+
+    func performReturningMessage(
+        _ path: String,
+        method: HTTPMethod = .post,
+        query: [String: Any] = [:],
+        body: Any? = nil,
+        showsFeedback: Bool = true,
+        feedbackTitle: String? = nil,
+        fallbackMessage: String? = nil
+    ) async -> String? {
         let labels = manualTaskLabels(for: path, method: method, body: body)
         let feedbackID = showsFeedback
             ? beginManualTask(feedbackTitle ?? labels.title)
             : nil
         do {
-            _ = try await api(path, method: method, query: query, body: body)
+            let response = try await api(path, method: method, query: query, body: body)
+            let returnedMessage = jsonMessage(response)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedMessage = returnedMessage.flatMap { $0.isEmpty ? nil : $0 }
+                ?? fallbackMessage
+                ?? labels.success
             if let feedbackID {
-                finishManualTask(feedbackID, success: true, message: successMessage ?? labels.success)
+                finishManualTask(feedbackID, success: true, message: resolvedMessage)
             }
-            return true
+            return resolvedMessage
         } catch {
             if isRequestCancellation(error) {
                 if let feedbackID { cancelManualTask(feedbackID) }
-                return false
+                return nil
             }
             if let feedbackID {
-                finishManualTask(feedbackID, success: false, message: "操作失败，请查看错误详情")
+                finishManualTask(feedbackID, success: false, message: error.localizedDescription)
             }
             presentedError = error.localizedDescription
-            return false
+            return nil
         }
     }
 

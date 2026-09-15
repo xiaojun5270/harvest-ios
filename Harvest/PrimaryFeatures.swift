@@ -1849,14 +1849,34 @@ struct DashboardView: View {
     @MainActor private func runGlobal(_ path: String) async {
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
         let signing = path == APIPath.siteSign
-        _ = await appState.runManualTask(
-            title: signing ? "正在为全部站点签到" : "正在刷新全部站点",
-            successMessage: signing ? "全部站点签到完成" : "全部站点数据已更新"
-        ) {
-            guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return false }
-            await model.load(appState, days: trendDays)
-            return appState.presentedError == nil
+        let title = signing ? "正在为全部站点签到" : "正在刷新全部站点"
+        let fallbackMessage = signing ? "全部站点签到完成" : "全部站点数据已更新"
+        appState.presentedError = nil
+        let feedbackID = appState.beginManualTask(title)
+        guard let returnedMessage = await appState.performReturningMessage(
+            endpoint,
+            method: .get,
+            showsFeedback: false,
+            fallbackMessage: fallbackMessage
+        ) else {
+            if Task.isCancelled {
+                appState.cancelManualTask(feedbackID)
+            } else {
+                appState.finishManualTask(
+                    feedbackID,
+                    success: false,
+                    message: appState.presentedError ?? "操作失败，请查看错误详情"
+                )
+            }
+            return
         }
+        await model.load(appState, days: trendDays)
+        let succeeded = appState.presentedError == nil
+        appState.finishManualTask(
+            feedbackID,
+            success: succeeded,
+            message: succeeded ? returnedMessage : appState.presentedError
+        )
     }
 
     @MainActor private func runQuickAction(_ action: DashboardQuickAction) async {

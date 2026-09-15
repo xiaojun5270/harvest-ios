@@ -1372,21 +1372,41 @@ final class SitesViewModel: ObservableObject {
         }
 
         let displayName = privacyMaskedText(site.name, enabled: appState.privacyMode)
+        let operationTitle: String
         let successMessage: String
         if path == APIPath.siteSign {
+            operationTitle = "正在为\(displayName)签到"
             successMessage = "\(displayName)签到完成"
         } else if path == APIPath.siteRepeat {
+            operationTitle = "正在为\(displayName)执行辅种"
             successMessage = "\(displayName)辅种任务已提交"
         } else {
+            operationTitle = "正在刷新\(displayName)"
             successMessage = "\(displayName)数据已更新"
         }
-        guard await appState.perform(
+        let feedbackID = appState.beginManualTask(operationTitle)
+        guard let returnedMessage = await appState.performReturningMessage(
             path + "\(site.id)",
             method: .get,
-            showsFeedback: false
-        ) else { return }
+            showsFeedback: false,
+            fallbackMessage: successMessage
+        ) else {
+            if Task.isCancelled {
+                appState.cancelManualTask(feedbackID)
+            } else {
+                appState.finishManualTask(
+                    feedbackID,
+                    success: false,
+                    message: appState.presentedError ?? "操作失败，请查看错误详情"
+                )
+            }
+            return
+        }
 
-        appState.presentManualTaskResult(successMessage)
+        let privacySafeMessage = site.name.isEmpty
+            ? returnedMessage
+            : returnedMessage.replacingOccurrences(of: site.name, with: displayName)
+        appState.finishManualTask(feedbackID, success: true, message: privacySafeMessage)
         Task { @MainActor [weak self] in
             await self?.load(appState, cached: false)
         }
@@ -1917,11 +1937,38 @@ struct SitesView: View {
         let endpoint = path.hasSuffix("/") ? String(path.dropLast()) : path
         let signing = path == APIPath.siteSign
         appState.presentedError = nil
-        guard await appState.perform(endpoint, method: .get, showsFeedback: false) else { return }
+        let fallbackMessage = signing ? "全部站点签到完成" : "全部站点数据已更新"
+        let feedbackID = appState.beginManualTask(signing ? "正在为全部站点签到" : "正在刷新全部站点")
+        guard let returnedMessage = await appState.performReturningMessage(
+            endpoint,
+            method: .get,
+            showsFeedback: false,
+            fallbackMessage: fallbackMessage
+        ) else {
+            if Task.isCancelled {
+                appState.cancelManualTask(feedbackID)
+            } else {
+                appState.finishManualTask(
+                    feedbackID,
+                    success: false,
+                    message: appState.presentedError ?? "操作失败，请查看错误详情"
+                )
+            }
+            return
+        }
         await model.load(appState, cached: false)
-        guard appState.presentedError == nil else { return }
-        appState.presentManualTaskResult(
-            signing ? "全部站点签到完成" : "全部站点数据已更新"
+        let succeeded = appState.presentedError == nil
+        let privacySafeMessage = model.sites.reduce(returnedMessage) { message, site in
+            guard !site.name.isEmpty else { return message }
+            return message.replacingOccurrences(
+                of: site.name,
+                with: privacyMaskedText(site.name, enabled: appState.privacyMode)
+            )
+        }
+        appState.finishManualTask(
+            feedbackID,
+            success: succeeded,
+            message: succeeded ? privacySafeMessage : appState.presentedError
         )
     }
 }
