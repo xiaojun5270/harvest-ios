@@ -780,6 +780,105 @@ struct TaskEditorSheet: View {
     }
 }
 
+private struct TaskExecutionTrafficEntry: Identifiable {
+    let site: String
+    let direction: String
+    let amount: String
+
+    var id: String { "\(site)|\(direction)|\(amount)" }
+}
+
+private struct TaskExecutionSiteEntry: Identifiable {
+    let site: String
+    var detail: String
+
+    var id: String { site.lowercased() }
+}
+
+private struct TaskExecutionReport {
+    let totalUpload: String
+    let totalDownload: String
+    let siteCount: String
+    let successCount: String
+    let failureCount: String
+    let duration: String
+    let traffic: [TaskExecutionTrafficEntry]
+    let failures: [TaskExecutionSiteEntry]
+    let successes: [TaskExecutionSiteEntry]
+    let readableContent: String
+
+    init(_ rawSummary: String) {
+        let content = taskResultPlainText(rawSummary)
+        let trafficSection = taskResultSection(
+            content,
+            marker: "数据列表",
+            endMarkers: ["站点信息抓取结束", "失败站点", "成功站点"]
+        )
+        let parsedTraffic = taskResultTrafficEntries(
+            trafficSection.isEmpty ? content : trafficSection
+        )
+        let parsedFailures = taskResultSiteEntries(
+            taskResultSection(content, marker: "失败站点", endMarkers: ["成功站点"])
+        )
+        let parsedSuccesses = taskResultSiteEntries(
+            taskResultSection(content, marker: "成功站点", endMarkers: [])
+        )
+        let summaryContent = taskResultContentBefore(
+            content,
+            markers: ["失败站点", "成功站点"]
+        )
+
+        let parsedSiteCount = taskResultCapture("站点数\\s*[:：]\\s*(\\d+)", in: summaryContent)
+        let parsedSuccessCount = taskResultCapture("成功\\s*[:：]\\s*(\\d+)", in: summaryContent)
+        let parsedFailureCount = taskResultCapture("失败\\s*[:：]\\s*(\\d+)", in: summaryContent)
+        let parsedTotalUpload = taskResultCapture(
+            "总上传\\s*[:：]\\s*([0-9]+(?:\\.[0-9]+)?\\s*(?:[KMGTPE]?i?B|B))",
+            in: content
+        )
+        let parsedTotalDownload = taskResultCapture(
+            "总下载\\s*[:：]\\s*([0-9]+(?:\\.[0-9]+)?\\s*(?:[KMGTPE]?i?B|B))",
+            in: content
+        )
+        let resolvedSiteCount = parsedSiteCount.isEmpty
+            ? taskResultDerivedSiteCount(parsedFailures, parsedSuccesses)
+            : parsedSiteCount
+        let resolvedSuccessCount = parsedSuccessCount.isEmpty && !parsedSuccesses.isEmpty
+            ? "\(parsedSuccesses.count)"
+            : parsedSuccessCount
+        let resolvedFailureCount = parsedFailureCount.isEmpty && !parsedFailures.isEmpty
+            ? "\(parsedFailures.count)"
+            : parsedFailureCount
+        let parsedDuration = taskResultCapture(
+            "耗时\\s*[:：]\\s*([0-9]+(?:\\.[0-9]+)?\\s*秒)",
+            in: summaryContent
+        )
+        let structured = !parsedTotalUpload.isEmpty || !parsedTotalDownload.isEmpty ||
+            !resolvedSiteCount.isEmpty || !resolvedSuccessCount.isEmpty || !resolvedFailureCount.isEmpty ||
+            !parsedDuration.isEmpty || !parsedTraffic.isEmpty || !parsedFailures.isEmpty || !parsedSuccesses.isEmpty
+
+        totalUpload = parsedTotalUpload
+        totalDownload = parsedTotalDownload
+        siteCount = resolvedSiteCount
+        successCount = resolvedSuccessCount
+        failureCount = resolvedFailureCount
+        duration = parsedDuration
+        traffic = parsedTraffic
+        failures = parsedFailures
+        successes = parsedSuccesses
+        readableContent = structured ? "" : taskResultReadableContent(content)
+    }
+
+    var hasMetrics: Bool {
+        !siteCount.isEmpty || !successCount.isEmpty || !failureCount.isEmpty || !duration.isEmpty
+    }
+
+    var hasTrafficTotals: Bool { !totalUpload.isEmpty || !totalDownload.isEmpty }
+
+    var hasStructuredContent: Bool {
+        hasMetrics || hasTrafficTotals || !traffic.isEmpty || !failures.isEmpty || !successes.isEmpty
+    }
+}
+
 struct TaskResultDetailSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -789,33 +888,115 @@ struct TaskResultDetailSheet: View {
     @State private var confirmDelete = false
     @State private var loadedResult: TaskResultItem?
     @State private var isLoading = true
+    @State private var showsAllTraffic = false
+    @State private var showsSuccessfulSites = false
+    @State private var report: TaskExecutionReport
+
+    init(
+        result: TaskResultItem,
+        onTerminate: @escaping () async -> Void,
+        onDelete: @escaping () async -> Void
+    ) {
+        self.result = result
+        self.onTerminate = onTerminate
+        self.onDelete = onDelete
+        _report = State(initialValue: TaskExecutionReport(result.summary))
+    }
 
     private var current: TaskResultItem { loadedResult ?? result }
-
     var body: some View {
         NavigationStack {
-            List {
-                Section("执行状态") {
-                    LabeledContent("任务", value: current.name)
-                    LabeledContent("状态", value: current.statusLabel)
-                    LabeledContent("任务 ID", value: current.taskID)
-                    if !current.createdAt.isEmpty { LabeledContent("开始", value: current.createdAt) }
-                    if !current.finishedAt.isEmpty { LabeledContent("结束", value: current.finishedAt) }
-                    if isLoading { ProgressView().frame(maxWidth: .infinity) }
-                }
-                if !current.summary.isEmpty {
-                    Section("结果") { Text(markdownAttributedString(current.summary)).font(.callout).textSelection(.enabled) }
-                }
-                Section("原始记录") { Text(prettyJSON(current.raw)).font(.caption.monospaced()).textSelection(.enabled) }
-                Section {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    statusCard
+
+                    if isLoading {
+                        HStack(spacing: 9) {
+                            ProgressView().controlSize(.small)
+                            Text("正在更新执行详情")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 11)
+                        .background(
+                            Color(uiColor: .secondarySystemGroupedBackground),
+                            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        )
+                    }
+
+                    if report.hasMetrics {
+                        metricGrid(report)
+                    }
+
+                    if report.hasTrafficTotals {
+                        trafficTotalGrid(report)
+                    }
+
+                    if !report.failures.isEmpty {
+                        TaskResultSiteListCard(
+                            title: "失败站点",
+                            icon: "exclamationmark.triangle.fill",
+                            color: HarvestTheme.coral,
+                            entries: report.failures,
+                            collapsedLimit: report.failures.count,
+                            expanded: .constant(true)
+                        )
+                    }
+
+                    if !report.traffic.isEmpty {
+                        TaskResultTrafficCard(
+                            entries: report.traffic,
+                            expanded: $showsAllTraffic
+                        )
+                    }
+
+                    if !report.successes.isEmpty {
+                        TaskResultSiteListCard(
+                            title: "成功站点",
+                            icon: "checkmark.circle.fill",
+                            color: HarvestTheme.green,
+                            entries: report.successes,
+                            collapsedLimit: 0,
+                            expanded: $showsSuccessfulSites
+                        )
+                    }
+
+                    if !report.readableContent.isEmpty {
+                        resultContentCard(report)
+                    } else if !isLoading && !report.hasStructuredContent {
+                        Label("暂无结果摘要", systemImage: "doc.text.magnifyingglass")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, minHeight: 88)
+                            .background(
+                                Color(uiColor: .secondarySystemGroupedBackground),
+                                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            )
+                    }
+
                     if current.isActive {
-                        Button { Task { await onTerminate(); dismiss() } } label: { Label("终止任务", systemImage: "stop.fill") }.tint(HarvestTheme.amber)
+                        Button { Task { await onTerminate(); dismiss() } } label: {
+                            Label("终止任务", systemImage: "stop.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(HarvestTheme.amber)
                     }
                     if current.isCompleted {
-                        Button(role: .destructive) { confirmDelete = true } label: { Label("删除记录", systemImage: "trash") }
+                        Button(role: .destructive) { confirmDelete = true } label: {
+                            Label("删除记录", systemImage: "trash")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
                     }
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 24)
             }
+            .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("执行详情").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
             .task { await loadDetail() }
@@ -823,6 +1004,158 @@ struct TaskResultDetailSheet: View {
                 Button("删除记录", role: .destructive) { Task { await onDelete(); dismiss() } }
             }
         }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var statusColor: Color {
+        if current.isSuccess { return HarvestTheme.green }
+        if current.isFailure { return HarvestTheme.coral }
+        if current.isRunning { return HarvestTheme.blue }
+        if current.isWaiting { return HarvestTheme.amber }
+        return .secondary
+    }
+
+    private var statusIcon: String {
+        if current.isSuccess { return "checkmark.circle.fill" }
+        if current.isFailure { return "exclamationmark.triangle.fill" }
+        if current.isRunning { return "clock.arrow.circlepath" }
+        if current.isWaiting { return "clock.fill" }
+        return "questionmark.circle.fill"
+    }
+
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 11) {
+                Image(systemName: statusIcon)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .frame(width: 40, height: 40)
+                    .background(statusColor.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(current.name)
+                        .font(.headline)
+                        .lineLimit(2)
+                    Text("任务执行结果")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Text(current.statusLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(statusColor.opacity(0.10), in: Capsule())
+            }
+
+            if !current.createdAt.isEmpty || !current.finishedAt.isEmpty {
+                Divider()
+                VStack(alignment: .leading, spacing: 7) {
+                    if !current.createdAt.isEmpty {
+                        TaskResultTimeRow(
+                            icon: "play.circle",
+                            title: "开始",
+                            value: taskResultDisplayTime(current.createdAt)
+                        )
+                    }
+                    if !current.finishedAt.isEmpty {
+                        TaskResultTimeRow(
+                            icon: "checkmark.circle",
+                            title: "结束",
+                            value: taskResultDisplayTime(current.finishedAt)
+                        )
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(statusColor.opacity(0.13), lineWidth: 0.8)
+        }
+    }
+
+    private func metricGrid(_ report: TaskExecutionReport) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            if !report.siteCount.isEmpty {
+                TaskResultMetricTile(
+                    title: "站点数",
+                    value: report.siteCount,
+                    icon: "square.grid.2x2.fill",
+                    color: HarvestTheme.blue
+                )
+            }
+            if !report.successCount.isEmpty {
+                TaskResultMetricTile(
+                    title: "成功",
+                    value: report.successCount,
+                    icon: "checkmark.circle.fill",
+                    color: HarvestTheme.green
+                )
+            }
+            if !report.failureCount.isEmpty {
+                TaskResultMetricTile(
+                    title: "失败",
+                    value: report.failureCount,
+                    icon: "exclamationmark.circle.fill",
+                    color: HarvestTheme.coral
+                )
+            }
+            if !report.duration.isEmpty {
+                TaskResultMetricTile(
+                    title: "耗时",
+                    value: report.duration,
+                    icon: "timer",
+                    color: HarvestTheme.purple
+                )
+            }
+        }
+    }
+
+    private func trafficTotalGrid(_ report: TaskExecutionReport) -> some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            if !report.totalUpload.isEmpty {
+                TaskResultMetricTile(
+                    title: "总上传",
+                    value: report.totalUpload,
+                    icon: "arrow.up",
+                    color: HarvestTheme.green
+                )
+            }
+            if !report.totalDownload.isEmpty {
+                TaskResultMetricTile(
+                    title: "总下载",
+                    value: report.totalDownload,
+                    icon: "arrow.down",
+                    color: HarvestTheme.blue
+                )
+            }
+        }
+    }
+
+    private func resultContentCard(_ report: TaskExecutionReport) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("执行结果", systemImage: "doc.text.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(HarvestTheme.blue)
+            Text(report.readableContent)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
     }
 
     @MainActor private func loadDetail() async {
@@ -833,12 +1166,390 @@ struct TaskResultDetailSheet: View {
             guard let value = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) else { return }
             var merged = result.raw
             for (key, item) in value { merged[key] = item }
-            loadedResult = TaskResultItem(merged)
+            let resolvedResult = TaskResultItem(merged)
+            loadedResult = resolvedResult
+            report = TaskExecutionReport(resolvedResult.summary)
         } catch {
             // The list response remains a usable fallback, matching the Flutter detail flow.
             recordAppLog(.warning, "读取任务执行详情失败：\(error.localizedDescription)")
         }
     }
+}
+
+private struct TaskResultTimeRow: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+        }
+    }
+}
+
+private struct TaskResultMetricTile: View {
+    let title: String
+    let value: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(color)
+                .frame(width: 31, height: 31)
+                .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(value)
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.64)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .padding(.horizontal, 10)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+        )
+    }
+}
+
+private struct TaskResultTrafficCard: View {
+    let entries: [TaskExecutionTrafficEntry]
+    @Binding var expanded: Bool
+
+    private var visibleEntries: [TaskExecutionTrafficEntry] {
+        Array(entries.prefix(expanded ? entries.count : 8))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "chart.bar.fill")
+                Text("站点流量")
+                Spacer()
+                Text("\(entries.count)")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(HarvestTheme.indigo)
+            .padding(.bottom, 8)
+
+            ForEach(Array(visibleEntries.enumerated()), id: \.offset) { index, entry in
+                HStack(spacing: 9) {
+                    Image(systemName: entry.direction == "下载" ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(entry.direction == "下载" ? HarvestTheme.blue : HarvestTheme.green)
+                        .frame(width: 20)
+                    Text(entry.site)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(entry.amount)
+                        .font(.subheadline.weight(.semibold).monospacedDigit())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.72)
+                    Text(entry.direction)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
+                if index < visibleEntries.count - 1 {
+                    Divider().padding(.leading, 29)
+                }
+            }
+
+            if entries.count > 8 {
+                Divider()
+                Button {
+                    withAnimation(.snappy) { expanded.toggle() }
+                } label: {
+                    HStack {
+                        Text(expanded ? "收起" : "查看全部 \(entries.count) 项")
+                        Spacer()
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 10)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(HarvestTheme.indigo)
+            }
+        }
+        .padding(13)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+    }
+}
+
+private struct TaskResultSiteListCard: View {
+    let title: String
+    let icon: String
+    let color: Color
+    let entries: [TaskExecutionSiteEntry]
+    let collapsedLimit: Int
+    @Binding var expanded: Bool
+
+    private var visibleEntries: [TaskExecutionSiteEntry] {
+        Array(entries.prefix(expanded ? entries.count : collapsedLimit))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                Text(title)
+                Spacer()
+                Text("\(entries.count)")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(color)
+
+            ForEach(Array(visibleEntries.enumerated()), id: \.offset) { index, entry in
+                if index == 0 { Divider().padding(.top, 9) }
+                HStack(alignment: .top, spacing: 9) {
+                    Circle()
+                        .fill(color.opacity(0.12))
+                        .frame(width: 26, height: 26)
+                        .overlay {
+                            Image(systemName: icon)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(color)
+                        }
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(entry.site)
+                            .font(.subheadline.weight(.semibold))
+                        if !entry.detail.isEmpty {
+                            Text(entry.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineSpacing(2)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, 8)
+                if index < visibleEntries.count - 1 {
+                    Divider().padding(.leading, 35)
+                }
+            }
+
+            if entries.count > collapsedLimit {
+                if !visibleEntries.isEmpty { Divider() }
+                Button {
+                    withAnimation(.snappy) { expanded.toggle() }
+                } label: {
+                    HStack {
+                        Text(expanded ? "收起" : "查看 \(entries.count) 个站点")
+                        Spacer()
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 10)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(color)
+            }
+        }
+        .padding(13)
+        .background(
+            Color(uiColor: .secondarySystemGroupedBackground),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(color.opacity(0.12), lineWidth: 0.8)
+        }
+    }
+}
+
+private func taskResultPlainText(_ raw: String) -> String {
+    var value = raw.replacingOccurrences(of: "\r\n", with: "\n")
+    for marker in ["**", "__", "`"] {
+        value = value.replacingOccurrences(of: marker, with: "")
+    }
+    return value.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func taskResultSection(_ content: String, marker: String, endMarkers: [String]) -> String {
+    guard let start = content.range(of: marker) else { return "" }
+    var end = content.endIndex
+    for endMarker in endMarkers {
+        if let candidate = content.range(
+            of: endMarker,
+            options: [],
+            range: start.upperBound..<content.endIndex
+        ), candidate.lowerBound < end {
+            end = candidate.lowerBound
+        }
+    }
+    return String(content[start.upperBound..<end])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func taskResultContentBefore(_ content: String, markers: [String]) -> String {
+    var end = content.endIndex
+    for marker in markers {
+        if let candidate = content.range(of: marker), candidate.lowerBound < end {
+            end = candidate.lowerBound
+        }
+    }
+    return String(content[..<end])
+}
+
+private func taskResultTrafficEntries(_ content: String) -> [TaskExecutionTrafficEntry] {
+    let pattern = "([^:：\\n]+?)\\s*[:：]\\s*(上传|下载)\\s*([0-9]+(?:\\.[0-9]+)?\\s*(?:[KMGTPE]?i?B|B))"
+    let matches = taskResultMatches(pattern, in: content)
+    var entries: [TaskExecutionTrafficEntry] = []
+    var keys = Set<String>()
+    let trimCharacters = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-—,，"))
+    for values in matches where values.count == 3 {
+        let site = values[0].trimmingCharacters(in: trimCharacters)
+        let direction = values[1].trimmingCharacters(in: .whitespacesAndNewlines)
+        let amount = values[2].trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = "\(site.lowercased())|\(direction)"
+        guard !site.isEmpty, !amount.isEmpty, keys.insert(key).inserted else { continue }
+        entries.append(TaskExecutionTrafficEntry(site: site, direction: direction, amount: amount))
+    }
+    return entries
+}
+
+private func taskResultSiteEntries(_ rawSection: String) -> [TaskExecutionSiteEntry] {
+    guard !rawSection.isEmpty else { return [] }
+    var separated = ["🥀", "🌹", "🌷", "🌸", "🌺", "💐"].reduce(rawSection) {
+        $0.replacingOccurrences(of: $1, with: "\n")
+    }
+    separated = taskResultReplacingMatches(
+        "(耗时\\s*[:：]?\\s*[0-9]+(?:\\.[0-9]+)?\\s*秒)",
+        in: separated,
+        template: "$1\n"
+    )
+
+    var entries: [TaskExecutionSiteEntry] = []
+    var indices: [String: Int] = [:]
+    for line in separated.components(separatedBy: .newlines) {
+        let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty,
+              let parts = taskResultSiteParts(normalized),
+              !parts.site.isEmpty else { continue }
+        let key = parts.site.lowercased()
+        if let index = indices[key] {
+            guard !parts.detail.isEmpty, !entries[index].detail.contains(parts.detail) else { continue }
+            entries[index].detail = entries[index].detail.isEmpty
+                ? parts.detail
+                : "\(entries[index].detail) · \(parts.detail)"
+        } else {
+            indices[key] = entries.count
+            entries.append(TaskExecutionSiteEntry(site: parts.site, detail: parts.detail))
+        }
+    }
+    return entries
+}
+
+private func taskResultSiteParts(_ entry: String) -> (site: String, detail: String)? {
+    let resultMarkers = [
+        "解析站点信息失败", "获取站点信息失败", "获取站点信息成功",
+        "签到失败", "签到成功", "已签到", "未签到", "未开启或不支持签到"
+    ]
+    for marker in resultMarkers {
+        guard let markerRange = entry.range(of: marker) else { continue }
+        let titleTrim = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":：,，-—"))
+        let site = String(entry[..<markerRange.lowerBound]).trimmingCharacters(in: titleTrim)
+        var detail = String(entry[markerRange.lowerBound...])
+        if detail.hasPrefix(marker) { detail.removeFirst(marker.count) }
+        detail = detail.trimmingCharacters(in: titleTrim)
+        detail = taskResultReplacingMatches(
+            "耗时\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*秒",
+            in: detail,
+            template: "耗时 $1 秒"
+        )
+        return (site, detail)
+    }
+    return nil
+}
+
+private func taskResultDerivedSiteCount(
+    _ failures: [TaskExecutionSiteEntry],
+    _ successes: [TaskExecutionSiteEntry]
+) -> String {
+    let sites = Set((failures + successes).map { $0.site.lowercased() })
+    return sites.isEmpty ? "" : "\(sites.count)"
+}
+
+private func taskResultReadableContent(_ content: String) -> String {
+    guard !content.isEmpty else { return "" }
+    if let data = content.data(using: .utf8),
+       let json = try? JSONSerialization.jsonObject(with: data),
+       json is [String: Any] || json is [Any] {
+        return ""
+    }
+    var value = ["🥀", "🌹", "🌷", "🌸", "🌺", "💐"].reduce(content) {
+        $0.replacingOccurrences(of: $1, with: "\n")
+    }
+    value = value.replacingOccurrences(of: "——", with: "\n")
+    value = taskResultReplacingMatches("([。！？])\\s*", in: value, template: "$1\n")
+    value = taskResultReplacingMatches("\\n{3,}", in: value, template: "\n\n")
+    return value.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func taskResultCapture(_ pattern: String, in text: String) -> String {
+    guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+          let match = expression.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+          match.numberOfRanges > 1,
+          let range = Range(match.range(at: 1), in: text) else { return "" }
+    return String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func taskResultMatches(_ pattern: String, in text: String) -> [[String]] {
+    guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        return []
+    }
+    return expression.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap { match in
+        guard match.numberOfRanges > 1 else { return nil }
+        return (1..<match.numberOfRanges).compactMap { index -> String? in
+            guard let range = Range(match.range(at: index), in: text) else { return nil }
+            return String(text[range])
+        }
+    }
+}
+
+private func taskResultReplacingMatches(_ pattern: String, in text: String, template: String) -> String {
+    guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        return text
+    }
+    return expression.stringByReplacingMatches(
+        in: text,
+        range: NSRange(text.startIndex..., in: text),
+        withTemplate: template
+    )
+}
+
+private func taskResultDisplayTime(_ value: String) -> String {
+    guard let date = parseDate(value) else { return value }
+    return date.formatted(.dateTime.year().month(.twoDigits).day(.twoDigits).hour().minute())
 }
 
 private func isDoubanSource(_ source: String) -> Bool {

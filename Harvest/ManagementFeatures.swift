@@ -625,7 +625,8 @@ private func noticeTaskReport(_ rawContent: String) -> NoticeTaskReport? {
         noticeReportSection(content, marker: failureRange, nextMarker: successRange)
     )
     let successes = noticeReportEntries(
-        noticeReportSection(content, marker: successRange, nextMarker: failureRange)
+        noticeReportSection(content, marker: successRange, nextMarker: failureRange),
+        omittingPlainSuccess: true
     )
 
     return NoticeTaskReport(
@@ -653,7 +654,7 @@ private func noticeReportSection(
     return String(content[marker.upperBound..<end])
 }
 
-private func noticeReportEntries(_ rawSection: String) -> [String] {
+private func noticeReportEntries(_ rawSection: String, omittingPlainSuccess: Bool = false) -> [String] {
     let separators = ["🥀", "🌹", "🌷", "🌸", "🌺", "💐"]
     let trimCharacters = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
     var separated = separators.reduce(rawSection) {
@@ -674,12 +675,27 @@ private func noticeReportEntries(_ rawSection: String) -> [String] {
         in: separated,
         template: "$1\n"
     )
-    return separated
+    let entries = separated
         .components(separatedBy: .newlines)
         .map {
             $0.trimmingCharacters(in: trimCharacters)
         }
         .filter { !$0.isEmpty }
+
+    var seen = Set<String>()
+    return entries.filter { entry in
+        let parts = noticeResultParts(entry)
+        let normalizedDetail = parts.detail
+            .trimmingCharacters(in: trimCharacters)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        if omittingPlainSuccess,
+           normalizedDetail.isEmpty || normalizedDetail == "获取站点信息成功" {
+            return false
+        }
+
+        let key = "\(parts.title.lowercased())|\(normalizedDetail.lowercased())"
+        return seen.insert(key).inserted
+    }
 }
 
 private func noticeResultParts(_ entry: String) -> (title: String, detail: String) {
@@ -1994,53 +2010,311 @@ private func appUpdateFileName(link: IOSDownloadLink, version: String) -> String
     return "Harvest-\(safeVersion.isEmpty ? "latest" : safeVersion).ipa"
 }
 
+private enum AppUpdateNoteKind: String, CaseIterable, Identifiable {
+    case feature
+    case fix
+    case performance
+    case other
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .feature: "新增"
+        case .fix: "修复"
+        case .performance: "优化"
+        case .other: "调整"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .feature: "sparkles"
+        case .fix: "wrench.and.screwdriver.fill"
+        case .performance: "bolt.fill"
+        case .other: "slider.horizontal.3"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .feature: HarvestTheme.blue
+        case .fix: HarvestTheme.coral
+        case .performance: HarvestTheme.amber
+        case .other: HarvestTheme.purple
+        }
+    }
+}
+
+private struct AppUpdateNoteItem: Identifiable {
+    let kind: AppUpdateNoteKind
+    let text: String
+
+    var id: String { "\(kind.rawValue)|\(text.lowercased())" }
+}
+
+private func appUpdateNoteItems(_ raw: String) -> [AppUpdateNoteItem] {
+    var content = raw.replacingOccurrences(of: "\r\n", with: "\n")
+    content = content.replacingOccurrences(of: "📌 更新日志", with: "\n")
+    content = content.replacingOccurrences(of: "📌更新日志", with: "\n")
+
+    let headingMarkers: [(String, AppUpdateNoteKind)] = [
+        ("✨ 新增功能", .feature), ("✨新增功能", .feature),
+        ("🐛 修复问题", .fix), ("🐛修复问题", .fix),
+        ("🚀 性能优化", .performance), ("🚀性能优化", .performance),
+        ("📌 其他变更", .other), ("📌其他变更", .other)
+    ]
+    for (marker, kind) in headingMarkers {
+        content = content.replacingOccurrences(
+            of: marker,
+            with: "\n@@\(kind.rawValue)@@\n",
+            options: .caseInsensitive
+        )
+    }
+    content = noticeReplacingMatches(
+        "((?:feat|fix|perf|refactor|chore|release|docs|style|test|build|ci)(?:\\([^\\r\\n)]*\\))?\\s*:)",
+        in: content,
+        template: "\n$1"
+    )
+
+    var currentKind = AppUpdateNoteKind.other
+    var items: [AppUpdateNoteItem] = []
+    var seen = Set<String>()
+    let prefixes: [String: AppUpdateNoteKind] = [
+        "feat": .feature,
+        "fix": .fix,
+        "perf": .performance,
+        "refactor": .performance,
+        "chore": .other,
+        "release": .other,
+        "docs": .other,
+        "style": .other,
+        "test": .other,
+        "build": .other,
+        "ci": .other
+    ]
+
+    for rawLine in content.components(separatedBy: .newlines) {
+        var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { continue }
+        if line.hasPrefix("@@"), line.hasSuffix("@@") {
+            let value = line.replacingOccurrences(of: "@", with: "")
+            if let kind = AppUpdateNoteKind(rawValue: value) { currentKind = kind }
+            continue
+        }
+
+        line = noticeReplacingMatches("^\\s*[-*•]+\\s*", in: line, template: "")
+        var kind = currentKind
+        if let colon = line.firstIndex(of: ":") {
+            let rawPrefix = String(line[..<colon])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let basePrefix = rawPrefix.split(separator: "(", maxSplits: 1).first.map(String.init) ?? rawPrefix
+            if let resolvedKind = prefixes[basePrefix] {
+                kind = resolvedKind
+                line = String(line[line.index(after: colon)...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        line = noticeReplacingMatches("\\s*\\([0-9a-f]{6,40}\\)\\s*$", in: line, template: "")
+        line = line.replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "__", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, line != "更新日志", line != "其他变更" else { continue }
+
+        let key = "\(kind.rawValue)|\(line.lowercased())"
+        guard seen.insert(key).inserted else { continue }
+        items.append(AppUpdateNoteItem(kind: kind, text: line))
+    }
+    return items
+}
+
+private func preferredIOSDownloadLinks(_ release: [String: Any]) -> [IOSDownloadLink] {
+    let links = iosDownloadLinks(release)
+    let packages = links.filter { link in
+        let marker = "\(link.label) \(link.url.lastPathComponent)".lowercased()
+        return link.url.pathExtension.lowercased() == "ipa" || marker.contains("testflight")
+    }
+    return packages.isEmpty ? links : packages
+}
+
+private struct AppUpdateNotesView: View {
+    let items: [AppUpdateNoteItem]
+    let collapsedLimit: Int
+    @State private var expanded = false
+
+    init(items: [AppUpdateNoteItem], collapsedLimit: Int = 6) {
+        self.items = items
+        self.collapsedLimit = collapsedLimit
+    }
+
+    private var visibleItems: [AppUpdateNoteItem] {
+        Array(items.prefix(expanded ? items.count : collapsedLimit))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(visibleItems.enumerated()), id: \.offset) { index, item in
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: item.kind.icon)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(item.kind.color)
+                        .frame(width: 27, height: 27)
+                        .background(item.kind.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.kind.title)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(item.kind.color)
+                        Text(markdownAttributedString(item.text, inlineOnly: true))
+                            .font(.subheadline)
+                            .foregroundStyle(.primary)
+                            .lineSpacing(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, 8)
+                if index < visibleItems.count - 1 {
+                    Divider().padding(.leading, 37)
+                }
+            }
+
+            if items.count > collapsedLimit {
+                if !visibleItems.isEmpty { Divider() }
+                Button {
+                    withAnimation(.snappy) { expanded.toggle() }
+                } label: {
+                    HStack {
+                        Text(expanded ? "收起更新内容" : "查看全部 \(items.count) 项")
+                        Spacer()
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.vertical, 9)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(HarvestTheme.blue)
+            }
+        }
+    }
+}
+
 private struct AppUpdateLinkRow: View {
     @ObservedObject var model: AppUpdateViewModel
     let release: [String: Any]
     let link: IOSDownloadLink
 
+    private var fileName: String {
+        let value = link.url.lastPathComponent.removingPercentEncoding ?? link.url.lastPathComponent
+        if !value.isEmpty, value != "/" { return value }
+        return link.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "iOS 安装包" : link.label
+    }
+
     var body: some View {
         HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(link.label).font(.subheadline)
-                Text(link.url.lastPathComponent.removingPercentEncoding ?? link.url.host ?? link.url.absoluteString)
-                    .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            Image(systemName: "arrow.down.app.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(HarvestTheme.blue)
+                .frame(width: 34, height: 34)
+                .background(HarvestTheme.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(fileName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.78)
+                Text(link.url.host ?? link.label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
-            Button { Task { await model.download(link, release: release) } } label: { Image(systemName: "arrow.down.circle") }
+            Button { Task { await model.download(link, release: release) } } label: {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.title3)
+            }
                 .disabled(model.isDownloading)
                 .accessibilityLabel("下载并分享 \(link.label)")
             Menu {
                 Button { model.copyDownloadURL(link) } label: { Label("复制下载链接", systemImage: "doc.on.doc") }
                 Link(destination: link.url) { Label("在浏览器中打开", systemImage: "safari") }
-            } label: { Image(systemName: "ellipsis.circle") }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.title3)
+            }
                 .accessibilityLabel("下载链接操作")
         }
+        .padding(.vertical, 3)
     }
 }
 
 private struct AppUpdateLatestSection: View {
     @ObservedObject var model: AppUpdateViewModel
 
+    private var notes: [AppUpdateNoteItem] {
+        guard let raw = model.latest.string("changelog", "changeLog", "description", "notes", "body") else {
+            return []
+        }
+        return appUpdateNoteItems(raw)
+    }
+
+    private var links: [IOSDownloadLink] { preferredIOSDownloadLinks(model.latest) }
+
     var body: some View {
-        Section("APP 最新版本") {
-            LabeledContent("当前版本", value: model.currentVersion)
+        let noteItems = notes
+        let downloadLinks = links
+        Section("版本信息") {
             if model.isLoading && model.latest.isEmpty {
                 HStack { ProgressView(); Text("正在检查新版本").foregroundStyle(.secondary) }
             } else if model.latest.isEmpty {
                 Text("暂未获取到版本信息").font(.caption).foregroundStyle(.secondary)
             } else {
-                HStack {
-                    LabeledContent("最新版本", value: model.latestVersion.isEmpty ? "未知" : model.latestVersion)
-                    if model.hasNewVersion { Text("可更新").font(.caption2.weight(.semibold)).foregroundStyle(HarvestTheme.coral) }
+                HStack(spacing: 11) {
+                    Image(systemName: model.hasNewVersion ? "arrow.down.app.fill" : "checkmark.seal.fill")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(model.hasNewVersion ? HarvestTheme.coral : HarvestTheme.green)
+                        .frame(width: 42, height: 42)
+                        .background(
+                            (model.hasNewVersion ? HarvestTheme.coral : HarvestTheme.green).opacity(0.10),
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        )
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(model.latestVersion.isEmpty ? "未知版本" : model.latestVersion)
+                            .font(.headline.monospacedDigit())
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.72)
+                        Text("当前版本 \(model.currentVersion)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 6)
+                    Text(model.hasNewVersion ? "可更新" : "已是最新")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(model.hasNewVersion ? HarvestTheme.coral : HarvestTheme.green)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(
+                            (model.hasNewVersion ? HarvestTheme.coral : HarvestTheme.green).opacity(0.10),
+                            in: Capsule()
+                        )
                 }
-                if let notes = model.latest.string("changelog", "changeLog", "description", "notes", "body"), !notes.isEmpty {
-                    Text(markdownAttributedString(notes)).font(.caption).textSelection(.enabled)
-                }
-                ForEach(model.latestLinks) { link in
+            }
+        }
+
+        if !noteItems.isEmpty {
+            Section("更新内容") {
+                AppUpdateNotesView(items: noteItems)
+            }
+        }
+
+        Section("安装包") {
+            if !model.latest.isEmpty {
+                ForEach(downloadLinks) { link in
                     AppUpdateLinkRow(model: model, release: model.latest, link: link)
                 }
-                if model.latestLinks.isEmpty {
+                if downloadLinks.isEmpty {
                     Text("当前版本未提供可识别的 iOS/IPA 下载地址").font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -2118,9 +2392,17 @@ private struct AppUpdateHistorySection: View {
                             }
                         }
                         if let notes = version.string("changelog", "changeLog", "description", "notes", "body"), !notes.isEmpty {
-                            Text(markdownAttributedString(notes)).font(.caption).foregroundStyle(.secondary).lineLimit(6)
+                            let items = appUpdateNoteItems(notes)
+                            if items.isEmpty {
+                                Text(markdownAttributedString(notes))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(4)
+                            } else {
+                                AppUpdateNotesView(items: items, collapsedLimit: 3)
+                            }
                         }
-                        ForEach(iosDownloadLinks(version)) { link in
+                        ForEach(preferredIOSDownloadLinks(version)) { link in
                             AppUpdateLinkRow(model: model, release: version, link: link)
                         }
                     }
