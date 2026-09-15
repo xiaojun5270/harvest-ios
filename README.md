@@ -11,10 +11,11 @@ and uses version `2026.0915.02` with build `292`, so it can be signed as the nex
 update of the existing iOS app. Do not install a Flutter and native archive with
 the same bundle identifier side by side.
 
-## 更新记录
+## 代码更新记录
 
-后续每次版本更新均在此处按时间倒序记录，内容以用户可见的功能和修复为主，
-不堆叠提交哈希或框架迁移明细。
+后续每次代码修改完成后均同步更新此处，无论是否调整版本号。同一发布版本的
+改动持续追加到对应版本下，并按时间倒序排列；内容说明本次具体新增、修改、
+优化或修复了什么，不堆叠提交哈希和无意义的内部日志。
 
 ### 2026.0915.02 (292) - 2026-09-15
 
@@ -26,6 +27,7 @@ the same bundle identifier side by side.
 - 站点刷新、签到、辅种及任务手动执行优先显示服务端实际返回信息，后端未
   返回消息时才使用本地兜底文案。
 - 服务端返回信息支持完整多行显示，操作结果在原停留时长基础上延长 2 秒。
+- README 改为随每次代码修改同步维护，持续记录每次实际变更内容。
 - App、收割机助手 Safari 扩展和 CookieCloud Safari 扩展的版本统一同步至
   `2026.0915.02 (292)`。
 
