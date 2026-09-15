@@ -2094,7 +2094,7 @@ final class AppState: ObservableObject {
         manualTaskOrder.append(id)
         manualTaskFeedback = feedback
         Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: .seconds(4))
             self?.removeManualTask(id)
         }
     }
@@ -2224,7 +2224,15 @@ final class AppState: ObservableObject {
             return
         }
         manualTaskFeedback = feedback
-        let delay: Duration = phase == .failure ? .milliseconds(1_500) : .milliseconds(1_050)
+        let delay: Duration
+        switch phase {
+        case .success:
+            delay = .milliseconds(3_050)
+        case .failure:
+            delay = .milliseconds(3_500)
+        case .running, .cancelled:
+            delay = .milliseconds(1_050)
+        }
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: delay)
             self?.removeManualTask(id)

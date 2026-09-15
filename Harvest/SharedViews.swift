@@ -2115,13 +2115,12 @@ struct ManualTaskFeedbackOverlay: View {
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.white)
                     .multilineTextAlignment(.leading)
-                    .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 18)
             .padding(.vertical, 13)
-            .frame(maxWidth: 310)
+            .frame(maxWidth: 350)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .background(color.opacity(0.66), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay {
@@ -2135,7 +2134,7 @@ struct ManualTaskFeedbackOverlay: View {
             .accessibilityAddTraits(feedback.phase == .running ? .updatesFrequently : [])
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 48)
+        .padding(.horizontal, 28)
         .allowsHitTesting(false)
         .onAppear {
             withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {

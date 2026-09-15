@@ -2103,6 +2103,23 @@ private func appUpdateNoteItems(_ raw: String) -> [AppUpdateNoteItem] {
             continue
         }
 
+        let headingDepth = line.prefix(while: { $0 == "#" }).count
+        let headingBody = line.dropFirst(headingDepth)
+        let isMarkdownHeading = headingDepth > 0 && headingBody.first?.isNumber != true
+        if isMarkdownHeading {
+            let heading = headingBody.trimmingCharacters(in: .whitespacesAndNewlines)
+            if heading.contains("新增") {
+                currentKind = .feature
+            } else if heading.contains("修复") {
+                currentKind = .fix
+            } else if heading.contains("性能") || heading.contains("优化") {
+                currentKind = .performance
+            } else {
+                currentKind = .other
+            }
+            continue
+        }
+
         line = noticeReplacingMatches("^\\s*[-*•]+\\s*", in: line, template: "")
         var kind = currentKind
         if let colon = line.firstIndex(of: ":") {

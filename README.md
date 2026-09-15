@@ -7,9 +7,33 @@ Open `Harvest.xcodeproj` with Xcode 26 or later, choose a development team, and
 run the `Harvest` scheme. The backend API is shared with the Flutter client.
 
 The native target keeps the production bundle identifier `com.ptools.harvest`
-and uses version `2026.0915.01` with build `290`, so it can be signed as the next
+and uses version `2026.0915.02` with build `292`, so it can be signed as the next
 update of the existing iOS app. Do not install a Flutter and native archive with
 the same bundle identifier side by side.
+
+## 更新记录
+
+后续每次版本更新均在此处按时间倒序记录，内容以用户可见的功能和修复为主，
+不堆叠提交哈希或框架迁移明细。
+
+### 2026.0915.02 (292) - 2026-09-15
+
+- 执行详情改为结构化摘要，分开展示站点统计、流量、失败原因和成功站点，
+  并移除原始 JSON 记录。
+- 消息详情过滤重复的简略成功记录，保留耗时、部分数据未更新和失败原因。
+- 更新页面重新设计版本摘要、更新内容和安装包区域；更新日志按新增、修复、
+  优化和调整分类，并过滤 Markdown 空标题与提交哈希。
+- 站点刷新、签到、辅种及任务手动执行优先显示服务端实际返回信息，后端未
+  返回消息时才使用本地兜底文案。
+- 服务端返回信息支持完整多行显示，操作结果在原停留时长基础上延长 2 秒。
+- App、收割机助手 Safari 扩展和 CookieCloud Safari 扩展的版本统一同步至
+  `2026.0915.02 (292)`。
+
+### 2026.0915.01 (290) - 2026-09-15
+
+- 对照 Flutter 版本完成增量审查；该批变更仅涉及 Flutter 组件兼容调整，
+  原生端接口、数据模型和移动端工作流无需变更。
+- App 与两个 Safari 扩展的版本统一同步至 `2026.0915.01 (290)`。
 
 ## Native stack
 
