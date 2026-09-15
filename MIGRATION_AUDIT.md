@@ -1,6 +1,6 @@
 # iOS Native Migration Audit
 
-Audit date: 2026-08-13
+Audit date: 2026-09-15
 
 Reference: the Flutter implementation in the parent repository and its active
 UI/service call sites.
@@ -20,6 +20,15 @@ An authoritative 1:1 result still requires an Xcode 26 build, API integration
 pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
+
+- The Flutter delta from `9257e64c` through release `6803c5e1` was rechecked.
+  Its September changes migrate Flutter-only dependencies and APIs
+  (`shadcn_flutter`, `liquid_glass_easy`, `file_picker`, generated Riverpod/
+  Freezed code, and desktop context menus) without changing active backend
+  contracts, source data-model fields, or mobile product workflows. Native iOS
+  already uses SwiftUI dialogs, menus/context menus, `fileImporter`, and native
+  Liquid Glass, so no compatibility shim was ported. The native marketing
+  version and build are synchronized to Flutter at `2026.0915.01+290`.
 
 - Torrent filtering now mirrors Flutter's mobile semantics instead of relying
   on broad status-string matches: queued downloads remain under downloading,

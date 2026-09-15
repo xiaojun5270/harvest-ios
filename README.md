@@ -7,9 +7,9 @@ Open `Harvest.xcodeproj` with Xcode 26 or later, choose a development team, and
 run the `Harvest` scheme. The backend API is shared with the Flutter client.
 
 The native target keeps the production bundle identifier `com.ptools.harvest`
-and uses build `291`, so it can be signed as the next update of the existing iOS
-app. Do not install a Flutter and native archive with the same bundle identifier
-side by side.
+and uses version `2026.0915.01` with build `290`, so it can be signed as the next
+update of the existing iOS app. Do not install a Flutter and native archive with
+the same bundle identifier side by side.
 
 ## Native stack
 
