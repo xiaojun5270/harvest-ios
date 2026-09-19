@@ -1,6 +1,6 @@
 # iOS Native Migration Audit
 
-Audit date: 2026-09-15
+Audit date: 2026-09-19
 
 Reference: the Flutter implementation in the parent repository and its active
 UI/service call sites.
@@ -20,6 +20,15 @@ An authoritative 1:1 result still requires an Xcode 26 build, API integration
 pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
+
+- The Flutter delta from `462ad326` through release `c510eeaa` was reviewed.
+  Android build fixes and Flutter Material/shadcn menu changes do not apply to
+  the native target. Native SwiftUI already uses the Scene lifecycle, restores
+  notice state and the system badge when becoming active, provides native
+  long-press context menus, uses primary text colors for site cards, and keeps
+  the site editor compact. Notice list/detail titles now explicitly use the
+  primary foreground color for dark-mode parity. All native app and Safari
+  extension configurations are synchronized to `2026.0918.01+294`.
 
 - The Flutter delta from `6803c5e1` through release `462ad326` was reviewed.
   It only changes Android build tooling and the Flutter iOS CocoaPods/SPM

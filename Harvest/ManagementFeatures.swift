@@ -10,6 +10,7 @@ struct NoticeItem: Identifiable, Hashable {
     let serverID: Int
     var title: String
     var content: String
+    var preview: String
     var category: String
     var createdAt: String
     var url: String
@@ -23,7 +24,9 @@ struct NoticeItem: Identifiable, Hashable {
     init(_ json: [String: Any]) {
         serverID = json.int("id") ?? 0
         title = json.string("title", "subject", "name") ?? "系统消息"
-        content = json.string("content", "message", "text", "body") ?? ""
+        let resolvedContent = json.string("content", "message", "text", "body") ?? ""
+        content = resolvedContent
+        preview = noticePreviewText(resolvedContent)
         category = json.string("category", "type", "level") ?? "通知"
         createdAt = json.string("created_at", "create_time", "created", "updated_at", "update_time", "updated", "time", "date") ?? ""
         url = json.string("url", "link") ?? ""
@@ -58,6 +61,9 @@ struct NoticeView: View {
                         ForEach(notices) { notice in
                             Button { selectedNotice = notice } label: { NoticeRow(item: notice) }
                                 .buttonStyle(.plain)
+                                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
                                 .swipeActions(edge: .leading) {
                                     if !notice.read {
                                         Button { Task { await markRead(notice) } } label: { Label("已读", systemImage: "checkmark") }.tint(HarvestTheme.green)
@@ -69,10 +75,13 @@ struct NoticeView: View {
                         }
                     }
                     .listStyle(.plain)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(uiColor: .systemGroupedBackground))
                     .refreshable { await load() }
                 }
             }
             .navigationTitle("消息")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } }
                 ToolbarItemGroup(placement: .confirmationAction) {
@@ -195,6 +204,7 @@ struct NoticeView: View {
             [
                 "id": notice.serverID,
                 "title": notice.title,
+                "content": notice.content,
                 "category": notice.category,
                 "created_at": notice.createdAt,
                 "url": notice.url,
@@ -309,34 +319,50 @@ struct NoticeDetailSheet: View {
     }
 
     private var noticeHeader: some View {
-        HStack(alignment: .center, spacing: 10) {
-            Image(systemName: isRead ? "bell" : "bell.fill")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(isRead ? Color.secondary : HarvestTheme.coral)
-                .frame(width: 34, height: 34)
-                .background(
-                    (isRead ? Color.secondary : HarvestTheme.coral).opacity(0.11),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-            VStack(alignment: .leading, spacing: 4) {
-                Text(notice.title)
-                    .font(.headline)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                HStack(spacing: 7) {
-                    Text(notice.category)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(HarvestTheme.blue)
-                    Label(notice.createdAt, systemImage: "clock")
-                        .font(.caption2)
+        let accent = isRead ? Color.secondary : HarvestTheme.coral
+        return VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 11) {
+                Image(systemName: isRead ? "envelope.open.fill" : "envelope.badge.fill")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(accent)
+                    .frame(width: 40, height: 40)
+                    .background(accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(notice.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("消息通知")
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.70)
                 }
+                Spacer(minLength: 8)
+                Text(isRead ? "已读" : "未读")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(accent)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(accent.opacity(0.10), in: Capsule())
             }
+
+            Divider()
+            HStack(spacing: 8) {
+                Label(notice.category, systemImage: "tag.fill")
+                Spacer(minLength: 8)
+                Label(notice.createdAt, systemImage: "clock")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.70)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        .padding(10)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(accent.opacity(0.13), lineWidth: 0.8)
+        }
     }
 
     private var noticeContent: some View {
@@ -365,23 +391,27 @@ private struct NoticeTaskReport {
 
 private struct NoticeTaskReportView: View {
     let report: NoticeTaskReport
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 7), count: 4)
+    @State private var showsSuccessfulSites = false
+    private let columns = [GridItem(.flexible()), GridItem(.flexible())]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            LazyVGrid(columns: columns, spacing: 7) {
-                metric("站点", report.siteCount, icon: "globe", color: HarvestTheme.blue)
-                metric("成功", report.successCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
-                metric("失败", report.failureCount, icon: "xmark.circle.fill", color: HarvestTheme.coral)
-                metric("耗时", report.duration, icon: "timer", color: HarvestTheme.amber)
+        VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: columns, spacing: 8) {
+                NoticeSummaryMetricTile(title: "站点数", value: report.siteCount, icon: "square.grid.2x2.fill", color: HarvestTheme.blue)
+                NoticeSummaryMetricTile(title: "成功", value: report.successCount, icon: "checkmark.circle.fill", color: HarvestTheme.green)
+                NoticeSummaryMetricTile(title: "失败", value: report.failureCount, icon: "exclamationmark.circle.fill", color: HarvestTheme.coral)
+                NoticeSummaryMetricTile(title: "耗时", value: report.duration, icon: "timer", color: HarvestTheme.purple)
             }
 
             if !report.failures.isEmpty {
                 NoticeResultGroup(
                     title: "失败站点",
                     entries: report.failures,
-                    icon: "xmark.circle.fill",
-                    color: HarvestTheme.coral
+                    countText: report.failureCount,
+                    icon: "exclamationmark.triangle.fill",
+                    color: HarvestTheme.coral,
+                    collapsedLimit: report.failures.count,
+                    expanded: .constant(true)
                 )
             }
 
@@ -389,34 +419,44 @@ private struct NoticeTaskReportView: View {
                 NoticeResultGroup(
                     title: "成功站点",
                     entries: report.successes,
+                    countText: report.successCount,
                     icon: "checkmark.circle.fill",
-                    color: HarvestTheme.green
+                    color: HarvestTheme.green,
+                    collapsedLimit: 0,
+                    expanded: $showsSuccessfulSites
                 )
             }
         }
-        .padding(12)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
+}
 
-    private func metric(_ title: String, _ value: String, icon: String, color: Color) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(color)
+private struct NoticeSummaryMetricTile: View {
+    let title: String
+    let value: String
+    let icon: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(color)
+                .frame(width: 31, height: 31)
+                .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.caption2.weight(.medium))
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
+                Text(value.isEmpty ? "-" : value)
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
                     .lineLimit(1)
+                    .minimumScaleFactor(0.64)
             }
-            Text(value.isEmpty ? "-" : value)
-                .font(.subheadline.weight(.semibold).monospacedDigit())
-                .lineLimit(1)
-                .minimumScaleFactor(0.62)
+            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
-        .padding(.horizontal, 8)
-        .background(color.opacity(0.075), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+        .padding(.horizontal, 10)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
     }
 }
 
@@ -435,17 +475,22 @@ private struct NoticeDailyDataReport {
 
 private struct NoticeDailyDataReportView: View {
     let report: NoticeDailyDataReport
+    @State private var showsAllEntries = false
+
+    private var visibleEntries: [NoticeDailyDataEntry] {
+        Array(report.entries.prefix(showsAllEntries ? report.entries.count : 8))
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                trafficMetric(
+        VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                NoticeSummaryMetricTile(
                     title: "总上传",
                     value: report.totalUpload,
                     icon: "arrow.up",
                     color: HarvestTheme.green
                 )
-                trafficMetric(
+                NoticeSummaryMetricTile(
                     title: "总下载",
                     value: report.totalDownload,
                     icon: "arrow.down",
@@ -466,72 +511,65 @@ private struct NoticeDailyDataReportView: View {
                     .foregroundStyle(HarvestTheme.blue)
                     .padding(.bottom, 8)
 
-                    ForEach(Array(report.entries.enumerated()), id: \.offset) { index, entry in
-                        HStack(spacing: 10) {
+                    ForEach(Array(visibleEntries.enumerated()), id: \.offset) { index, entry in
+                        HStack(spacing: 9) {
                             Image(systemName: entry.direction == "下载" ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
                                 .foregroundStyle(entry.direction == "下载" ? HarvestTheme.blue : HarvestTheme.green)
+                                .frame(width: 20)
                             Text(entry.site)
                                 .font(.subheadline.weight(.medium))
                                 .lineLimit(1)
                             Spacer(minLength: 8)
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(entry.amount)
-                                    .font(.subheadline.weight(.semibold).monospacedDigit())
-                                    .lineLimit(1)
-                                    .minimumScaleFactor(0.72)
-                                Text(entry.direction)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Text(entry.amount)
+                                .font(.subheadline.weight(.semibold).monospacedDigit())
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                            Text(entry.direction)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
                         }
-                        .padding(.vertical, 9)
-                        if index < report.entries.count - 1 {
-                            Divider().padding(.leading, 28)
+                        .padding(.vertical, 8)
+                        if index < visibleEntries.count - 1 {
+                            Divider().padding(.leading, 29)
                         }
                     }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(HarvestTheme.blue.opacity(0.045), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(HarvestTheme.blue.opacity(0.12), lineWidth: 0.8)
-                }
-            }
-        }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
 
-    private func trafficMetric(title: String, value: String, icon: String, color: Color) -> some View {
-        HStack(spacing: 9) {
-            Image(systemName: icon)
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(color)
-                .frame(width: 32, height: 32)
-                .background(color.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(value.isEmpty ? "-" : value)
-                    .font(.subheadline.weight(.semibold).monospacedDigit())
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
+                    if report.entries.count > 8 {
+                        Divider()
+                        Button {
+                            withAnimation(.snappy) { showsAllEntries.toggle() }
+                        } label: {
+                            HStack {
+                                Text(showsAllEntries ? "收起" : "查看全部 \(report.entries.count) 项")
+                                Spacer()
+                                Image(systemName: showsAllEntries ? "chevron.up" : "chevron.down")
+                            }
+                            .font(.caption.weight(.semibold))
+                            .padding(.top, 10)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(HarvestTheme.blue)
+                    }
+                }
+                .padding(13)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
-            Spacer(minLength: 0)
         }
-        .frame(maxWidth: .infinity, minHeight: 54)
-        .padding(.horizontal, 10)
-        .background(color.opacity(0.065), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
     }
 }
 
 private struct NoticeResultGroup: View {
     let title: String
     let entries: [String]
+    let countText: String
     let icon: String
     let color: Color
+    let collapsedLimit: Int
+    @Binding var expanded: Bool
+
+    private var visibleEntries: [String] {
+        Array(entries.prefix(expanded ? entries.count : collapsedLimit))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -539,20 +577,24 @@ private struct NoticeResultGroup: View {
                 Image(systemName: icon)
                 Text(title)
                 Spacer()
-                Text("\(entries.count)")
+                Text(countText.isEmpty ? "\(entries.count)" : countText)
                     .font(.caption.weight(.semibold).monospacedDigit())
             }
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(color)
-            .padding(.bottom, 8)
 
-            ForEach(Array(entries.enumerated()), id: \.offset) { index, entry in
+            ForEach(Array(visibleEntries.enumerated()), id: \.offset) { index, entry in
                 let parts = noticeResultParts(entry)
+                if index == 0 { Divider().padding(.top, 9) }
                 HStack(alignment: .top, spacing: 9) {
-                    Image(systemName: icon)
-                        .font(.caption)
-                        .foregroundStyle(color)
-                        .padding(.top, 3)
+                    Circle()
+                        .fill(color.opacity(0.12))
+                        .frame(width: 26, height: 26)
+                        .overlay {
+                            Image(systemName: icon)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(color)
+                        }
                     VStack(alignment: .leading, spacing: 3) {
                         Text(parts.title)
                             .font(.subheadline.weight(.semibold))
@@ -567,17 +609,33 @@ private struct NoticeResultGroup: View {
                         .textSelection(.enabled)
                 }
                 .padding(.vertical, 9)
-                if index < entries.count - 1 {
-                    Divider().padding(.leading, 23)
+                if index < visibleEntries.count - 1 {
+                    Divider().padding(.leading, 35)
                 }
             }
+
+            if entries.count > collapsedLimit {
+                if !visibleEntries.isEmpty { Divider() }
+                Button {
+                    withAnimation(.snappy) { expanded.toggle() }
+                } label: {
+                    HStack {
+                        Text(expanded ? "收起" : "查看 \(entries.count) 条明细")
+                        Spacer()
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.top, 10)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(color)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(color.opacity(0.055), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(13)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(color.opacity(0.14), lineWidth: 0.8)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(color.opacity(0.12), lineWidth: 0.8)
         }
     }
 }
@@ -708,8 +766,13 @@ private func noticeResultParts(_ entry: String) -> (title: String, detail: Strin
         guard let markerRange = entry.range(of: marker) else { continue }
         let title = String(entry[..<markerRange.lowerBound])
             .trimmingCharacters(in: titleTrimCharacters)
-        let detail = String(entry[markerRange.lowerBound...])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var detail = String(entry[markerRange.upperBound...])
+            .trimmingCharacters(in: titleTrimCharacters)
+        detail = noticeReplacingMatches(
+            "耗时\\s*[:：]?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*秒",
+            in: detail,
+            template: "耗时 $1 秒"
+        )
         if !title.isEmpty { return (title, detail) }
     }
     guard let separator = entry.firstIndex(where: { $0.isWhitespace }) else {
@@ -782,30 +845,107 @@ private func formattedNoticeContent(_ rawContent: String) -> String {
 
 struct NoticeRow: View {
     let item: NoticeItem
+
+    private var accent: Color { item.read ? .secondary : HarvestTheme.coral }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Circle()
-                .fill(item.read ? Color.secondary.opacity(0.10) : HarvestTheme.coral.opacity(0.14))
-                .frame(width: 38, height: 38)
-                .overlay {
-                    Image(systemName: item.read ? "bell" : "bell.fill")
-                        .foregroundStyle(item.read ? .secondary : HarvestTheme.coral)
-                }
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text(item.title).font(.subheadline.weight(item.read ? .regular : .semibold))
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: item.read ? "envelope.open.fill" : "envelope.badge.fill")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(accent)
+                .frame(width: 42, height: 42)
+                .background(accent.opacity(0.11), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Text(item.title)
+                        .font(.subheadline.weight(item.read ? .regular : .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
                     Spacer()
-                    Text(item.category).font(.caption2).foregroundStyle(.secondary)
+                    if !item.category.isEmpty && item.category != "通知" {
+                        Text(item.category)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(accent)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(accent.opacity(0.09), in: Capsule())
+                    }
                 }
-                Text(markdownAttributedString(item.content, inlineOnly: true))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                Text(item.createdAt).font(.caption2).foregroundStyle(.tertiary)
+                if !item.preview.isEmpty {
+                    Text(item.preview)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineSpacing(2)
+                        .lineLimit(2)
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: "clock")
+                    Text(item.createdAt)
+                    if !item.read {
+                        Spacer()
+                        Circle()
+                            .fill(HarvestTheme.coral)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
             }
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 14)
         }
-        .padding(.vertical, 5)
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(accent.opacity(item.read ? 0.08 : 0.15), lineWidth: 0.8)
+        }
     }
+}
+
+private func noticePreviewText(_ content: String) -> String {
+    let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
+    if normalized.contains("失败站点") || normalized.contains("成功站点") {
+        let values = [
+            noticeReportCapture("站点数\\s*[:：]\\s*(\\d+)", in: normalized),
+            noticeReportCapture("成功\\s*[:：]\\s*(\\d+)", in: normalized),
+            noticeReportCapture("失败\\s*[:：]\\s*(\\d+)", in: normalized),
+            noticeReportCapture("耗时\\s*[:：]\\s*([0-9.]+\\s*秒)", in: normalized)
+        ]
+        let labels = ["站点", "成功", "失败", "耗时"]
+        let summary = zip(labels, values).compactMap { label, value in
+            value.isEmpty ? nil : "\(label) \(value)"
+        }
+        if !summary.isEmpty { return summary.joined(separator: " · ") }
+    }
+    if normalized.contains("今日数据") {
+        let values = [
+            noticeReportCapture("总上传\\s*[:：]\\s*([0-9]+(?:\\.[0-9]+)?\\s*(?:[KMGTPE]?i?B|B))", in: normalized),
+            noticeReportCapture("总下载\\s*[:：]\\s*([0-9]+(?:\\.[0-9]+)?\\s*(?:[KMGTPE]?i?B|B))", in: normalized)
+        ]
+        let labels = ["上传", "下载"]
+        let summary = zip(labels, values).compactMap { label, value in
+            value.isEmpty ? nil : "\(label) \(value)"
+        }
+        if !summary.isEmpty { return summary.joined(separator: " · ") }
+    }
+
+    var content = normalized
+    content = noticeReplacingMatches("(?m)^\\s{0,3}#{1,6}\\s*", in: content, template: "")
+    content = noticeReplacingMatches("(?m)^\\s*[>\\-*•]+\\s*", in: content, template: "")
+    content = content
+        .replacingOccurrences(of: "**", with: "")
+        .replacingOccurrences(of: "__", with: "")
+        .replacingOccurrences(of: "`", with: "")
+    return content
+        .components(separatedBy: .newlines)
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .prefix(2)
+        .joined(separator: " · ")
 }
 
 struct SettingsView: View {

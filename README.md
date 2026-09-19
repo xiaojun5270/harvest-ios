@@ -7,7 +7,7 @@ Open `Harvest.xcodeproj` with Xcode 26 or later, choose a development team, and
 run the `Harvest` scheme. The backend API is shared with the Flutter client.
 
 The native target keeps the production bundle identifier `com.ptools.harvest`
-and uses version `2026.0915.02` with build `292`, so it can be signed as the next
+and uses version `2026.0918.01` with build `294`, so it can be signed as the next
 update of the existing iOS app. Do not install a Flutter and native archive with
 the same bundle identifier side by side.
 
@@ -16,6 +16,20 @@ the same bundle identifier side by side.
 后续每次代码修改完成后均同步更新此处，无论是否调整版本号。同一发布版本的
 改动持续追加到对应版本下，并按时间倒序排列；内容说明本次具体新增、修改、
 优化或修复了什么，不堆叠提交哈希和无意义的内部日志。
+
+### 2026.0918.01 (294) - 2026-09-18
+
+- 修复消息历史与消息详情标题在深色模式下可能继承错误颜色的问题。
+- 重新设计消息列表卡片、结构化预览和消息详情；任务与今日数据消息统一采用
+  执行详情的两列指标和可展开明细布局，避免大量记录一次性铺满页面。
+- 消息缓存补齐正文内容，离线或后台刷新期间仍可查看完整预览和详情。
+- 主导航品牌图标改为放大圆形裁切，使图标内容填满 Liquid Glass 圆形入口。
+- 复核 iOS 27 Scene 生命周期和角标同步：原生端已使用 SwiftUI `WindowGroup`
+  与系统通知角标 API，前台恢复时会重新同步通知，无需引入 Flutter 专属代理。
+- 复核移动端站点长按菜单、站点名称深色模式、账号弹层宽度及站点编辑密度；
+  原生 SwiftUI 实现已满足对应行为，无需重复引入 Flutter 组件修复代码。
+- App、收割机助手 Safari 扩展和 CookieCloud Safari 扩展的版本统一同步至
+  `2026.0918.01 (294)`。
 
 ### 2026.0915.02 (292) - 2026-09-15
 

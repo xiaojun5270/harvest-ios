@@ -1911,7 +1911,11 @@ struct MainShellView: View {
             .toolbar(appState.selectedTab == 5 ? .hidden : .visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    BrandMark(size: 28)
+                    BrandMark(size: 38)
+                        .scaleEffect(1.16)
+                        .frame(width: 38, height: 38)
+                        .clipShape(Circle())
+                        .contentShape(Circle())
                         .accessibilityHidden(true)
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
