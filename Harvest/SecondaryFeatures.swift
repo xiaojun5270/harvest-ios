@@ -4055,6 +4055,7 @@ struct SearchSettingsSheet: View {
     @State private var maxCount: Int
     @State private var sitesEnabled: Bool
     @State private var selectedSiteIDs: Set<Int>
+    @State private var siteFilter = ""
     @State private var isReloading = false
     @State private var didSave = false
 
@@ -4073,6 +4074,24 @@ struct SearchSettingsSheet: View {
     private let siteColumns = [
         GridItem(.adaptive(minimum: 86, maximum: 150), spacing: 8, alignment: .leading)
     ]
+
+    private var filteredSites: [SiteItem] {
+        let query = normalizedSiteFilter(siteFilter)
+        guard !query.isEmpty else { return model.sites }
+        return model.sites.filter { site in
+            let values = [
+                site.name,
+                site.siteKey,
+                site.url,
+                site.rss,
+                site.torrentsURL,
+                URL(string: site.url)?.host ?? "",
+                URL(string: site.rss)?.host ?? "",
+                URL(string: site.torrentsURL)?.host ?? ""
+            ]
+            return values.contains { normalizedSiteFilter($0).contains(query) }
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -4147,14 +4166,44 @@ struct SearchSettingsSheet: View {
                             ) { persistDraft() }
                         }
 
+                        HStack(spacing: 8) {
+                            Image(systemName: "line.3.horizontal.decrease")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            TextField("筛选名称、域名或昵称", text: $siteFilter)
+                                .font(.caption)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if !siteFilter.isEmpty {
+                                Button { siteFilter = "" } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("清空站点筛选")
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .frame(height: 36)
+                        .background(Color(uiColor: .systemBackground), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+                        }
+
                         if model.sites.isEmpty {
                             Text(isReloading ? "正在加载站点" : "没有可搜索的存活站点")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, minHeight: 100)
+                        } else if filteredSites.isEmpty {
+                            Text("没有匹配“\(siteFilter.trimmingCharacters(in: .whitespacesAndNewlines))”的站点")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, minHeight: 100)
                         } else {
                             LazyVGrid(columns: siteColumns, alignment: .leading, spacing: 8) {
-                                ForEach(model.sites) { site in
+                                ForEach(filteredSites) { site in
                                     Button {
                                         sitesEnabled = true
                                         if selectedSiteIDs.contains(site.id) {
@@ -4244,6 +4293,13 @@ struct SearchSettingsSheet: View {
         model.selectedSiteIDs = selectedSiteIDs
         model.saveSettings()
         didSave = true
+    }
+
+    private func normalizedSiteFilter(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
     }
 }
 
@@ -4339,6 +4395,17 @@ private struct ResourceResultRow: View {
     }
 }
 
+private func cjkCharacterCount(_ value: String) -> Int {
+    value.unicodeScalars.reduce(into: 0) { count, scalar in
+        switch scalar.value {
+        case 0x3400...0x4DBF, 0x4E00...0x9FFF:
+            count += 1
+        default:
+            break
+        }
+    }
+}
+
 struct ResourceRowItem: View {
     @EnvironmentObject private var appState: AppState
     let item: [String: Any]
@@ -4348,16 +4415,24 @@ struct ResourceRowItem: View {
     private var imageCandidates: [RemoteImageCandidate] {
         resourceImageCandidates(item, site: site, appState: appState)
     }
-    private var title: String {
-        let value = item.string("title", "name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return value.isEmpty ? "未命名资源" : value
+    private var rawTitle: String {
+        item.string("title", "name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
-    private var subtitle: String {
+    private var rawSubtitle: String {
         item.string("subtitle", "sub_title", "description")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    private var displayTitles: (title: String, subtitle: String) {
+        if rawTitle.isEmpty { return rawSubtitle.isEmpty ? ("未命名资源", "") : (rawSubtitle, "") }
+        guard !rawSubtitle.isEmpty else { return (rawTitle, "") }
+        guard rawTitle != rawSubtitle else { return (rawTitle, "") }
+        return cjkCharacterCount(rawSubtitle) > cjkCharacterCount(rawTitle)
+            ? (rawSubtitle, rawTitle)
+            : (rawTitle, rawSubtitle)
     }
 
     var body: some View {
         let badges = cardBadges
+        let titles = displayTitles
 
         HStack(alignment: .top, spacing: 9) {
             CachedRemoteImageCandidates(
@@ -4367,7 +4442,7 @@ struct ResourceRowItem: View {
                     image.resizable().scaledToFill()
                 },
                 placeholder: {
-                    resourcePosterPlaceholder(title: title, category: nil)
+                    resourcePosterPlaceholder(title: titles.title, category: nil)
                 }
             )
             .frame(width: 70, height: 104)
@@ -4387,7 +4462,7 @@ struct ResourceRowItem: View {
                     .frame(height: 15, alignment: .leading)
                 }
 
-                Text(title)
+                Text(titles.title)
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(2)
@@ -4458,6 +4533,7 @@ struct ResourceRowItem: View {
         var values: [String] = []
         let site = siteLabel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !site.isEmpty { values.append(site) }
+        let subtitle = displayTitles.subtitle
         if !subtitle.isEmpty { values.append(subtitle) }
         return values.joined(separator: " | ")
     }
@@ -4496,7 +4572,7 @@ struct ResourceRowItem: View {
 
     private var cardBadges: [(text: String, tint: Color)] {
         let sourceLabels = item.strings("tags", "labels").joined(separator: " ")
-        let source = "\(title) \(subtitle) \(sourceLabels)".uppercased()
+        let source = "\(rawTitle) \(rawSubtitle) \(sourceLabels)".uppercased()
         var values: [(String, Color)] = []
         var seen = Set<String>()
 

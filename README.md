@@ -7,7 +7,7 @@ Open `Harvest.xcodeproj` with Xcode 26 or later, choose a development team, and
 run the `Harvest` scheme. The backend API is shared with the Flutter client.
 
 The native target keeps the production bundle identifier `com.ptools.harvest`
-and uses version `2026.0918.01` with build `294`, so it can be signed as the next
+and uses version `2026.0928.01` with build `295`, so it can be signed as the next
 update of the existing iOS app. Do not install a Flutter and native archive with
 the same bundle identifier side by side.
 
@@ -16,6 +16,19 @@ the same bundle identifier side by side.
 后续每次代码修改完成后均同步更新此处，无论是否调整版本号。同一发布版本的
 改动持续追加到对应版本下，并按时间倒序排列；内容说明本次具体新增、修改、
 优化或修复了什么，不堆叠提交哈希和无意义的内部日志。
+
+### 2026.0928.01 (295) - 2026-09-28
+
+- 资源搜索结果按标题与副标题的中日韩字符数量自动选择主标题，中文更多的
+  文本优先加粗显示，另一条固定作为弱化副标题。
+- 搜索设置新增站点筛选框，支持按站点名称、代码、昵称及镜像、RSS、种子页
+  域名筛选；筛选仅影响当前展示，全选、随机和保存仍作用于完整站点集合。
+- 新增、编辑下载器以及分类、标签、工具管理在移动端固定使用大尺寸 sheet，
+  并显示拖动指示器，避免管理表单空间不足或无法完整操作。
+- 复核下载器编辑、参数设置、选择下载器与暗黑模式样式；原生 SwiftUI 已使用
+  系统表单、主题前景色和原生 sheet，无需引入 Flutter Material/shadcn 重构代码。
+- App、收割机助手 Safari 扩展和 CookieCloud Safari 扩展的版本统一同步至
+  `2026.0928.01 (295)`。
 
 ### 2026.0918.01 (294) - 2026-09-18
 

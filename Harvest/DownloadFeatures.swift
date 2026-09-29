@@ -2197,7 +2197,12 @@ struct DownloadsView: View {
             )
             .environmentObject(appState)
         }
-        .sheet(isPresented: $showAddDownloader) { DownloaderEditorSheet { await model.load(appState) }.environmentObject(appState) }
+        .sheet(isPresented: $showAddDownloader) {
+            DownloaderEditorSheet { await model.load(appState) }
+                .environmentObject(appState)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(item: $torrentListDownloader) { downloader in
             NavigationStack {
                 TorrentListView(initialDownloader: downloader)
@@ -2209,9 +2214,19 @@ struct DownloadsView: View {
             }
             .environmentObject(appState)
         }
-        .sheet(item: $editingDownloader) { downloader in DownloaderEditorSheet(downloader: downloader) { await model.load(appState) }.environmentObject(appState) }
+        .sheet(item: $editingDownloader) { downloader in
+            DownloaderEditorSheet(downloader: downloader) { await model.load(appState) }
+                .environmentObject(appState)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(item: $settingsDownloader) { downloader in DownloaderSettingsSheet(downloader: downloader).environmentObject(appState) }
-        .sheet(item: $toolsDownloader) { downloader in DownloaderToolsSheet(downloader: downloader).environmentObject(appState) }
+        .sheet(item: $toolsDownloader) { downloader in
+            DownloaderToolsSheet(downloader: downloader)
+                .environmentObject(appState)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
         .sheet(isPresented: $showRefreshSettings) {
             DownloaderRefreshSettingsSheet(
                 enabled: $refreshEnabled,

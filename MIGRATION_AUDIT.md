@@ -1,6 +1,6 @@
 # iOS Native Migration Audit
 
-Audit date: 2026-09-19
+Audit date: 2026-09-29
 
 Reference: the Flutter implementation in the parent repository and its active
 UI/service call sites.
@@ -20,6 +20,14 @@ An authoritative 1:1 result still requires an Xcode 26 build, API integration
 pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
+
+- The Flutter delta from `c510eeaa` through release `5e3e3c09` was reviewed.
+  It contains no API, service, or data-model changes. Native resource search now
+  prioritizes the title with more CJK characters, search settings can filter
+  sites by name/code/nickname and configured URL hosts, and downloader tools use
+  a large mobile sheet. Flutter Material/shadcn migrations do not apply to the
+  native SwiftUI target. All app and Safari extension configurations are
+  synchronized to `2026.0928.01+295`.
 
 - The Flutter delta from `462ad326` through release `c510eeaa` was reviewed.
   Android build fixes and Flutter Material/shadcn menu changes do not apply to
