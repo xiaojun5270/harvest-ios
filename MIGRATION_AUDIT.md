@@ -1,6 +1,6 @@
 # iOS Native Migration Audit
 
-Audit date: 2026-09-29
+Audit date: 2026-09-30
 
 Reference: the Flutter implementation in the parent repository and its active
 UI/service call sites.
@@ -20,6 +20,21 @@ An authoritative 1:1 result still requires an Xcode 26 build, API integration
 pass, and device testing against a reachable Harvest server.
 
 ## Latest Corrections
+
+- The Flutter delta from `5e3e3c09` through release `96268b5e` was reviewed.
+  It only updates the Android AGP/Kotlin toolchain, refreshes Flutter dependency
+  locks, and removes waits on a shadcn menu-overlay close future that stalls on
+  Android. Native SwiftUI downloader menu actions update sheet state directly
+  and have no equivalent blocking path. No API, model, or product workflow
+  changes were introduced. All app and Safari extension configurations are
+  synchronized to `2026.0930.01+296`.
+
+- Native downloader presentation was aligned with Flutter after the delta
+  review: cards now show both address and torrent path, menu actions expose
+  parameter, speed, connection, category, and tag workflows separately, and
+  category/tag management uses dedicated large sheets. The editor preserves
+  sort order without exposing the Flutter-hidden field, while advanced settings
+  retain the same backend preferences API with user-facing labels only.
 
 - The Flutter delta from `c510eeaa` through release `5e3e3c09` was reviewed.
   It contains no API, service, or data-model changes. Native resource search now

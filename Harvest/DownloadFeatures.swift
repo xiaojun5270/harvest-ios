@@ -2087,6 +2087,26 @@ final class DownloadsViewModel: ObservableObject {
 
 }
 
+private enum DownloaderToolMode: String {
+    case connection
+    case categories
+    case tags
+
+    var title: String {
+        switch self {
+        case .connection: "连接检查"
+        case .categories: "分类管理"
+        case .tags: "标签管理"
+        }
+    }
+}
+
+private struct DownloaderToolPresentation: Identifiable {
+    let downloader: DownloaderItem
+    let mode: DownloaderToolMode
+    var id: String { "\(downloader.id)-\(mode.rawValue)" }
+}
+
 struct DownloadsView: View {
     @EnvironmentObject private var appState: AppState
     @StateObject private var model = DownloadsViewModel(includesTorrentData: false)
@@ -2099,7 +2119,8 @@ struct DownloadsView: View {
     @State private var torrentListDownloader: DownloaderItem?
     @State private var editingDownloader: DownloaderItem?
     @State private var settingsDownloader: DownloaderItem?
-    @State private var toolsDownloader: DownloaderItem?
+    @State private var speedSettingsDownloader: DownloaderItem?
+    @State private var toolPresentation: DownloaderToolPresentation?
     @State private var deletingDownloader: DownloaderItem?
     @State private var repeatingDownloader: DownloaderItem?
     @State private var showRefreshSettings = false
@@ -2136,7 +2157,16 @@ struct DownloadsView: View {
                                     },
                                     onEdit: { editingDownloader = downloader },
                                     onSettings: { settingsDownloader = downloader },
-                                    onTools: { toolsDownloader = downloader },
+                                    onSpeedSettings: { speedSettingsDownloader = downloader },
+                                    onConnection: {
+                                        toolPresentation = DownloaderToolPresentation(downloader: downloader, mode: .connection)
+                                    },
+                                    onCategories: {
+                                        toolPresentation = DownloaderToolPresentation(downloader: downloader, mode: .categories)
+                                    },
+                                    onTags: {
+                                        toolPresentation = DownloaderToolPresentation(downloader: downloader, mode: .tags)
+                                    },
                                     onToggle: { Task { await model.toggle(appState, downloader: downloader) } },
                                     onToggleBrush: { Task { await model.toggleBrush(appState, downloader: downloader) } },
                                     onRepeat: { repeatingDownloader = downloader },
@@ -2220,9 +2250,23 @@ struct DownloadsView: View {
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
         }
-        .sheet(item: $settingsDownloader) { downloader in DownloaderSettingsSheet(downloader: downloader).environmentObject(appState) }
-        .sheet(item: $toolsDownloader) { downloader in
-            DownloaderToolsSheet(downloader: downloader)
+        .sheet(item: $settingsDownloader) { downloader in
+            DownloaderSettingsSheet(downloader: downloader)
+                .environmentObject(appState)
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $speedSettingsDownloader) { downloader in
+            DownloaderSettingsSheet(
+                downloader: downloader,
+                initialSection: downloaderIsTransmission(downloader.category) ? "带宽设置" : "速度"
+            )
+            .environmentObject(appState)
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $toolPresentation) { presentation in
+            DownloaderToolsSheet(downloader: presentation.downloader, mode: presentation.mode)
                 .environmentObject(appState)
                 .presentationDetents([.large])
                 .presentationDragIndicator(.visible)
@@ -2668,7 +2712,10 @@ struct DownloaderCard: View {
     let onAddTorrent: () -> Void
     let onEdit: () -> Void
     let onSettings: () -> Void
-    let onTools: () -> Void
+    let onSpeedSettings: () -> Void
+    let onConnection: () -> Void
+    let onCategories: () -> Void
+    let onTags: () -> Void
     let onToggle: () -> Void
     let onToggleBrush: () -> Void
     let onRepeat: () -> Void
@@ -2693,7 +2740,7 @@ struct DownloaderCard: View {
                     size: 40
                 )
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(item.name).font(.headline).lineLimit(1)
+                    Text(item.name).font(.headline).foregroundStyle(.primary).lineLimit(1)
                     HStack(spacing: 6) {
                         Text(downloaderTypeName)
                         if !item.version.isEmpty { Text(item.version).monospacedDigit() }
@@ -2703,30 +2750,17 @@ struct DownloaderCard: View {
                 }
                 .layoutPriority(1)
                 Spacer(minLength: 4)
-                HStack(spacing: 4) {
-                    Image(systemName: "link")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(accentColor)
-                    Text(displayAddress)
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.6)
-                }
-                .frame(maxWidth: 160, alignment: .trailing)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("下载器地址 \(displayAddress)")
                 Menu {
                     Button(action: onOpenTorrents) { Label("种子列表", systemImage: "list.bullet.rectangle") }
                     Button(action: onAddTorrent) { Label("添加种子", systemImage: "link.badge.plus") }
                     Divider()
                     Button(action: onEdit) { Label("编辑", systemImage: "pencil") }
-                    Button(action: onSettings) { Label("下载器设置", systemImage: "slider.horizontal.3") }
-                    Button(action: onTools) {
-                        Label(
-                            isTransmission ? "连接检查" : "连接与分类",
-                            systemImage: isTransmission ? "network" : "tag"
-                        )
+                    Button(action: onSettings) { Label("参数设置", systemImage: "slider.horizontal.3") }
+                    Button(action: onSpeedSettings) { Label("限速设置", systemImage: "gauge.with.dots.needle.67percent") }
+                    Button(action: onConnection) { Label("连接检查", systemImage: "network") }
+                    if !isTransmission {
+                        Button(action: onCategories) { Label("分类管理", systemImage: "tag.square") }
+                        Button(action: onTags) { Label("标签管理", systemImage: "tag") }
                     }
                     if !item.brush {
                         Button(action: onRepeat) { Label("执行辅种", systemImage: "square.stack.3d.up") }
@@ -2761,6 +2795,7 @@ struct DownloaderCard: View {
                 if item.main { statusChip("主下载器", icon: "star.fill", color: HarvestTheme.amber) }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            downloaderConnectionPanel
             HStack(spacing: 7) {
                 transferMetric(
                     "已下载",
@@ -2829,6 +2864,62 @@ struct DownloaderCard: View {
         .contentShape(RoundedRectangle(cornerRadius: HarvestTheme.cardCornerRadius, style: .continuous))
         .onTapGesture(count: 2, perform: onOpenTorrents)
         .accessibilityAction(named: Text("打开种子列表")) { onOpenTorrents() }
+    }
+
+    private var downloaderConnectionPanel: some View {
+        VStack(spacing: 0) {
+            downloaderInfoRow(
+                icon: "link",
+                label: downloaderTypeName,
+                value: displayAddress.isEmpty ? "-" : displayAddress,
+                color: accentColor,
+                drawsDivider: true
+            )
+            downloaderInfoRow(
+                icon: "folder.fill",
+                label: "种子路径",
+                value: item.torrentPath.isEmpty ? "-" : item.torrentPath,
+                color: .secondary,
+                drawsDivider: false
+            )
+        }
+        .padding(.horizontal, 9)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.primary.opacity(0.08), lineWidth: 0.7)
+        }
+    }
+
+    private func downloaderInfoRow(
+        icon: String,
+        label: String,
+        value: String,
+        color: Color,
+        drawsDivider: Bool
+    ) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(color)
+                    .frame(width: 20)
+                Text(label)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 76, alignment: .leading)
+                Text(value)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.vertical, 7)
+            if drawsDivider { Divider().padding(.leading, 28) }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label) \(value)")
     }
 
     private func statusChip(_ label: String, icon: String, color: Color) -> some View {
@@ -3151,45 +3242,54 @@ struct TorrentListView: View {
     }
 }
 
-struct DownloaderToolsSheet: View {
+private struct DownloaderToolsSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let downloader: DownloaderItem
+    let mode: DownloaderToolMode
     @State private var tags: [String] = []
     @State private var categories: [ManagedDownloaderCategory] = []
     @State private var newTag = ""
     @State private var categoryName = ""
     @State private var categoryPath = ""
     @State private var editingCategory: String?
-    @State private var speedLimited = false
     @State private var isLoading = true
     @State private var isWorking = false
     @State private var testResult = ""
     @State private var deletingTag: String?
     @State private var deletingCategory: String?
 
-    private var isTransmission: Bool {
-        let value = downloader.category.lowercased()
-        return value.contains("tr") || value.contains("transmission")
-    }
-
     var body: some View {
         NavigationStack {
             Form {
-                Section("连接") {
-                    Toggle("限速模式", isOn: $speedLimited)
-                        .onChange(of: speedLimited) { oldValue, newValue in
-                            guard !isLoading, oldValue != newValue else { return }
-                            Task { await setSpeedMode(newValue) }
-                        }
-                    Button { Task { await testConnection() } } label: {
-                        Label("测试下载器连接", systemImage: "network")
+                if mode == .connection {
+                    Section("连接") {
+                        LabeledContent("下载器", value: downloader.name)
+                        LabeledContent("类型", value: downloaderIsTransmission(downloader.category) ? "Transmission" : "qBittorrent")
+                        LabeledContent("地址", value: downloaderDisplayAddress(downloader))
                     }
-                    if !testResult.isEmpty { Text(testResult).font(.caption).foregroundStyle(.secondary) }
+                    Section {
+                        Button { Task { await testConnection() } } label: {
+                            Label("测试下载器连接", systemImage: "network")
+                        }
+                        if !testResult.isEmpty {
+                            Label(
+                                testResult,
+                                systemImage: testResult.contains("失败") ? "xmark.circle.fill" : "checkmark.circle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(testResult.contains("失败") ? HarvestTheme.coral : HarvestTheme.green)
+                        }
+                    }
                 }
 
-                if !isTransmission {
+                if mode == .tags {
                     Section("标签") {
+                        if tags.isEmpty {
+                            Text("暂无标签")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         ForEach(tags, id: \.self) { tag in
                             HStack { Label(tag, systemImage: "tag"); Spacer(); Button(role: .destructive) { deletingTag = tag } label: { Image(systemName: "trash") }.buttonStyle(.plain) }
                         }
@@ -3199,8 +3299,15 @@ struct DownloaderToolsSheet: View {
                                 .disabled(newTag.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
                     }
+                }
 
+                if mode == .categories {
                     Section("分类") {
+                        if categories.isEmpty {
+                            Text("暂无分类")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                         ForEach(categories) { category in
                             Button {
                                 editingCategory = category.name
@@ -3235,7 +3342,7 @@ struct DownloaderToolsSheet: View {
             }
             .disabled(isWorking)
             .overlay { if isLoading || isWorking { ProgressView().controlSize(.large) } }
-            .navigationTitle(downloader.name)
+            .navigationTitle("\(downloader.name) · \(mode.title)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() }.disabled(isWorking) } }
             .task { await load() }
@@ -3271,51 +3378,18 @@ struct DownloaderToolsSheet: View {
     @MainActor private func load() async {
         isLoading = true
         defer { isLoading = false }
-        if isTransmission {
-            let preferencesResult = await loadToolValue(
-                APIPath.downloaderPreferences + "\(downloader.id)",
-                query: ["with_status": true],
-                label: "Transmission 设置"
-            )
-            applySpeedMode(preferencesResult.value)
-            if let errorMessage = preferencesResult.errorMessage {
-                appState.presentedError = errorMessage
-            }
+        switch mode {
+        case .connection:
             return
+        case .tags:
+            let result = await loadToolValue(APIPath.downloaderTags + "\(downloader.id)", label: "标签")
+            if let value = result.value { tags = normalizedTags(value) }
+            if let errorMessage = result.errorMessage { appState.presentedError = errorMessage }
+        case .categories:
+            let result = await loadToolValue(APIPath.downloaderCategories + "\(downloader.id)", label: "分类")
+            if let value = result.value { categories = normalizedCategories(value) }
+            if let errorMessage = result.errorMessage { appState.presentedError = errorMessage }
         }
-        async let tagResult = loadToolValue(APIPath.downloaderTags + "\(downloader.id)", label: "标签")
-        async let categoryResult = loadToolValue(APIPath.downloaderCategories + "\(downloader.id)", label: "分类")
-        async let preferencesResult = loadToolValue(
-            APIPath.downloaderPreferences + "\(downloader.id)",
-            query: ["with_status": true],
-            label: "下载器设置"
-        )
-        let values = await (tagResult, categoryResult, preferencesResult)
-        if let tagValue = values.0.value { tags = normalizedTags(tagValue) }
-        if let categoryValue = values.1.value { categories = normalizedCategories(categoryValue) }
-        applySpeedMode(values.2.value)
-        let errors = [values.0.errorMessage, values.1.errorMessage, values.2.errorMessage].compactMap { $0 }
-        if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
-    }
-
-    private func applySpeedMode(_ raw: Any?) {
-        guard let raw else { return }
-        let root = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) ?? [:]
-        let preferences = root.dict("prefs", "preferences") ?? root
-        speedLimited = preferences.bool(
-            "use_alt_speed_limits",
-            "alt_speed_limits_enabled",
-            "speed_limit_mode",
-            "alt-speed-enabled",
-            "altSpeedEnabled",
-            "alternativeSpeedEnabled"
-        ) ?? false
-    }
-
-    @MainActor private func setSpeedMode(_ enabled: Bool) async {
-        isWorking = true
-        defer { isWorking = false }
-        _ = await appState.perform(APIPath.downloaderToggleSpeed + "\(downloader.id)", method: .get, query: ["state": enabled])
     }
 
     @MainActor private func testConnection() async {
@@ -3371,13 +3445,7 @@ struct DownloaderToolsSheet: View {
     }
 
     @MainActor private func reloadLists() async {
-        async let tagResult = loadToolValue(APIPath.downloaderTags + "\(downloader.id)", label: "标签")
-        async let categoryResult = loadToolValue(APIPath.downloaderCategories + "\(downloader.id)", label: "分类")
-        let values = await (tagResult, categoryResult)
-        if let tagValue = values.0.value { tags = normalizedTags(tagValue) }
-        if let categoryValue = values.1.value { categories = normalizedCategories(categoryValue) }
-        let errors = [values.0.errorMessage, values.1.errorMessage].compactMap { $0 }
-        if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
+        await load()
     }
 
     @MainActor private func loadToolValue(
@@ -4552,7 +4620,6 @@ struct DownloaderEditorSheet: View {
                 Section("任务") {
                     Toggle("启用下载器", isOn: $enabled)
                     Toggle("参与辅种", isOn: Binding(get: { !brush }, set: { brush = !$0 }))
-                    TextField("排序值", text: $sortID).keyboardType(.numberPad)
                     if isLoadingPaths { HStack { ProgressView(); Text("正在读取种子目录").foregroundStyle(.secondary) } }
                     if !suggestedPaths.isEmpty {
                         Picker("种子文件目录", selection: $torrentPath) {
@@ -4723,12 +4790,18 @@ struct DownloaderSettingsSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     let downloader: DownloaderItem
+    let initialSection: String?
     @State private var drafts: [DownloaderPreferenceDraft] = []
     @State private var selectedSection = ""
     @State private var query = ""
     @State private var isLoading = true
     @State private var isSaving = false
     @State private var parseError: String?
+
+    init(downloader: DownloaderItem, initialSection: String? = nil) {
+        self.downloader = downloader
+        self.initialSection = initialSection
+    }
 
     private var isTransmission: Bool { downloader.category.lowercased().contains("tr") || downloader.category.lowercased().contains("trans") }
     private var sections: [String] {
@@ -4750,9 +4823,11 @@ struct DownloaderSettingsSheet: View {
                 if isLoading {
                     Section { ProgressView().frame(maxWidth: .infinity) }
                 } else {
-                    Section {
-                        Picker("设置分组", selection: $selectedSection) {
-                            ForEach(sections, id: \.self) { Text($0).tag($0) }
+                    if initialSection == nil {
+                        Section {
+                            Picker("设置分组", selection: $selectedSection) {
+                                ForEach(sections, id: \.self) { Text($0).tag($0) }
+                            }
                         }
                     }
                     Section(selectedSection) {
@@ -4767,7 +4842,7 @@ struct DownloaderSettingsSheet: View {
                 }
             }
             .searchable(text: $query, prompt: "搜索设置")
-            .navigationTitle("\(downloader.name) · 参数设置")
+            .navigationTitle("\(downloader.name) · \(initialSection == nil ? "参数设置" : "限速设置")")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
@@ -4792,35 +4867,24 @@ struct DownloaderSettingsSheet: View {
                     }
                     ForEach(choices) { choice in Text(choice.title).tag(choice.value) }
                 }
-                Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
             }
         } else {
             switch draft.kind {
             case .boolean:
-                VStack(alignment: .leading, spacing: 3) {
-                    Toggle(preferenceLabel(draft.key), isOn: boolBinding(draft.key))
-                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
-                }
+                Toggle(preferenceLabel(draft.key), isOn: boolBinding(draft.key))
             case .integer, .decimal:
-                VStack(alignment: .leading, spacing: 4) {
-                    TextField(preferenceLabel(draft.key), text: textBinding(draft.key))
-                        .keyboardType(draft.kind == .integer ? .numbersAndPunctuation : .decimalPad)
-                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
-                }
+                TextField(preferenceLabel(draft.key), text: textBinding(draft.key))
+                    .keyboardType(draft.kind == .integer ? .numbersAndPunctuation : .decimalPad)
             case .text:
-                VStack(alignment: .leading, spacing: 4) {
-                    if draft.key.lowercased().contains("password") {
-                        SecureField(preferenceLabel(draft.key), text: textBinding(draft.key))
-                    } else {
-                        TextField(preferenceLabel(draft.key), text: textBinding(draft.key), axis: .vertical).lineLimit(1...5)
-                    }
-                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
+                if draft.key.lowercased().contains("password") {
+                    SecureField(preferenceLabel(draft.key), text: textBinding(draft.key))
+                } else {
+                    TextField(preferenceLabel(draft.key), text: textBinding(draft.key), axis: .vertical).lineLimit(1...5)
                 }
             case .json:
                 VStack(alignment: .leading, spacing: 5) {
                     Text(preferenceLabel(draft.key)).font(.subheadline)
                     TextEditor(text: textBinding(draft.key)).font(.caption.monospaced()).frame(minHeight: 100)
-                    Text(draft.key).font(.caption2.monospaced()).foregroundStyle(.tertiary)
                 }
             }
         }
@@ -4862,7 +4926,9 @@ struct DownloaderSettingsSheet: View {
                 guard let value = preferences[key] else { return nil }
                 return DownloaderPreferenceDraft(key: key, value: value, section: preferenceSection(key, transmission: isTransmission))
             }
-            selectedSection = sections.first ?? ""
+            selectedSection = initialSection.flatMap { requested in
+                sections.first(where: { $0 == requested })
+            } ?? sections.first ?? ""
         } catch { appState.presentedError = error.localizedDescription }
     }
 

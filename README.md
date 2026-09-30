@@ -7,7 +7,7 @@ Open `Harvest.xcodeproj` with Xcode 26 or later, choose a development team, and
 run the `Harvest` scheme. The backend API is shared with the Flutter client.
 
 The native target keeps the production bundle identifier `com.ptools.harvest`
-and uses version `2026.0928.01` with build `295`, so it can be signed as the next
+and uses version `2026.0930.01` with build `296`, so it can be signed as the next
 update of the existing iOS app. Do not install a Flutter and native archive with
 the same bundle identifier side by side.
 
@@ -16,6 +16,22 @@ the same bundle identifier side by side.
 后续每次代码修改完成后均同步更新此处，无论是否调整版本号。同一发布版本的
 改动持续追加到对应版本下，并按时间倒序排列；内容说明本次具体新增、修改、
 优化或修复了什么，不堆叠提交哈希和无意义的内部日志。
+
+### 2026.0930.01 (296) - 2026-09-30
+
+- 下载器卡片补齐地址与种子路径连接区，并保留连接、启用、辅种、实时速度、
+  活跃数、总数、剩余空间和限速状态展示，使信息结构与 Flutter 一致。
+- 下载器菜单拆分为参数设置、限速设置、连接检查、分类管理和标签管理；分类
+  与标签分别使用独立大尺寸 sheet，限速入口直接打开对应设置分组。
+- 下载器基础编辑页隐藏 Flutter 未展示的排序字段，但保存时继续保留原排序值；
+  高级设置移除内部 API 键名提示，统一使用中文字段名称。
+- 复核 Flutter 安卓真机下载器菜单修复：问题源于等待 shadcn Overlay 关闭
+  Future 不返回；原生 SwiftUI 菜单直接更新编辑与工具 sheet 状态，不存在
+  该阻塞链路，无需复制 Android/Flutter 专属修复。
+- 复核 Flutter 依赖锁文件与 Android AGP/Kotlin 构建链升级；原生工程不使用
+  Flutter、Gradle 或相关依赖，本轮没有 API、数据模型和功能代码变化。
+- App、收割机助手 Safari 扩展和 CookieCloud Safari 扩展的版本统一同步至
+  `2026.0930.01 (296)`。
 
 ### 2026.0928.01 (295) - 2026-09-28
 
