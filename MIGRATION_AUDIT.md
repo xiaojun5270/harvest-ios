@@ -36,6 +36,19 @@ pass, and device testing against a reachable Harvest server.
   sort order without exposing the Flutter-hidden field, while advanced settings
   retain the same backend preferences API with user-facing labels only.
 
+- Native site editing now mirrors Flutter's configured-mirror workflow. It
+  loads website configuration for both new and existing sites, exposes every
+  configured URL as a selectable option, matches configuration keys without
+  case sensitivity, and retains a custom mirror-address field for values that
+  are not present in the configuration list.
+
+- Downloader live metrics now follow Flutter's exact payload semantics instead
+  of recursively accepting count aliases. Active, paused, and total counts use
+  the live `activeTorrentCount`, `pausedTorrentCount`, and
+  `torrentCount`/`torrent_count` fields; qB and Transmission session totals use
+  their respective response structures, and current zero values replace stale
+  cached counts rather than being discarded.
+
 - The Flutter delta from `c510eeaa` through release `5e3e3c09` was reviewed.
   It contains no API, service, or data-model changes. Native resource search now
   prioritizes the title with more CJK characters, search settings can filter

@@ -1774,6 +1774,7 @@ struct SitesView: View {
                     .listStyle(.plain)
                     .listRowSpacing(0)
                     .contentMargins(.vertical, 0, for: .scrollContent)
+                    .scrollDismissesKeyboard(.immediately)
                     .scrollContentBackground(.hidden)
                     .background(Color(uiColor: .systemGroupedBackground))
                     .environment(\.harvestFlowEffectsPaused, model.isPullRefreshSettling)
@@ -8474,7 +8475,45 @@ struct SiteEditorSheet: View {
                         Spacer(minLength: 0)
                     }
                     .listRowInsets(compactEditorInsets)
-                    editorField("镜像地址（可选）", text: $url, keyboardType: .URL, isURL: true)
+                    if !mirrorOptions.isEmpty {
+                        Menu {
+                            ForEach(mirrorOptions, id: \.self) { option in
+                                Button {
+                                    url = option
+                                } label: {
+                                    if normalizedMirror(url) == normalizedMirror(option) {
+                                        Label(option, systemImage: "checkmark")
+                                    } else {
+                                        Text(option)
+                                    }
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("镜像地址")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                    Text(selectedMirrorLabel)
+                                        .font(.subheadline)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .minimumScaleFactor(0.68)
+                                }
+                                Spacer(minLength: 8)
+                                Text("\(mirrorOptions.count) 个地址")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(HarvestTheme.blue)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .listRowInsets(compactEditorInsets)
+                    }
+                    editorField("自定义镜像地址（可选）", text: $url, keyboardType: .URL, isURL: true)
                 }
                 Section("登录凭据") {
                     editorField("用户 ID（可选）", text: $userID, isURL: true)
@@ -8593,22 +8632,46 @@ struct SiteEditorSheet: View {
                 } }.disabled(siteKey.isEmpty || name.isEmpty) }
             }
             .task {
-                guard site == nil, availableSites.isEmpty else { return }
-                async let namesResult = loadSiteEditorValue(APIPath.websiteToAdd)
+                guard availableConfigs.isEmpty else { return }
+                async let namesResult = loadAvailableSiteNames()
                 async let configsResult = loadSiteEditorValue(APIPath.websiteList)
                 let values = await (namesResult, configsResult)
-                if let names = values.0.value { availableSites = jsonStrings(names) }
+                if site == nil, let names = values.0.value { availableSites = jsonStrings(names) }
+                if site == nil, siteKey.isEmpty { siteKey = availableSites.first ?? "" }
+
+                var configMap: [String: [String: Any]] = [:]
                 if let configs = values.1.value {
-                    var configMap: [String: [String: Any]] = [:]
                     for config in jsonRows(configs) {
-                        if let key = config.string("name", "site"), !key.isEmpty { configMap[key] = config }
+                        if let key = config.string("name", "site"), !key.isEmpty {
+                            configMap[normalizedConfigKey(key)] = config
+                        }
                     }
-                    availableConfigs = configMap
                 }
-                if siteKey.isEmpty { siteKey = availableSites.first ?? "" }
-                applyConfigDefaults(siteKey)
-                let errors = [values.0.errorMessage, values.1.errorMessage].compactMap { $0 }
-                if !errors.isEmpty { appState.presentedError = errors.joined(separator: "\n") }
+
+                var loadErrors: [String] = []
+                if site == nil, let nameError = values.0.errorMessage { loadErrors.append(nameError) }
+                let currentKey = normalizedConfigKey(siteKey)
+                if !currentKey.isEmpty, configMap[currentKey] == nil {
+                    let direct = await loadSiteEditorValue(
+                        "\(APIPath.websiteList)/\(urlPathSegment(siteKey))"
+                    )
+                    if let raw = direct.value,
+                       let config = jsonPayloadDictionary(raw) ?? jsonDictionary(raw) {
+                        configMap[currentKey] = config
+                    } else if let error = direct.errorMessage ?? values.1.errorMessage {
+                        loadErrors.append(error)
+                    }
+                } else if currentKey.isEmpty, let configError = values.1.errorMessage {
+                    loadErrors.append(configError)
+                }
+                availableConfigs = configMap
+
+                if site == nil {
+                    applyConfigDefaults(siteKey)
+                } else if url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    url = mirrorOptions.first ?? ""
+                }
+                if !loadErrors.isEmpty { appState.presentedError = loadErrors.joined(separator: "\n") }
             }
         }
     }
@@ -8618,9 +8681,14 @@ struct SiteEditorSheet: View {
         catch { return (nil, error.localizedDescription) }
     }
 
+    @MainActor private func loadAvailableSiteNames() async -> (value: Any?, errorMessage: String?) {
+        guard site == nil else { return (nil, nil) }
+        return await loadSiteEditorValue(APIPath.websiteToAdd)
+    }
+
     private func applyConfigDefaults(_ key: String) {
         guard site == nil else { return }
-        guard let config = availableConfigs[key] else {
+        guard let config = availableConfigs[normalizedConfigKey(key)] else {
             name = key
             url = ""
             return
@@ -8635,6 +8703,30 @@ struct SiteEditorSheet: View {
         brushRSS = config.bool("brush_rss", "brushRss") ?? brushRSS
         packageFile = config.bool("package_file", "packageFile") ?? packageFile
         hrDiscern = config.bool("hr_discern", "hrDiscern") ?? hrDiscern
+    }
+
+    private var mirrorOptions: [String] {
+        guard let config = availableConfigs[normalizedConfigKey(siteKey)] else { return [] }
+        var seen = Set<String>()
+        return configStrings(config["url"])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert(normalizedMirror($0)).inserted }
+    }
+
+    private var selectedMirrorLabel: String {
+        let current = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !current.isEmpty else { return "选择镜像地址" }
+        return mirrorOptions.contains { normalizedMirror($0) == normalizedMirror(current) }
+            ? current
+            : "自定义地址"
+    }
+
+    private func normalizedConfigKey(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func normalizedMirror(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private var compactEditorInsets: EdgeInsets {

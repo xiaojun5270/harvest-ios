@@ -91,17 +91,15 @@ struct DownloaderItem: Identifiable {
         sortID = json.int("sort_id", "sortId") ?? 0
         torrentPath = json.string("torrent_path", "torrentPath") ?? ""
         main = json.bool("main", "is_main", "default") ?? false
-        uploadSpeed = status.double("uploadSpeed", "upload_speed", "up_info_speed") ?? json.double("upload_speed", "up_speed", "upspeed") ?? 0
-        downloadSpeed = status.double("downloadSpeed", "download_speed", "dl_info_speed") ?? json.double("download_speed", "down_speed", "dlspeed") ?? 0
-        activeTorrentCount = downloaderMetricInt(json, keys: downloaderActiveCountKeys) ?? 0
-        pausedTorrentCount = downloaderMetricInt(json, keys: downloaderPausedCountKeys) ?? 0
-        totalTorrentCount = downloaderMetricInt(json, keys: downloaderTotalCountKeys) ?? 0
+        uploadSpeed = status.double("uploadSpeed", "upload_speed", "up_info_speed") ?? 0
+        downloadSpeed = status.double("downloadSpeed", "download_speed", "dl_info_speed") ?? 0
+        activeTorrentCount = status.int("activeTorrentCount") ?? 0
+        pausedTorrentCount = status.int("pausedTorrentCount") ?? 0
+        totalTorrentCount = status.int("torrentCount", "torrent_count") ?? 0
         freeSpace = downloaderFreeSpace(status) ?? downloaderFreeSpace(preferences) ?? 0
-        uploadedSession = status.double("up_info_data", "uploadedSession", "uploadedBytes")
-            ?? currentStats.double("uploadedBytes", "uploaded_bytes") ?? 0
-        downloadedSession = status.double("dl_info_data", "downloadedSession", "downloadedBytes")
-            ?? currentStats.double("downloadedBytes", "downloaded_bytes") ?? 0
         if downloaderIsTransmission(categoryValue) {
+            uploadedSession = currentStats.double("uploadedBytes", "uploaded_bytes") ?? 0
+            downloadedSession = currentStats.double("downloadedBytes", "downloaded_bytes") ?? 0
             let alternativeEnabled = preferences.bool(
                 "alt-speed-enabled", "altSpeedEnabled", "alternativeSpeedEnabled"
             ) ?? status.bool(
@@ -138,6 +136,8 @@ struct DownloaderItem: Identifiable {
             uploadLimit = max(0, parsedUploadLimit)
             downloadLimit = max(0, parsedDownloadLimit)
         } else {
+            uploadedSession = status.double("up_info_data", "uploadedSession", "uploadedBytes") ?? 0
+            downloadedSession = status.double("dl_info_data", "downloadedSession", "downloadedBytes") ?? 0
             uploadLimit = max(0, status.double("up_rate_limit", "uploadLimit")
                 ?? preferences.double("up_limit", "uploadLimit") ?? 0)
             downloadLimit = max(0, status.double("dl_rate_limit", "downloadLimit")
@@ -242,7 +242,8 @@ private func downloaderFreeSpace(_ dictionary: [String: Any]) -> Double? {
     let keys = [
         "free_space_on_disk", "freeSpaceOnDisk", "free_space", "freeSpace",
         "download-dir-free-space", "downloadDirFreeSpace", "download_dir_free_space",
-        "freeSpaceBytes", "free_space_bytes", "disk_free_space", "availableSpace"
+        "downloadDirFree", "downloadDirFreeSpaceBytes", "freeSpaceBytes", "free_space_bytes",
+        "disk_free_space", "diskFreeSpace", "available_space", "availableSpace"
     ]
     if let value = keys.compactMap({ dictionary.double($0) }).first { return value }
     for value in dictionary.values {
@@ -869,6 +870,7 @@ final class DownloadsViewModel: ObservableObject {
     private var downloaderWatchTokens: [Int: UUID] = [:]
     private var downloaderWatchSignatures: [Int: String] = [:]
     private var torrentSnapshotSignatures: [Int: Int] = [:]
+    private var liveSpeedDownloaderIDs: Set<Int> = []
     private var countdownTask: Task<Void, Never>?
     private var cacheWriteTask: Task<Void, Never>?
     private var compactSummaryTask: Task<Void, Never>?
@@ -1215,7 +1217,8 @@ final class DownloadsViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             var changed = false
             let refreshed = self.downloaders.map { item in
-                guard let summary = summaries[item.id] else { return item }
+                guard let summary = summaries[item.id],
+                      !self.liveSpeedDownloaderIDs.contains(item.id) else { return item }
                 let merged = mergingDownloaderStatus([
                     "activeTorrentCount": summary.active,
                     "pausedTorrentCount": summary.paused,
@@ -1777,6 +1780,7 @@ final class DownloadsViewModel: ObservableObject {
         downloaderWatchTokens = [:]
         downloaderWatchSignatures = [:]
         torrentSnapshotSignatures = [:]
+        liveSpeedDownloaderIDs = []
         socketConnections = []
         if clearRemaining { refreshDeadline = nil }
     }
@@ -1884,24 +1888,9 @@ final class DownloadsViewModel: ObservableObject {
             let downloader = updated[index]
             let websocketKey = "\(downloader.name)-\(downloader.id)-\(downloader.category)".lowercased()
             guard let live = liveByKey[websocketKey] ?? liveByKey[String(downloader.id)] else { continue }
-            let liveTotal = downloaderMetricInt(live, keys: downloaderTotalCountKeys)
-            var fallbackStatus: [String: Any] = [:]
-            if downloaderIsTransmission(downloader.category)
-                || downloaderMetricInt(live, keys: downloaderActiveCountKeys) == nil
-                || ((liveTotal ?? 0) == 0 && downloader.totalTorrentCount > 0) {
-                fallbackStatus["activeTorrentCount"] = downloader.activeTorrentCount
-            }
-            if downloaderMetricInt(live, keys: downloaderPausedCountKeys) == nil {
-                fallbackStatus["pausedTorrentCount"] = downloader.pausedTorrentCount
-            }
-            if liveTotal == nil || (liveTotal == 0 && downloader.totalTorrentCount > 0) {
-                fallbackStatus["torrentCount"] = downloader.totalTorrentCount
-            }
+            liveSpeedDownloaderIDs.insert(downloader.id)
             var merged = downloader.raw
             merged["status"] = live
-            if !fallbackStatus.isEmpty {
-                merged = mergingDownloaderStatus(fallbackStatus, into: merged)
-            }
             let next = DownloaderItem(merged)
             guard downloaderLiveSignature(next) != downloaderLiveSignature(downloader) else { continue }
             updated[index] = next
